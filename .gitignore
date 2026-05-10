@@ -1,0 +1,25 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Cargo lockfile is committed (workspace contains a binary crate)
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Editors / IDEs
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.iml
+
+# OS
+Thumbs.db

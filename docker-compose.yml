@@ -1,0 +1,34 @@
+# Dev-only Postgres for Engram. Production deployment uses systemd-managed
+# Postgres (see docs/engram-design-v0.md §11), not this file.
+#
+# The pgvector/pgvector:pg16 image bundles the `vector`, `pg_trgm`, and
+# `pgcrypto` extensions — i.e. everything the M1 migration's CREATE EXTENSION
+# lines need. The image is the official one published by the pgvector
+# maintainers.
+#
+# Defaults are dev-friendly (engram/engram on localhost:5432). The container
+# only accepts connections from localhost; a real password is unnecessary
+# at this trust boundary.
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: engram-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: engram
+      POSTGRES_PASSWORD: engram
+      POSTGRES_DB: engram
+    ports:
+      - "5432:5432"
+    volumes:
+      - engram-pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U engram -d engram"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  engram-pg-data:
