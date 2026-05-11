@@ -1,36 +1,66 @@
 //! The rmcp `ServerHandler` wiring. `EngramServer` is the per-connection
 //! service factory; it holds an `Arc<dyn Embedder>` and a `PgPool` (both
-//! cheap to clone). The actual orchestration lives in [`crate::capture`].
+//! cheap to clone). The actual orchestration lives in [`crate::capture`]
+//! and [`crate::search`].
 
-use engram_core::{Embedder, Metadata, Scope, Source};
+use engram_core::{Embedder, Metadata, Scope, Source, ThoughtId};
 use rmcp::{
     ServerHandler, model::ServerCapabilities, model::ServerInfo, schemars, tool,
 };
 use serde::Deserialize;
 use sqlx::PgPool;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use crate::capture::{self, CaptureError, CaptureRequest, MAX_CONTENT_LEN};
+use crate::search::{
+    self, GetThoughtResponse, ReadError, RecentRequest, RecentResponse, SearchRequest,
+    SearchResponse,
+};
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CaptureArgs {
-    /// The thought text to capture. Required; non-empty; max 1 MiB.
     #[schemars(description = "The thought text. Required, non-empty, max 1 MiB.")]
     pub content: String,
 
-    /// Provenance label. Required. Convention: `manual`, `agent:claude-code`,
-    /// `agent:opencode`, `reflector`, etc.
     #[schemars(description = "Provenance label. Required. Examples: 'manual', 'agent:claude-code'.")]
     pub source: String,
 
-    /// Scope of the thought. Defaults to `"global"` when omitted.
     #[schemars(description = "Scope label. Optional; defaults to 'global'. Convention is dotted ('work.tcgplayer').")]
     pub scope: Option<String>,
 
-    /// Free-form metadata object. Defaults to `{}`. Recommended keys:
-    /// `client_name`, `session_id`, `tool_name`, `agent_role`.
     #[schemars(description = "Optional free-form metadata object. Recommended keys: client_name, session_id, tool_name, agent_role.")]
     pub metadata: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SearchThoughtsArgs {
+    #[schemars(description = "Search query. Required, non-empty.")]
+    pub query: String,
+
+    #[schemars(description = "Scope filter. Optional; when omitted, searches across all scopes.")]
+    pub scope: Option<String>,
+
+    #[schemars(description = "Max results. Optional; defaults to 10, max 100.")]
+    pub limit: Option<usize>,
+
+    #[schemars(description = "Recency boost half-life in days. Optional; defaults to 30. Set to 0 to disable recency boost.")]
+    pub recency_half_life_days: Option<f32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RecentThoughtsArgs {
+    #[schemars(description = "Scope filter. Optional; when omitted, returns across all scopes.")]
+    pub scope: Option<String>,
+
+    #[schemars(description = "Max results. Optional; defaults to 10, max 100.")]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GetThoughtArgs {
+    #[schemars(description = "Thought ID (UUID string).")]
+    pub thought_id: String,
 }
 
 #[derive(Clone)]
@@ -89,6 +119,70 @@ impl EngramServer {
         serde_json::to_string(&body)
             .map_err(|e| format!("response serialization error: {e}"))
     }
+
+    #[tool(description = "Hybrid search across captured thoughts. Combines vector kNN (over the active embedding model) with trigram lexical similarity via reciprocal rank fusion, then applies a recency boost. Returns the top-N matching thoughts with score. If the embedder is unreachable, results still come back from the trigram leg only and `vector_search_available` is false.")]
+    async fn search_thoughts(
+        &self,
+        #[tool(aggr)] args: SearchThoughtsArgs,
+    ) -> Result<String, String> {
+        let scope = match args.scope {
+            Some(s) => Some(Scope::new(s).map_err(|e| format!("invalid scope: {e}"))?),
+            None => None,
+        };
+
+        let request = SearchRequest {
+            query: args.query,
+            scope,
+            limit: args.limit,
+            recency_half_life_days: args.recency_half_life_days,
+        };
+
+        let resp = search::search_thoughts(&self.pool, self.embedder.as_ref(), request)
+            .await
+            .map_err(map_read_error)?;
+
+        serde_json::to_string(&search_response_json(&resp))
+            .map_err(|e| format!("response serialization error: {e}"))
+    }
+
+    #[tool(description = "Recent thoughts in (optional) scope, ordered newest first. No retrieval scoring — just chronological browsing.")]
+    async fn recent_thoughts(
+        &self,
+        #[tool(aggr)] args: RecentThoughtsArgs,
+    ) -> Result<String, String> {
+        let scope = match args.scope {
+            Some(s) => Some(Scope::new(s).map_err(|e| format!("invalid scope: {e}"))?),
+            None => None,
+        };
+
+        let request = RecentRequest {
+            scope,
+            limit: args.limit,
+        };
+
+        let resp = search::recent_thoughts(&self.pool, request)
+            .await
+            .map_err(map_read_error)?;
+
+        serde_json::to_string(&recent_response_json(&resp))
+            .map_err(|e| format!("response serialization error: {e}"))
+    }
+
+    #[tool(description = "Fetch a single thought by ID along with its provenance: whether it's been embedded ('indexed' or 'pending'), when it was embedded, and (M2+) linked extracted facts.")]
+    async fn get_thought(
+        &self,
+        #[tool(aggr)] args: GetThoughtArgs,
+    ) -> Result<String, String> {
+        let id = ThoughtId::from_str(&args.thought_id)
+            .map_err(|e| format!("invalid thought_id: {e}"))?;
+
+        let resp = search::get_thought(&self.pool, self.embedder.model(), id)
+            .await
+            .map_err(map_read_error)?;
+
+        serde_json::to_string(&get_thought_response_json(&resp))
+            .map_err(|e| format!("response serialization error: {e}"))
+    }
 }
 
 fn map_capture_error(err: CaptureError) -> String {
@@ -104,18 +198,230 @@ fn map_capture_error(err: CaptureError) -> String {
     }
 }
 
+fn map_read_error(err: ReadError) -> String {
+    match err {
+        ReadError::EmptyQuery => "query must be non-empty".to_string(),
+        ReadError::LimitOutOfBounds { got, max } => {
+            format!("limit out of bounds: {got} (must be 1..={max})")
+        }
+        ReadError::NotFound => "thought not found".to_string(),
+        ReadError::Storage(e) => {
+            tracing::error!(error = %e, "read storage error");
+            "internal database error".to_string()
+        }
+    }
+}
+
+fn search_response_json(resp: &SearchResponse) -> serde_json::Value {
+    let results: Vec<serde_json::Value> = resp
+        .results
+        .iter()
+        .map(|h| {
+            serde_json::json!({
+                "thought_id": h.thought_id.to_string(),
+                "content": h.content,
+                "scope": h.scope.as_str(),
+                "source": h.source.as_str(),
+                "created_at": h.created_at.format(&time::format_description::well_known::Rfc3339).unwrap_or_default(),
+                "metadata": h.metadata.as_value(),
+                "score": h.score,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "results": results,
+        "vector_search_available": resp.vector_search_available,
+    })
+}
+
+fn recent_response_json(resp: &RecentResponse) -> serde_json::Value {
+    let results: Vec<serde_json::Value> = resp
+        .results
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "thought_id": t.id.to_string(),
+                "content": t.content,
+                "scope": t.scope.as_str(),
+                "source": t.source.as_str(),
+                "created_at": t.created_at.format(&time::format_description::well_known::Rfc3339).unwrap_or_default(),
+                "metadata": t.metadata.as_value(),
+            })
+        })
+        .collect();
+    serde_json::json!({ "results": results })
+}
+
+fn get_thought_response_json(resp: &GetThoughtResponse) -> serde_json::Value {
+    serde_json::json!({
+        "thought": {
+            "thought_id": resp.thought.id.to_string(),
+            "content": resp.thought.content,
+            "scope": resp.thought.scope.as_str(),
+            "source": resp.thought.source.as_str(),
+            "created_at": resp.thought.created_at.format(&time::format_description::well_known::Rfc3339).unwrap_or_default(),
+            "metadata": resp.thought.metadata.as_value(),
+        },
+        "provenance": {
+            "embedding_status": resp.embedding_status,
+            "embedded_at": resp.embedded_at.and_then(|t| t.format(&time::format_description::well_known::Rfc3339).ok()),
+            "linked_facts": [],
+        },
+    })
+}
+
 #[tool(tool_box)]
 impl ServerHandler for EngramServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             instructions: Some(
-                "Engram — self-hosted MCP-native memory service. Use `capture` to record \
-                 a thought. Search tools (`search_thoughts`, `recent_thoughts`, `get_thought`) \
-                 land in subsequent commits."
+                "Engram — self-hosted MCP-native memory service. \
+                 Use `capture` to record a thought, `search_thoughts` for hybrid retrieval, \
+                 `recent_thoughts` to browse by recency, and `get_thought` for full provenance \
+                 of a single thought."
                     .into(),
             ),
             capabilities: ServerCapabilities::builder().enable_tools().build(),
             ..Default::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use engram_embed::FakeEmbedder;
+
+    fn server(pool: PgPool) -> EngramServer {
+        EngramServer::new(pool, Arc::new(FakeEmbedder::new()))
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn capture_tool_returns_thought_id_and_indexed_status(pool: PgPool) {
+        let s = server(pool);
+        let raw = s
+            .capture(CaptureArgs {
+                content: "hello there".into(),
+                source: "test".into(),
+                scope: None,
+                metadata: None,
+            })
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(json["thought_id"].is_string());
+        assert_eq!(json["embedding_status"], "indexed");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn capture_tool_validation_error_reports_message(pool: PgPool) {
+        let s = server(pool);
+        let err = s
+            .capture(CaptureArgs {
+                content: String::new(),
+                source: "test".into(),
+                scope: None,
+                metadata: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(err.contains("content"));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_thoughts_tool_returns_results_and_flag(pool: PgPool) {
+        let s = server(pool);
+        s.capture(CaptureArgs {
+            content: "tcgplayer integration notes".into(),
+            source: "test".into(),
+            scope: None,
+            metadata: None,
+        })
+        .await
+        .unwrap();
+
+        let raw = s
+            .search_thoughts(SearchThoughtsArgs {
+                query: "tcgplayer".into(),
+                scope: None,
+                limit: None,
+                recency_half_life_days: None,
+            })
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(json["vector_search_available"], true);
+        let results = json["results"].as_array().unwrap();
+        assert!(!results.is_empty());
+        assert!(results[0]["thought_id"].is_string());
+        assert!(results[0]["content"].as_str().unwrap().contains("tcgplayer"));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn recent_thoughts_tool_returns_results(pool: PgPool) {
+        let s = server(pool);
+        s.capture(CaptureArgs {
+            content: "one".into(),
+            source: "test".into(),
+            scope: None,
+            metadata: None,
+        })
+        .await
+        .unwrap();
+        s.capture(CaptureArgs {
+            content: "two".into(),
+            source: "test".into(),
+            scope: None,
+            metadata: None,
+        })
+        .await
+        .unwrap();
+
+        let raw = s
+            .recent_thoughts(RecentThoughtsArgs {
+                scope: None,
+                limit: None,
+            })
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let results = json["results"].as_array().unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn get_thought_tool_returns_thought_and_provenance(pool: PgPool) {
+        let s = server(pool);
+        let cap_raw = s
+            .capture(CaptureArgs {
+                content: "hello".into(),
+                source: "test".into(),
+                scope: None,
+                metadata: None,
+            })
+            .await
+            .unwrap();
+        let cap_json: serde_json::Value = serde_json::from_str(&cap_raw).unwrap();
+        let thought_id = cap_json["thought_id"].as_str().unwrap().to_string();
+
+        let raw = s.get_thought(GetThoughtArgs { thought_id }).await.unwrap();
+        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(json["thought"].is_object());
+        assert_eq!(json["thought"]["content"], "hello");
+        assert_eq!(json["provenance"]["embedding_status"], "indexed");
+        assert!(json["provenance"]["embedded_at"].is_string());
+        assert_eq!(json["provenance"]["linked_facts"], serde_json::json!([]));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn get_thought_tool_invalid_uuid_errors(pool: PgPool) {
+        let s = server(pool);
+        let err = s
+            .get_thought(GetThoughtArgs {
+                thought_id: "not-a-uuid".into(),
+            })
+            .await
+            .unwrap_err();
+        assert!(err.contains("invalid thought_id"));
     }
 }

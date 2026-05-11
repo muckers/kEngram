@@ -33,20 +33,20 @@ End state: an agent can call `capture` over MCP; thought row + embedding row lan
 - [x] `sqlx::test`: `capture` with `FakeEmbedder` writes both rows, returns `embedding_status: "indexed"`
 - [x] `sqlx::test`: `capture` with a failing `FakeEmbedder` returns `embedding_status: "pending"`; thought row exists; embedding row absent; WARN logged
 
-## Phase C — Search vertical slice
+## Phase C — Search vertical slice ✅
 
 End state: capture → search end-to-end via MCP. Hybrid retrieval (vector ∪ trigram, RRF) returns ranked results. Trigram-only fallback works when the embedder is down.
 
-- [ ] `engram-storage` vector kNN query against `embeddings_bge_m3_hnsw`
-- [ ] `engram-storage` trigram similarity query against `thoughts_content_trgm_idx`
-- [ ] `engram-storage` recent-by-scope query against `thoughts_scope_recent_idx`
-- [ ] `engram-core` RRF fusion (`k = 60` default; configurable) + post-fusion recency boost
-- [ ] `engram-mcp` tools: `search_thoughts`, `recent_thoughts`, `get_thought`
-- [ ] Soft-fail on embedder unavailable: `search_thoughts` returns `vector_search_available: false` with trigram-only results
-- [ ] `sqlx::test`: full hybrid search round-trip with `FakeEmbedder`
-- [ ] `sqlx::test`: search with embedder unavailable returns degraded results plus the flag
-- [ ] `sqlx::test`: `recent_thoughts` orders by `created_at DESC`
-- [ ] `sqlx::test`: `get_thought` returns full row with `embedding_status` in provenance
+- [x] `engram-storage` vector kNN query (uses `embeddings_bge_m3_hnsw` HNSW partial when present; falls back to sequential scan for ad-hoc test models)
+- [x] `engram-storage` trigram similarity query — uses `similarity() > 0.1` rather than the default `%` operator threshold (0.3 is too strict for short queries against long thoughts)
+- [x] `engram-storage` recent-by-scope query against `thoughts_scope_recent_idx`
+- [x] `engram-core::search` RRF fusion (`k = 60` default; constants exposed for config) + post-fusion recency boost (half-life decay)
+- [x] `engram-mcp` tools: `search_thoughts`, `recent_thoughts`, `get_thought`
+- [x] Soft-fail on embedder unavailable: `search_thoughts` returns `vector_search_available: false` with trigram-only results
+- [x] `sqlx::test`: full hybrid search round-trip with `FakeEmbedder`
+- [x] `sqlx::test`: search with embedder unavailable returns degraded results plus the flag
+- [x] `sqlx::test`: `recent_thoughts` orders by `created_at DESC`
+- [x] `sqlx::test`: `get_thought` returns full row with `embedding_status` in provenance
 
 ## Phase D — Hardening
 
@@ -66,6 +66,7 @@ Dated notes appended as items land. Format: `YYYY-MM-DD — <one-line summary>`.
 
 <!-- Most recent entry first. -->
 
+- **2026-05-10** — Phase C complete. Hybrid search end-to-end. `engram-core::search` adds the pure RRF fusion (`k=60` default) + half-life recency decay, both fully unit-tested. `engram-storage` gains four new query functions: `search_vector_knn`, `search_trigram`, `recent_thoughts`, `fetch_thought_with_provenance`. `engram-mcp` adds three MCP tools (`search_thoughts`, `recent_thoughts`, `get_thought`) plus an orchestrator that gracefully degrades to trigram-only when the embedder fails (returns `vector_search_available: false`). Two implementation notes: (1) the trigram leg uses `similarity() > 0.1` directly rather than the indexed `%` operator — the default `pg_trgm.similarity_threshold` of 0.3 is too strict for short queries against long thoughts; at M1 volumes the sequential scan is fast enough. (2) test vectors must be 1024-dim because the schema fixes `vector(1024)`; tests use a helper to build unit vectors of the right size. Total 98 tests passing (3 cli + 38 core + 16 embed + 24 mcp + 17 storage), clippy clean. The MCP `tool` macro auto-generates callable wrappers on the impl block, which made it possible to unit-test the tool methods directly with `FakeEmbedder` — no SSE round-trip needed for the unit tests.
 - **2026-05-10** — Phase B complete. rmcp `ServerHandler` impl in `engram-mcp::server` exposes `capture` as an MCP tool over SSE transport. `engram-cli` provides `serve` and `migrate` subcommands with `figment`-layered TOML + env config (default `~/.config/engram/engram.toml`, override via `--config`, env-overrides via `ENGRAM_DATABASE__URL` etc.). `tracing-subscriber` initialised at startup with `RUST_LOG`/`ENGRAM_LOG` filter. Smoke-tested: `cargo run -- migrate` re-applies idempotently; `cargo run -- serve` binds 127.0.0.1:8080, `curl /sse` returns 200 `text/event-stream`. Two pieces of rmcp friction worth noting: (1) the `#[tool]` macro doesn't accept `Result<String, rmcp::Error>` because `rmcp::Error` doesn't impl `IntoContents`; we use `Result<String, String>` so failures land as tool-level errors (`isError: true` content) rather than JSON-RPC protocol errors — this is the more idiomatic shape for validation failures anyway; (2) the macro requires `#[tool(tool_box)]` on both the `impl Server { ... }` and the `impl ServerHandler for Server { ... }` blocks. Total 64 tests passing (30 + 16 + 9 + 6 + 3 cli config), clippy clean. Full MCP-protocol round-trip (Claude Code or `mcp-inspector` invoking `capture` end-to-end) deferred to Phase D smoke-test alongside the other three tools.
 - **2026-05-10** — Phase B orchestration checkpoint. All testable logic landed: `engram-core` domain types (`Thought`, `ThoughtId`, `Scope`, `Source`, `Embedding`, `EmbeddingModel`, `EmbeddingStatus`, `Metadata`) + `Embedder` trait with transient-vs-fatal classification; `engram-embed::FakeEmbedder` (deterministic, configurable failure modes) and `engram-embed::OpenAICompatibleEmbedder` (one struct covers Ollama / TEI / OpenAI / Voyage; configurable endpoint, model, api_key, timeout); `engram-storage` repository functions (`insert_thought`, `insert_embedding`, `insert_thought_embedding`, `fetch_thought`, `thought_has_embedding`); `engram-mcp::capture` orchestration that writes the thought, attempts to embed, and soft-fails to `EmbeddingStatus::Pending` on any embedder/embedding/storage failure (logging warn for transient, error for fatal). 61 tests pass (30 engram-core + 16 engram-embed + 6 engram-storage + 9 engram-mcp). Workspace clippy clean. Note: sqlx::query! requires `DATABASE_URL` at *build* time in every crate that uses it — `.env` at workspace root is not sufficient; pass via shell env or per-crate `.env`. Documented in next History pass.
 - **2026-05-09** — Phase A complete. Workspace skeleton (`Cargo.toml` + 5 crates) compiles cleanly with edition 2024 on rustc 1.95. Resolved versions: `tokio 1`, `axum 0.8.9`, `sqlx 0.8.6`, `pgvector 0.4.1`, `reqwest 0.12.28`, `figment 0.10.19`, `clap 4.6.1`, `rmcp 0.1.5`, `tracing-subscriber 0.3.23`. Migration `0001_initial.sql` applied in 39 ms; all five tables, three required extensions (`pgcrypto`, `vector 0.8.2`, `pg_trgm 1.6`), and the four named indexes (including `embeddings_bge_m3_hnsw` HNSW partial) confirmed via `\dt`/`\dx`/`\di`. Note: `chrono` resolved transitively (figment → uncased → chrono); we use `time` directly per workspace deps, so this is a transitive duplicate, not a workspace-level inconsistency.

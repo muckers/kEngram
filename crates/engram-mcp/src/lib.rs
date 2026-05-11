@@ -8,7 +8,13 @@
 //! they're invokable over an MCP transport.
 
 pub mod capture;
+pub mod search;
 pub mod server;
 
 pub use capture::{capture, CaptureError, CaptureRequest, CaptureResponse, MAX_CONTENT_LEN};
-pub use server::{CaptureArgs, EngramServer};
+pub use search::{
+    get_thought, recent_thoughts, search_thoughts, GetThoughtResponse, ReadError, RecentRequest,
+    RecentResponse, SearchHit, SearchRequest, SearchResponse, DEFAULT_SEARCH_LIMIT,
+    DEFAULT_TOP_K_PER_LEG, MAX_SEARCH_LIMIT,
+};
+pub use server::{CaptureArgs, EngramServer, GetThoughtArgs, RecentThoughtsArgs, SearchThoughtsArgs};
