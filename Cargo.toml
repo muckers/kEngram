@@ -35,7 +35,7 @@ serde_json = "1"
 
 # IDs and timestamps
 uuid = { version = "1", features = ["v4", "serde"] }
-time = { version = "0.3", features = ["serde", "macros"] }
+time = { version = "0.3", features = ["serde", "serde-well-known", "macros", "formatting", "parsing"] }
 
 # Tracing
 tracing            = "0.1"
@@ -57,3 +57,6 @@ clap = { version = "4", features = ["derive"] }
 
 # MCP
 rmcp = "0.1"
+
+# Test utilities (dev-deps)
+wiremock = "0.6"
