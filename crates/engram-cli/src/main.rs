@@ -32,6 +32,15 @@ enum Command {
     Serve,
     /// Apply pending database migrations.
     Migrate,
+    /// Embed thoughts that don't yet have an embedding row for the active model.
+    EmbedBackfill {
+        /// Restrict to a single scope.
+        #[arg(long)]
+        scope: Option<String>,
+        /// Maximum number of thoughts to embed in this run. Defaults to 1000.
+        #[arg(long, default_value_t = 1000)]
+        limit: i64,
+    },
 }
 
 fn init_tracing() {
@@ -119,6 +128,41 @@ async fn run_migrate(config: Config) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn run_embed_backfill(
+    config: Config,
+    scope: Option<String>,
+    limit: i64,
+) -> anyhow::Result<()> {
+    let pool = PgPoolOptions::new()
+        .max_connections(config.database.max_connections)
+        .connect(&config.database.url)
+        .await
+        .with_context(|| format!("connecting to {}", config.database.url))?;
+
+    let embedder = build_embedder(&config.embedder)?;
+
+    let report =
+        engram_mcp::embed_backfill(&pool, embedder.as_ref(), scope.as_deref(), limit).await?;
+
+    tracing::info!(
+        found = report.found,
+        embedded = report.embedded,
+        failed = report.failed,
+        "backfill complete"
+    );
+
+    if report.failed > 0 {
+        // Non-zero exit so scripts/cron can detect partial failures.
+        anyhow::bail!(
+            "{} of {} thoughts failed to embed (see logs); {} succeeded",
+            report.failed,
+            report.found,
+            report.embedded
+        );
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     init_tracing();
@@ -128,5 +172,6 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Serve => run_serve(config).await,
         Command::Migrate => run_migrate(config).await,
+        Command::EmbedBackfill { scope, limit } => run_embed_backfill(config, scope, limit).await,
     }
 }

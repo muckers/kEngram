@@ -311,6 +311,48 @@ pub async fn search_trigram(
         .collect()
 }
 
+/// Find thoughts that don't yet have an embedding row for the given model.
+/// Oldest first — backfill should clear the backlog FIFO.
+pub async fn find_unembedded_thoughts(
+    pool: &PgPool,
+    model: &EmbeddingModel,
+    scope: Option<&str>,
+    limit: i64,
+) -> Result<Vec<Thought>, StorageError> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT t.id, t.scope, t.content, t.source, t.created_at, t.metadata
+        FROM thoughts t
+        LEFT JOIN embeddings e
+            ON e.target_kind = 'thought'
+           AND e.target_id = t.id
+           AND e.model_id = $1
+        WHERE e.id IS NULL
+          AND ($2::text IS NULL OR t.scope = $2)
+        ORDER BY t.created_at ASC
+        LIMIT $3
+        "#,
+        model.id,
+        scope,
+        limit,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|r| {
+            Ok(Thought {
+                id: ThoughtId::from(r.id),
+                scope: Scope::new(r.scope)?,
+                content: r.content,
+                source: Source::new(r.source)?,
+                created_at: r.created_at,
+                metadata: Metadata::from(r.metadata),
+            })
+        })
+        .collect()
+}
+
 /// Vector-similarity kNN over `embeddings` for the given model. Hits are
 /// returned in descending order of cosine similarity (`1 - cosine_distance`).
 /// Uses the per-model HNSW partial index (`embeddings_<model>_hnsw`).
@@ -667,5 +709,64 @@ mod tests {
         let id = ThoughtId::new();
         let prov = fetch_thought_with_provenance(&pool, id, &model).await.unwrap();
         assert!(prov.is_none());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn find_unembedded_thoughts_returns_thoughts_without_embedding(pool: PgPool) {
+        let model = EmbeddingModel::bge_m3();
+        let embedded = insert_test_thought(&pool, "embedded", "global").await;
+        let unembedded = insert_test_thought(&pool, "unembedded", "global").await;
+
+        insert_thought_embedding(
+            &pool,
+            embedded,
+            &Embedding::new(model.clone(), vec![0.0_f32; 1024]).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let pending = find_unembedded_thoughts(&pool, &model, None, 100).await.unwrap();
+        let ids: Vec<ThoughtId> = pending.iter().map(|t| t.id).collect();
+        assert!(ids.contains(&unembedded));
+        assert!(!ids.contains(&embedded));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn find_unembedded_thoughts_respects_scope_and_limit(pool: PgPool) {
+        let model = EmbeddingModel::bge_m3();
+        for i in 0..5 {
+            insert_test_thought(&pool, &format!("work-{i}"), "work").await;
+        }
+        for i in 0..3 {
+            insert_test_thought(&pool, &format!("personal-{i}"), "personal").await;
+        }
+
+        let work = find_unembedded_thoughts(&pool, &model, Some("work"), 100).await.unwrap();
+        assert_eq!(work.len(), 5);
+        assert!(work.iter().all(|t| t.scope.as_str() == "work"));
+
+        let limited = find_unembedded_thoughts(&pool, &model, None, 4).await.unwrap();
+        assert_eq!(limited.len(), 4);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn find_unembedded_thoughts_is_per_model(pool: PgPool) {
+        let model_a = EmbeddingModel::new("a:1024", 1024);
+        let model_b = EmbeddingModel::new("b:1024", 1024);
+
+        let t = insert_test_thought(&pool, "hi", "global").await;
+        insert_thought_embedding(
+            &pool,
+            t,
+            &Embedding::new(model_a.clone(), vec![0.0_f32; 1024]).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        // Under model_a it's embedded; under model_b it's still pending.
+        let pending_a = find_unembedded_thoughts(&pool, &model_a, None, 10).await.unwrap();
+        let pending_b = find_unembedded_thoughts(&pool, &model_b, None, 10).await.unwrap();
+        assert!(pending_a.iter().all(|x| x.id != t));
+        assert!(pending_b.iter().any(|x| x.id == t));
     }
 }

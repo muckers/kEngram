@@ -319,4 +319,23 @@ mod tests {
         .unwrap();
         assert!(matches!(e.embed(&[]).await, Err(EmbedderError::EmptyBatch)));
     }
+
+    /// Hits a real Ollama at localhost:11434 with `bge-m3` pulled. Gated on
+    /// the `integration` feature. Run with `cargo test -p engram-embed
+    /// --features integration -- live_ollama`.
+    #[cfg(feature = "integration")]
+    #[tokio::test]
+    async fn live_ollama_returns_1024_dim_vector() {
+        let cfg = OpenAICompatibleConfig::ollama_local();
+        let dims = cfg.model.dimensions;
+        let e = OpenAICompatibleEmbedder::new(cfg).unwrap();
+        let out = e
+            .embed(&["the quick brown fox".to_string()])
+            .await
+            .expect("ollama unreachable — is the daemon up and 'bge-m3' pulled?");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].len(), dims);
+        // Sanity: the vector shouldn't be all zeros.
+        assert!(out[0].iter().any(|x| x.abs() > 1e-6));
+    }
 }

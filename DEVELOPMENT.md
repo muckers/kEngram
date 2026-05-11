@@ -44,20 +44,29 @@ curl http://localhost:11434/v1/embeddings \
 # expect: 1024
 ```
 
-### 4. Run migrations (once M1 lands)
+### 4. Run migrations
 
 ```bash
+cargo run --bin engram -- migrate
+# or, equivalently
 sqlx migrate run
 ```
 
-The migration creates the extensions in the `engram` database and ships the schema described in `docs/engram-design-v0.md` §5.
+The migration creates the three required extensions in the `engram` database and ships the schema described in `docs/engram-design-v0.md` §5.
 
-### 5. Build and test
+### 5. Build, test, run
 
 ```bash
 cargo build --workspace
-cargo test --workspace
+cargo test --workspace                       # 106 tests (unit + sqlx::test)
+cargo test --workspace --features integration   # adds a live-Ollama round-trip test
+
+cargo run --bin engram -- serve              # starts the MCP server on 127.0.0.1:8080
 ```
+
+Point an MCP-capable client (Claude Code, Claude Desktop, `mcp-inspector`) at `http://127.0.0.1:8080/sse`.
+
+`sqlx::query!` macros and the `sqlx::test` attribute both require `DATABASE_URL` to be set at *build time*, not just at runtime. The `.env` file at the workspace root is read by `sqlx-cli` but NOT by `cargo build` — set `DATABASE_URL` in your shell or pass it inline: `DATABASE_URL=... cargo build`.
 
 ## Common operations
 
@@ -73,6 +82,35 @@ docker exec -it engram-postgres psql -U engram -d engram
 
 # Tail Postgres logs
 docker compose logs -f postgres
+
+# Find captures that landed as `embedding_status: "pending"` (e.g. because
+# Ollama was down at capture time) and re-embed them inline:
+cargo run --bin engram -- embed-backfill --limit 1000
+# or restricted to one scope:
+cargo run --bin engram -- embed-backfill --scope work --limit 100
+```
+
+## Configuration
+
+Defaults live in code. Override via `~/.config/engram/engram.toml`, a `--config <path>` argument, or `ENGRAM_*` env vars (nested via `__`, e.g. `ENGRAM_DATABASE__URL`).
+
+Example `engram.toml`:
+
+```toml
+[server]
+bind = "127.0.0.1:8080"
+
+[database]
+url = "postgres://engram:engram@localhost:5432/engram"
+max_connections = 10
+
+[embedder]
+provider = "openai-compatible"
+endpoint = "http://localhost:11434/v1"   # Ollama for dev; TEI in production
+model = "bge-m3"
+model_id = "bge-m3:1024"                 # must match an HNSW partial index
+dimensions = 1024
+timeout_seconds = 5
 ```
 
 ## Port conflicts

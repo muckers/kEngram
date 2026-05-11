@@ -7,10 +7,12 @@
 //! [`EngramServer`] type wires them into rmcp's `ServerHandler` trait so
 //! they're invokable over an MCP transport.
 
+pub mod backfill;
 pub mod capture;
 pub mod search;
 pub mod server;
 
+pub use backfill::{BackfillError, BackfillReport, embed_backfill};
 pub use capture::{capture, CaptureError, CaptureRequest, CaptureResponse, MAX_CONTENT_LEN};
 pub use search::{
     get_thought, recent_thoughts, search_thoughts, GetThoughtResponse, ReadError, RecentRequest,

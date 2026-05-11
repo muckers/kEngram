@@ -19,3 +19,10 @@ tracing.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 wiremock.workspace = true
+
+[features]
+# Enables integration tests that hit a real Ollama instance at
+# http://localhost:11434/v1 with `bge-m3` pulled. Off by default; run with
+# `cargo test --features integration` after `docker compose up postgres` and
+# `ollama pull bge-m3`.
+integration = []
