@@ -283,7 +283,91 @@ There are two write paths. Both terminate in the same `thoughts` row plus an emb
 
 **Designed-in seam for async embedding.** [M2+] In M1 the capture handler calls `Embedder::embed(...)` directly. In M2 the worker process appears, and the same capture handler is changed in *one place*: instead of calling `embed` inline, it enqueues a job; the worker drains the queue. The MCP tool contract stays identical; capture continues to return a thought ID immediately; the embedding row becomes available shortly after (with a brief window during which `search_thoughts` may not surface the brand-new thought via vector — trigram still finds it).
 
-The worker also runs the **session reflector** [M2+], opt-in via `[reflector] enabled = true`. On its cron schedule (`tokio-cron-scheduler` 6-field cron; default `0 0 3 * * *` — 03:00 daily) it walks **unfacted thoughts** (`LEFT JOIN facts ON source_thought_id WHERE facts.id IS NULL`, ASC by `created_at`), asks the extractor to derive structured facts, and writes them with full provenance (`source_run_id` → `reflector_runs`). See §10 for drift handling.
+The worker also runs the **session reflector** [M2+], opt-in via `[reflector] enabled = true`. On its cron schedule (`tokio-cron-scheduler` 6-field cron; default `0 0 3 * * *` — 03:00 daily) it walks **unfacted thoughts** (`LEFT JOIN facts ON source_thought_id WHERE facts.id IS NULL`, ASC by `created_at`), asks the extractor to derive structured facts, and writes them with full provenance (`source_run_id` → `reflector_runs`). The reflector pipeline is the subject of §6.5; §10 covers drift defense.
+
+## 6.5 Fact extraction pipeline
+
+This is the M2 capability that distinguishes Engram from "MCP server + Postgres + a vector index." On a schedule the operator controls, the reflector reads each unfacted thought and derives **facts** — structured rows that capture what the thought claims, queryable as data.
+
+**Why facts matter.** Thoughts are raw and free-form; you search them lexically (trigram) or semantically (vector kNN). Facts are a second, structured layer over the same captures: each row is a self-contained natural-language statement, optionally decomposed into an `(S, P, O)` triple, with a `confidence`, a pointer back to the source thought, and provenance (`extractor_model`, `extractor_version`, `source_run_id`). The same captures become two independently-queryable surfaces — natural language for "what did I write?" and structured data for "what claims exist about X?" — without either surface being the source of truth. The thought is the source of truth; facts are derived data that can be re-derived from a different model.
+
+**The pipeline.** Six discrete steps, all in `engram worker`'s reflector task:
+
+1. **Open a run.** `INSERT INTO reflector_runs (extractor_model, extractor_version, scope_filter) RETURNING id`. Every fact produced by this pass will carry this `run_id` in `facts.source_run_id` — so an entire bad run can later be jointly retracted with `UPDATE facts SET superseded_at = NOW() WHERE source_run_id = ...`.
+
+2. **Walk unfacted thoughts.** `SELECT thoughts.* FROM thoughts LEFT JOIN facts ON facts.source_thought_id = thoughts.id WHERE facts.id IS NULL [AND thoughts.scope = $1] ORDER BY thoughts.created_at ASC LIMIT $2`. The LEFT-JOIN-IS-NULL guarantees idempotency: re-running the reflector on a stable corpus produces no new rows. Thoughts whose only facts are *superseded* still have rows in `facts` and so are excluded — re-extracting a thought the operator already corrected would defeat the correction.
+
+3. **Extract.** For each thought, call `Extractor::extract(thought, ctx)`. The default impl (`OpenAICompatibleExtractor`) POSTs to `/v1/chat/completions` with a system prompt that defines the output schema and `response_format: { type: "json_schema", json_schema: { strict: true, schema: { ... } } }`. JSON-Schema-guided decoding (vLLM's `xgrammar`/`outlines`, OpenRouter's structured outputs) makes the response shape guaranteed-parseable. Schema:
+
+    ```json
+    {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "facts": {
+          "type": "array",
+          "items": {
+            "type": "object", "additionalProperties": false,
+            "properties": {
+              "statement":  { "type": "string" },
+              "subject":    { "type": ["string", "null"] },
+              "predicate":  { "type": ["string", "null"] },
+              "object":     { "type": ["string", "null"] },
+              "confidence": { "type": "number" }
+            },
+            "required": ["statement", "subject", "predicate", "object", "confidence"]
+          }
+        }
+      },
+      "required": ["facts"]
+    }
+    ```
+
+    On per-thought extractor failure (`Timeout`, `Unreachable`, `Backend 5xx`, malformed response, model-id mismatch), the reflector **soft-fails**: logs a warning with `transient = err.is_transient()`, increments `n_extractor_failures`, and continues with the next thought. The unfacted thought stays in the LEFT-JOIN-IS-NULL set and the next tick retries it. No special "extractor attempted but failed" marker is needed.
+
+4. **Route by confidence.** Facts with `confidence ≥ review_queue_below` (default 0.7) commit to `facts` via `insert_fact(NewFact { ... })`. Below threshold, they land in `facts_review_queue` for operator decision — `decision` defaults to `'pending'`; the review-queue UX lands at M5. M2 ships single-band routing; the three-band design (with a "stored but flagged" middle band requiring a `flagged` column on `facts`) is deferred — see §10.
+
+5. **Close the run.** `UPDATE reflector_runs SET finished_at = NOW(), n_thoughts_processed = $1, n_facts_committed = $2, n_review_queue = $3 WHERE id = $4`. The run-row is the audit anchor: an operator can later see exactly when each extractor pass happened, how much it produced, and which model produced it.
+
+6. **(Optional) Operator review.** The CLI surface is `engram reflect [--scope <s>] [--limit <n>]` for an on-demand pass instead of waiting for the cron, and `engram reflect --rerun [--since <RFC3339>]` to re-evaluate already-facted thoughts when the extractor model is upgraded. Rerun is **additive only**: existing active facts the new extractor doesn't reproduce stay active. Rationale in §10 §5.
+
+**Concrete example.** A thought: *"Talked to Sarah today about the PR backlog. She wants migration #0042 fast-tracked because the mobile freeze starts Thursday."* A reasonable extraction:
+
+```json
+{ "facts": [
+    { "statement": "Sarah wants migration #0042 fast-tracked",
+      "subject": "Sarah", "predicate": "wants fast-tracked", "object": "migration #0042",
+      "confidence": 0.9 },
+    { "statement": "Mobile freeze starts Thursday",
+      "subject": "mobile freeze", "predicate": "starts", "object": "Thursday",
+      "confidence": 0.85 }
+] }
+```
+
+Both facts commit (0.9 and 0.85 are above the default 0.7). They're now retrievable via `search_facts("mobile freeze")` independently of vector kNN over the thought, and `get_thought(source_id)` returns both in `linked_facts`.
+
+**What the operator gets.** Facts are first-class data with full provenance. Concrete queries that become trivial:
+
+```sql
+-- All active facts the current extractor version produced this week
+SELECT statement, confidence FROM facts
+WHERE superseded_at IS NULL
+  AND extractor_model = 'vllm/qwen2.5-7b-instruct'
+  AND extractor_version = 1
+  AND created_at >= NOW() - INTERVAL '7 days';
+
+-- Facts produced by a specific run (useful when reviewing a run before/after a model swap)
+SELECT statement, confidence FROM facts WHERE source_run_id = $1;
+
+-- Which thoughts are still unfacted in a scope?
+SELECT t.id, t.content FROM thoughts t
+LEFT JOIN facts f ON f.source_thought_id = t.id
+WHERE f.id IS NULL AND t.scope = 'work';
+
+-- Operator-authored corrections vs. machine-authored facts
+SELECT statement FROM facts WHERE extractor_model = 'manual';
+```
+
+These are the queries that make `engram audit` (M5) trivial. They also make Engram's "memory I can reason about" pitch real: a year from now, the operator can ask the agent "what did I learn about X?" and get back structured rows with confidence and provenance — not a vector-search blob.
 
 ## 7. Retrieval path
 
@@ -477,7 +561,7 @@ vLLM's `--tensor-parallel-size 2` is the obvious deployment shape. The embedder 
 
 ## 10. Provenance, extraction drift, and reconciliation
 
-This entire section describes M2+ behavior — M1 has no extractor and therefore no facts to drift. The mechanisms below land alongside the facts pipeline at M2.
+§6.5 describes the fact-extraction pipeline as a capability — what it produces and how. This section is the defensive counterweight: how Engram keeps extraction honest, given that LLMs hallucinate, model versions drift, and the operator may not notice for months. Everything below is M2+ behavior — M1 has no extractor and therefore no facts to drift.
 
 This section addresses the operator's specific concern: *"I don't want there to be drift from truth when the session reflector extracts facts."*
 
@@ -577,3 +661,4 @@ Carrying forward:
 - **2026-05-09** — Revised by engineer + architect after the milestone-roadmap brainstorm. Added §3.5 milestone roadmap. Corrected schema in §5: added `CREATE EXTENSION` lines for `pgcrypto`/`vector`/`pg_trgm`; removed trailing comma in `thoughts`; replaced the `current_setting`-based partial HNSW index (which the Postgres planner rejects, since `current_setting` is `STABLE` not `IMMUTABLE`) with a literal-model partial index (`embeddings_bge_m3_hnsw`); added `thoughts_scope_recent_idx` and `thoughts_content_trgm_idx`; added `target_kind` CHECK on `embeddings`. Reframed §6 (M1 sync embedding via TEI; M2+ async seam), §7 (RRF hybrid; reranker M3), §8 (per-tool milestone column), §9 (Embedder M1, Extractor M2; `CloudEmbedder` added; active-embedder via config). Reframed §12 auth tiers as a milestone progression and dropped Tier 3 from the table. Pruned resolved open questions in §14. Doc now describes the M5-complete terminal state with milestone callouts inline.
 - **2026-05-13** — **M2 complete.** Shipped in four phases A–D (see `docs/milestones/m2-progress.md`). Facts pipeline live: async embedding seam (capture enqueues; `engram worker` drains), reflector cron via `tokio-cron-scheduler` 0.15 (default off — opt-in via `[reflector] enabled = true`), `OpenAICompatibleExtractor` covering vLLM and OpenRouter via named-constructor presets, two new MCP tools (`search_facts`, `correct_fact`), `get_thought` now carries active `linked_facts`, and a new `engram reflect` subcommand with `--rerun [--since <RFC3339>]` for re-extracting historical thoughts (idempotent; supersedes on (S,P,O)-match-but-statement-differs; additive only). **Phase D simplification:** `search_facts` ships trigram-only inside an RRF-shaped pipeline — fact embeddings are wired through migration 0001's `target_kind = 'fact'` enum but the worker doesn't yet enqueue facts; the vector leg lands in M3 (search quality) alongside the cross-encoder reranker. **`correct_fact` provenance:** manual rows use the sentinel `extractor_model = "manual"`, `extractor_version = 0`, `source_run_id = NULL`, `confidence = 1.0`. Three-band confidence routing (the "flagged but committed" middle band from §10) is deferred — needs a `flagged` column on `facts` that doesn't exist yet. M2 success criteria #1–#5 met by code; #6 (operator dogfood ≥ 1 week) is the only remaining open item.
 - **2026-05-13** — Reconciled doc against shipped M1 + M2 code. §5 schema block extended with migration 0002's three tables (`pending_embeddings`, `reflector_runs`, `facts_review_queue`) and `facts.source_run_id`. §7 `SearchRequest` snippet matches the shipped struct (no `mode: SearchMode` or `include_facts: bool` — neither was implemented); added a `SearchFactsRequest` peer. §8 tool descriptions tightened: `capture` documents the always-pending return; `get_thought` calls out `linked_facts`; `search_facts` notes the trigram-only / M3-vector-leg state; `correct_fact` documents the manual-sentinel provenance and retract-via-no-replacement variant. §9 trait signatures match the code (`Embedder::model() -> &EmbeddingModel`, `Extractor` takes `&Thought`, both return typed errors with `is_transient()`); added the `Fact` read-shape struct; replaced the fictional `TeiEmbedder` / `CloudEmbedder` / `OpenRouterExtractor` defaults with the actual `OpenAICompatibleEmbedder` / `FakeEmbedder` / `OpenAICompatibleExtractor` / `FakeExtractor` set. §9 default-config TOML and §11 process-model paragraph match shipped fields and values (6-field cron, opt-in reflector, single-threshold routing). §10 mechanism #3 reframed as single-band with the three-band band noted as deferred; mechanism #5 documents `--rerun` as additive-only.
+- **2026-05-13** — Added §6.5 "Fact extraction pipeline" as the affirmative companion to §10. §6.5 leads with *why facts matter* (the structured-second-layer story: same captures, two queryable surfaces, thought stays source-of-truth), walks the six-step pipeline (open run → walk unfacted thoughts → extract via JSON-Schema-guided decoding → route by confidence → close run → optional operator review/rerun), shows the exact `response_format` JSON Schema, gives a worked example (a casual conversation capture becoming two facts), and ends with operator-facing SQL ("here are the queries that become trivial once you have a facts table"). §10 reframed as the drift-defense counterweight — same content, but explicitly positioned as the defensive complement to §6.5 rather than the only place facts are discussed.
