@@ -183,7 +183,9 @@ CREATE INDEX embeddings_bge_m3_hnsw
     ON embeddings USING hnsw (vector vector_cosine_ops)
     WHERE model_id = 'bge-m3:1024';
 
--- Reserved for M2.
+-- Structured facts. Populated from M2 onward by the reflector (and by
+-- `correct_fact` for manual overrides). `source_run_id` joins back to
+-- `reflector_runs` so a whole bad run can be jointly retracted later.
 CREATE TABLE facts (
     id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     scope               TEXT NOT NULL,
@@ -193,11 +195,12 @@ CREATE TABLE facts (
     object              TEXT,
     source_thought_id   UUID REFERENCES thoughts(id) ON DELETE CASCADE,
     source_chunk_id     UUID REFERENCES artifact_chunks(id) ON DELETE CASCADE,
-    extractor_model     TEXT NOT NULL,
+    extractor_model     TEXT NOT NULL,       -- 'vllm/qwen2.5-7b-instruct' | 'manual' | ...
     extractor_version   INT NOT NULL,
     confidence          REAL NOT NULL CHECK (confidence BETWEEN 0 AND 1),
     superseded_by       UUID REFERENCES facts(id),
     superseded_at       TIMESTAMPTZ,
+    source_run_id       UUID REFERENCES reflector_runs(id),  -- added at M2; NULL for manual rows
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CHECK (source_thought_id IS NOT NULL OR source_chunk_id IS NOT NULL)
 );
@@ -205,6 +208,63 @@ CREATE TABLE facts (
 CREATE INDEX facts_active_idx
     ON facts (scope, created_at DESC)
     WHERE superseded_at IS NULL;
+
+-- M2 additions follow. These three tables ship in migration 0002.
+
+-- Durable FIFO queue backing the async embedding seam. Capture inserts a
+-- row; `engram worker`'s drainer task pulls batches via
+-- `UPDATE ... FROM (SELECT ... FOR UPDATE SKIP LOCKED LIMIT $1)`.
+-- The UNIQUE constraint makes enqueue idempotent.
+CREATE TABLE pending_embeddings (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    target_kind     TEXT NOT NULL CHECK (target_kind IN ('thought','artifact_chunk','fact')),
+    target_id       UUID NOT NULL,
+    model_id        TEXT NOT NULL,                    -- pairs the job with the right embedder
+    enqueued_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    attempts        INT NOT NULL DEFAULT 0,
+    last_attempt_at TIMESTAMPTZ,
+    last_error      TEXT,
+    UNIQUE (target_kind, target_id, model_id)
+);
+CREATE INDEX pending_embeddings_dequeue_idx ON pending_embeddings (enqueued_at ASC);
+
+-- One row per reflector pass. Backs facts.source_run_id so an entire bad
+-- run can be retracted by joining on this id. `error` is only populated
+-- when the run itself fails at the orchestrator level — per-thought
+-- extractor failures are soft and counted via the n_* fields.
+CREATE TABLE reflector_runs (
+    id                      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    started_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    finished_at             TIMESTAMPTZ,
+    extractor_model         TEXT NOT NULL,
+    extractor_version       INT NOT NULL,
+    scope_filter            TEXT,
+    n_thoughts_processed    INT NOT NULL DEFAULT 0,
+    n_facts_committed       INT NOT NULL DEFAULT 0,
+    n_review_queue          INT NOT NULL DEFAULT 0,
+    error                   TEXT
+);
+
+-- Landing zone for low-confidence extractions. `decision` is operator-flipped
+-- (Phase D ships pending → accept/reject; the review-queue UX lands at M5).
+CREATE TABLE facts_review_queue (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    statement           TEXT NOT NULL,
+    subject             TEXT,
+    predicate           TEXT,
+    object              TEXT,
+    confidence          REAL NOT NULL CHECK (confidence BETWEEN 0 AND 1),
+    source_thought_id   UUID REFERENCES thoughts(id) ON DELETE CASCADE,
+    source_chunk_id     UUID REFERENCES artifact_chunks(id) ON DELETE CASCADE,
+    extractor_model     TEXT NOT NULL,
+    extractor_version   INT NOT NULL,
+    source_run_id       UUID REFERENCES reflector_runs(id),
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    reviewed_at         TIMESTAMPTZ,
+    decision            TEXT NOT NULL DEFAULT 'pending'
+                          CHECK (decision IN ('pending','accept','reject')),
+    CHECK (source_thought_id IS NOT NULL OR source_chunk_id IS NOT NULL)
+);
 ```
 
 **Why embeddings are a separate table.** A model swap is a re-index, not a re-write. With this layout we insert a new row in `embeddings` per `(target, new model)`, build a new HNSW partial index for the new model, and once the operator is satisfied with retrieval quality, optionally drop the old rows and old index. No data is lost during the swap.
@@ -223,7 +283,7 @@ There are two write paths. Both terminate in the same `thoughts` row plus an emb
 
 **Designed-in seam for async embedding.** [M2+] In M1 the capture handler calls `Embedder::embed(...)` directly. In M2 the worker process appears, and the same capture handler is changed in *one place*: instead of calling `embed` inline, it enqueues a job; the worker drains the queue. The MCP tool contract stays identical; capture continues to return a thought ID immediately; the embedding row becomes available shortly after (with a brief window during which `search_thoughts` may not surface the brand-new thought via vector — trigram still finds it).
 
-The worker also runs the **session reflector** [M2+]. Periodically (configurable; default `0 3 * * *` daily) it walks recent thoughts in a scope, asks the extractor to derive structured facts, and writes them with full provenance. See §10 for drift handling.
+The worker also runs the **session reflector** [M2+], opt-in via `[reflector] enabled = true`. On its cron schedule (`tokio-cron-scheduler` 6-field cron; default `0 0 3 * * *` — 03:00 daily) it walks **unfacted thoughts** (`LEFT JOIN facts ON source_thought_id WHERE facts.id IS NULL`, ASC by `created_at`), asks the extractor to derive structured facts, and writes them with full provenance (`source_run_id` → `reflector_runs`). See §10 for drift handling.
 
 ## 7. Retrieval path
 
@@ -242,15 +302,22 @@ Three retrieval primitives, composable:
 Why RRF over a weighted-score blend like `α·cos_sim + β·bm25 + γ·exp(-age/τ)`: RRF is parameter-light, robust to score-distribution differences between heterogeneous rankers, and is the de-facto choice for vector + lexical hybrids in current information-retrieval literature. It also generalizes cleanly to a third ranker when the M3 reranker is added.
 
 ```rust
-pub struct SearchRequest {
+pub struct SearchRequest {                       // [M1]
     pub query: String,
-    pub scope: Option<String>,
-    pub limit: usize,                 // default 10
-    pub mode: SearchMode,             // Hybrid | Semantic | Lexical | Recent
-    pub recency_half_life_days: f32,  // default 30
-    pub include_facts: bool,          // [M2+] attach extracted facts to results
+    pub scope: Option<Scope>,
+    pub limit: Option<usize>,                    // defaults to 10; max 100
+    pub recency_half_life_days: Option<f32>,     // default 30; 0 disables
+}
+
+pub struct SearchFactsRequest {                  // [M2 Phase D]
+    pub query: String,
+    pub scope: Option<Scope>,
+    pub limit: Option<usize>,
+    pub recency_half_life_days: Option<f32>,     // keyed on source thought's created_at
 }
 ```
+
+The two share a shape and an error type (`ReadError`). `search_facts` is trigram-only in M2 — the vector leg lands in M3 alongside the reranker. Active (non-superseded) facts derived from a thought come back via `get_thought`'s `linked_facts` field rather than a flag on `SearchRequest`.
 
 **Reranker.** [M3] M3 adds a cross-encoder rerank pass after RRF fusion: retrieve a wider candidate set (typically top-50), rerank with BGE-reranker via TEI to get the final top-N. The MCP search interface is unchanged.
 
@@ -260,16 +327,16 @@ Tools and the milestone in which each ships. Names and signatures are part of th
 
 | Tool | Milestone | Purpose |
 |---|---|---|
-| `capture` | M1 | Store a thought. Returns `thought_id`. |
-| `search_thoughts` | M1 | Hybrid retrieval over thoughts. |
+| `capture` | M1 | Store a thought. Returns `thought_id` + `embedding_status: "pending"`; the worker drains the embed queue on its tick. From M2, `embedding_status` is *always* `pending` (the synchronous-embed path is gone). |
+| `search_thoughts` | M1 | Hybrid retrieval over thoughts. RRF-fused vector + trigram + recency boost; gracefully degrades to trigram-only when the embedder is unreachable. |
 | `recent_thoughts` | M1 | Browse by recency in a scope. |
-| `get_thought` | M1 | Full thought + provenance. (Linked-facts join lights up at M2.) |
-| `search_facts` | M2 | Retrieval over extracted facts. |
-| `correct_fact` | M2 | Human/agent override: supersede or delete an extracted fact. |
+| `get_thought` | M1 (M2 adds `linked_facts`) | Full thought + provenance (`embedding_status`, `embedded_at`) plus active (non-superseded) facts derived from it. |
+| `search_facts` | M2 | Trigram retrieval over `facts.statement`, filtered to active rows. Each result includes the source thought's content/scope/created_at — no follow-up `get_thought` call needed. M3 adds the vector leg. |
+| `correct_fact` | M2 | Operator-driven correction. With a replacement: inserts a manual-author row (`extractor_model="manual"`, `extractor_version=0`, `source_run_id=NULL`, `confidence=1.0`) and supersedes the old one. Without: retracts via supersede with no successor. Audit trail (`superseded_by`, `superseded_at`) is preserved either way. |
 | `ingest_artifact` | M4 | Async ingest of a longer document. |
 | `stats` | M5 | Per-scope counts, last activity, embedding model version. |
 
-`correct_fact` (M2) matters: it is the explicit user-facing knob for "the extractor got it wrong." It writes a new fact pointing at the same source thought and marks the old one superseded.
+`correct_fact` is the explicit operator knob for "the extractor got it wrong." The manual-sentinel provenance shape (`extractor_model = "manual"`, `extractor_version = 0`) lets a single query separate machine-authored facts from human-authored ones: `WHERE extractor_model = 'manual'` finds operator corrections; `WHERE extractor_model <> 'manual' AND extractor_version < N` finds stale-extractor rows that need re-evaluation.
 
 ## 9. Embedding & extraction abstraction
 
@@ -278,37 +345,53 @@ Two traits, one config struct, no other architectural concession to model choice
 ```rust
 #[async_trait]                      // [M1]
 pub trait Embedder: Send + Sync {
-    fn model_id(&self) -> &'static str;
-    fn dimensions(&self) -> usize;
-    async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
+    fn model(&self) -> &EmbeddingModel;          // { id: String, dimensions: usize }
+    async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedderError>;
 }
 
 #[async_trait]                      // [M2]
 pub trait Extractor: Send + Sync {
-    fn model_id(&self) -> &'static str;
-    fn version(&self) -> u32;
+    fn model_id(&self) -> &str;                  // e.g. "vllm/qwen2.5-7b-instruct"
+    fn version(&self) -> i32;                    // bumped when prompt/schema changes
     async fn extract(
         &self,
-        thought: &str,
+        thought: &Thought,                       // takes the full row, not just &str
         ctx: &ExtractionContext,
-    ) -> Result<Vec<ExtractedFact>>;
+    ) -> Result<Vec<ExtractedFact>, ExtractorError>;
 }
 
-pub struct ExtractedFact {          // [M2]
+pub struct ExtractedFact {          // [M2] — write shape (extractor output)
     pub statement: String,
     pub subject: Option<String>,
     pub predicate: Option<String>,
     pub object: Option<String>,
     pub confidence: f32,
 }
+
+pub struct Fact {                   // [M2 Phase D] — read shape (DB row)
+    pub id: Uuid,
+    pub scope: Scope,
+    pub statement: String,
+    pub subject: Option<String>,
+    pub predicate: Option<String>,
+    pub object: Option<String>,
+    pub source_thought_id: ThoughtId,
+    pub extractor_model: String,
+    pub extractor_version: i32,
+    pub source_run_id: Option<Uuid>,
+    pub confidence: f32,
+    pub created_at: OffsetDateTime,
+}
 ```
+
+Both `EmbedderError` and `ExtractorError` carry an `is_transient(&self) -> bool` so capture/drain/reflector orchestrators can decide retry vs. mark-failed on a per-call basis. `Timeout`, `Unreachable`, and `Backend { status: 500..=599, .. }` are transient; everything else is not.
 
 **Default implementations:**
 
-- **`TeiEmbedder`** [M1] — calls a `text-embeddings-inference` (TEI) sidecar over HTTP. Default `endpoint = http://localhost:8080`. Default model `BAAI/bge-m3`, `model_id = "bge-m3:1024"`, 1024 dimensions.
-- **`CloudEmbedder`** [M1] — calls Voyage AI or OpenAI embeddings. Intended for development environments where a local TEI sidecar isn't running. Off by default.
-- **`OpenAICompatibleExtractor`** [M2] — calls vLLM `/v1/chat/completions` with structured-output prompting (JSON Schema or grammar-constrained). Default `endpoint = http://localhost:8000/v1`. The model called is whatever vLLM is currently serving — we don't pin or pick it.
-- **`OpenRouterExtractor`** [M2] — opt-in cloud fallback for testing the model-swap path or when the local box is offline.
+- **`OpenAICompatibleEmbedder`** [M1] — one type covering every OpenAI-`/v1/embeddings`-shaped backend by config alone: Ollama (dev default, `http://localhost:11434/v1` + `bge-m3`), Hugging Face TEI (production sidecar), OpenAI, Voyage. Dimension validation against the declared `model.dimensions` is built in.
+- **`FakeEmbedder`** [M1] — deterministic in-memory embedder for tests. Configurable via `FakeBehavior` to always fail (`Timeout` / `Unreachable`) so soft-fail paths can be exercised without standing up TEI/Ollama.
+- **`OpenAICompatibleExtractor`** [M2] — one type covering every OpenAI-`/v1/chat/completions`-shaped backend that supports `response_format: { type: "json_schema" }`. Named-constructor presets `OpenAICompatibleConfig::vllm_local()` (default `http://localhost:8000/v1`, no key) and `::open_router(api_key, model)` (`https://openrouter.ai/api/v1` + Bearer auth) cover the production-sidecar and cloud-fallback paths. Operators picking any other backend (LM Studio, SGLang, etc.) use the `openai-compatible` provider with custom `endpoint` + `model_name`.
+- **`FakeExtractor`** [M2] — deterministic in-memory extractor mirroring `FakeEmbedder`. `with_confidence(f32)` drives review-queue-routing tests; `with_facts(Vec<ExtractedFact>)` pins explicit outputs; `always_failing(FakeBehavior)` exercises the soft-fail path.
 
 The trait boundary is the buffer-from-model-changes guarantee. Swapping vLLM's served model, swapping to SGLang, swapping to a cloud provider — all happen behind the same interface. The only operation that propagates beyond the trait is a re-embed when the *embedder* changes (which is why §5 makes embeddings a separate table).
 
@@ -319,31 +402,44 @@ Configuration is a TOML file:
 ```toml
 [database]
 # Postgres connection. Overridden by DATABASE_URL env var if set (sqlx convention).
-url = "postgres:///engram"
+url = "postgres://engram:engram@localhost:5432/engram"
 max_connections = 10
 
+[server]                                        # [M1]
+bind = "127.0.0.1:8080"                         # Tier 0 default — see §12
+
 [embedder]                                      # [M1]
-provider     = "tei"
-endpoint     = "http://localhost:8080"
-model        = "BAAI/bge-m3"
-model_id     = "bge-m3:1024"                    # must match an HNSW partial index
+provider     = "openai-compatible"
+endpoint     = "http://localhost:11434/v1"      # Ollama in dev; TEI in production
+model        = "bge-m3"                         # backend-side model name
+model_id     = "bge-m3:1024"                    # Engram-side identity; must match an HNSW index
 dimensions   = 1024
+timeout_seconds = 5
+
+[worker]                                        # [M2]
+tick_interval_seconds = 5                       # embed-drainer wakeup cadence
+batch_size            = 16                      # max jobs per tick
 
 [extractor]                                     # [M2+]
-provider              = "openai-compatible"     # vLLM
-endpoint              = "http://localhost:8000/v1"
-model                 = "Qwen/Qwen2.5-Coder-32B-Instruct-AWQ"
-temperature           = 0.1
+provider              = "openai-compatible"     # alternative: "openrouter"
+endpoint              = "http://localhost:8000/v1"   # vLLM default
+model_name            = "qwen2.5-7b-instruct"   # backend-side model name
+model_id              = "vllm/qwen2.5-7b-instruct"   # provenance label → facts.extractor_model
+model_version         = 1                       # bump when prompt/schema changes
+timeout_seconds       = 60
+temperature           = 0.2
 max_facts_per_thought = 8
-response_format       = "json_schema"
 
 [reflector]                                     # [M2+]
-enabled                  = true
-schedule                 = "0 3 * * *"          # cron: 3am daily, single-user friendly
-batch_size               = 50
-min_confidence_to_store  = 0.6
-review_queue_below       = 0.4
+enabled               = false                   # opt-in: flip to true once vLLM is up
+schedule              = "0 0 3 * * *"           # 6-field cron (sec min hour dom month dow). 03:00 daily.
+scope_filter          = ""                      # blank = all scopes
+max_thoughts_per_run  = 1000
+max_facts_per_thought = 8
+review_queue_below    = 0.7                     # confidence < this → facts_review_queue; ≥ → facts
 ```
+
+Single-threshold routing (`review_queue_below`) is the M2 Phase D simplification — the three-band design originally sketched in §10 (with a "stored but flagged" middle band) is deferred until `facts` grows a `flagged` column. See §10 and `docs/milestones/m2-progress.md`.
 
 **Hardware sizing — concrete on the Phase 1 / Phase 2 BOM, single-user.**
 
@@ -363,7 +459,7 @@ CPU embeddings via TEI on the 9800X3D run at ~50–150 ms per call. Engram's act
 
 **Why Coder-32B over a smaller model.** For strong tool use against opencode / Claude Code, model quality at the tool-call schema and multi-step planning level matters more than peak throughput. Qwen2.5-Coder-32B is one of the few open models where tool calling holds up under real agent loops — error recovery, multi-step planning, long tool-result reasoning. A 14B class model is sufficient for Engram's *own* extraction needs but underperforms on the operator's primary use case.
 
-**Reflection cost** [M2+]. A reflector pass over 50 thoughts is ~4k input tokens → ~1k structured output. At Coder-32B's vLLM throughput on a 3090 (≈75 tok/s per stream per the BOM), that's roughly 60 seconds. Default schedule is `0 3 * * *` (3am daily); contention with active agent work is non-existent at that hour. If the operator needs more frequent or real-time extraction for a particular scope, the schedule is per-scope tunable.
+**Reflection cost** [M2+]. A reflector pass over 50 thoughts is ~4k input tokens → ~1k structured output. At Coder-32B's vLLM throughput on a 3090 (≈75 tok/s per stream per the BOM), that's roughly 60 seconds. Default schedule is `0 0 3 * * *` — 6-field `tokio-cron-scheduler` cron meaning 03:00 daily; contention with active agent work is non-existent at that hour. For dev/test, tighten to something like `*/30 * * * * *` (every 30 seconds) or drive a one-shot pass with `engram reflect [--scope <s>] [--limit <n>]`.
 
 **Embedder placement is a deployment-time choice, not a code change.** TEI ships CPU and CUDA builds with identical HTTP APIs (`ghcr.io/huggingface/text-embeddings-inference:cpu-1.x` vs `:1.x`). Switching is a systemd unit edit; the Engram TOML doesn't change. CPU is the v0 default; GPU is appropriate later if capture rate grows or the operator wants sub-100ms capture latency for some interaction pattern.
 
@@ -391,11 +487,11 @@ This section addresses the operator's specific concern: *"I don't want there to 
 
 2. **Every fact carries its extractor identity.** `extractor_model` + `extractor_version` on every row. When the local extractor is upgraded, `WHERE extractor_version < N` finds every fact that needs re-evaluation.
 
-3. **Confidence-gated commit.** The extractor returns a self-rated confidence. Below `review_queue_below` (default 0.4), facts go to a review queue, not to `facts`. Between that and `min_confidence_to_store` (default 0.6), they're stored but flagged. Above, they're stored normally. Tunable per scope.
+3. **Confidence-gated commit.** The extractor returns a self-rated confidence. Below `review_queue_below` (default 0.7 as shipped in M2 Phase C/D), facts go to `facts_review_queue` for operator review; at-or-above, they commit directly to `facts`. M2 ships single-threshold routing. The original three-band design — adding a middle "stored but flagged" band between `review_queue_below` and a separate `min_confidence_to_store` — is deferred until `facts` gains a `flagged` column; tracked in `docs/milestones/m2-progress.md`.
 
 4. **Dual-extractor reconciliation (optional).** When `extractor.dual_run = true`, every reflection pass runs two distinct models (e.g. local Qwen3 and cloud Claude Haiku) and only commits facts both produced. Disagreements surface as review-queue items. Roughly doubles cost; recommended for high-stakes scopes only.
 
-5. **Re-extraction is a first-class operation.** `engram reflect --rerun --scope work --since 2026-01-01` re-runs the current extractor against historical thoughts and reconciles. New facts that match existing ones (same `(subject, predicate, object)`) are merged; conflicting ones supersede the old via `superseded_by`. The audit trail is preserved.
+5. **Re-extraction is a first-class operation.** `engram reflect --rerun --scope work --since 2026-01-01` re-runs the current extractor against historical thoughts and reconciles. New facts whose `(subject, predicate, object)` exactly matches an existing active row and whose `statement` is identical are no-ops (idempotency keystone); same `(S, P, O)` with a different `statement` inserts a new row and supersedes the old via `superseded_by`; new `(S, P, O)` triples insert as additional facts. **Phase D ships this additively only** — existing active facts that the new extractor doesn't reproduce stay active. Rationale: a single rerun reflects model drift in *how* facts are stated, not *what* the thought says, and subtractive logic risks losing real facts to sampling variance. Operators retract obsolete rows manually via `correct_fact`.
 
 **What this does not protect against:** a confident-and-wrong extractor producing a high-confidence wrong fact that no other extractor disagrees with. The mitigation is human review via `correct_fact` and periodic `engram audit` reports that surface low-traffic facts (potentially stale) and high-confidence facts that contradict source thoughts on lexical inspection.
 
@@ -410,7 +506,7 @@ This section addresses the operator's specific concern: *"I don't want there to 
 - `text-embeddings-inference` HTTP server for BGE-M3, sidecar pattern. **CPU build by default** for v0; swap to CUDA build by changing the systemd unit's container image (no Engram code or config change needed). Required from M1.
 - vLLM serving an instruct model — required from M2 onward (no extractor in M1). **Operated independently of Engram.** Engram is a client; the operator manages vLLM's lifecycle, model choice, and serving config. Engram only requires the OpenAI-compatible endpoint to be reachable.
 
-**Process model:** systemd units. `engram-server.service` exists from M1. `engram-tei.service` (the embeddings sidecar; CPU build by default — see §9) is required from M1. `engram-worker.service` joins at M2. vLLM and Postgres run as their own units, managed independently. The reflector is a Tokio-scheduled task inside the worker process (M2+), firing on a cron schedule (default `0 3 * * *`).
+**Process model:** systemd units. `engram-server.service` exists from M1. `engram-tei.service` (the embeddings sidecar; CPU build by default — see §9) is required from M1. `engram-worker.service` joins at M2 and runs *two* Tokio tasks inside one process: the embed-drainer (always on, pulls jobs off `pending_embeddings`) and the reflector (cron-scheduled via `tokio-cron-scheduler`, default `0 0 3 * * *` — 6-field cron, 03:00 daily). vLLM and Postgres run as their own units, managed independently. **The reflector task is opt-in**: `engram worker` defaults to `[reflector] enabled = false` so the binary works without vLLM running; the operator flips the flag once the extractor backend is up.
 
 **Why a cron schedule rather than continuous** [M2+]. Single-user means the reflector competes only with the operator's own active agent sessions for vLLM throughput. Scheduling it for off-hours (overnight, default) eliminates that contention entirely. If the operator wants more aggressive extraction for a specific scope, the schedule is per-scope tunable via the admin API.
 
@@ -479,4 +575,5 @@ Carrying forward:
 
 - **2026-05-09** — Initial v0 draft by Claude Desktop in a "technical PM" capacity.
 - **2026-05-09** — Revised by engineer + architect after the milestone-roadmap brainstorm. Added §3.5 milestone roadmap. Corrected schema in §5: added `CREATE EXTENSION` lines for `pgcrypto`/`vector`/`pg_trgm`; removed trailing comma in `thoughts`; replaced the `current_setting`-based partial HNSW index (which the Postgres planner rejects, since `current_setting` is `STABLE` not `IMMUTABLE`) with a literal-model partial index (`embeddings_bge_m3_hnsw`); added `thoughts_scope_recent_idx` and `thoughts_content_trgm_idx`; added `target_kind` CHECK on `embeddings`. Reframed §6 (M1 sync embedding via TEI; M2+ async seam), §7 (RRF hybrid; reranker M3), §8 (per-tool milestone column), §9 (Embedder M1, Extractor M2; `CloudEmbedder` added; active-embedder via config). Reframed §12 auth tiers as a milestone progression and dropped Tier 3 from the table. Pruned resolved open questions in §14. Doc now describes the M5-complete terminal state with milestone callouts inline.
-- **2026-05-13** — **M2 complete.** Shipped in four phases A–D (see `docs/milestones/m2-progress.md`). Facts pipeline live: async embedding seam (capture enqueues; `engram worker` drains), reflector cron via `tokio-cron-scheduler` 0.15 (default off — opt-in via `[reflector] enabled = true`), `OpenAICompatibleExtractor` covering vLLM and OpenRouter via named-constructor presets, two new MCP tools (`search_facts`, `correct_fact`), `get_thought` now carries active `linked_facts`, and a new `engram reflect` subcommand with `--rerun [--since <RFC3339>]` for re-extracting historical thoughts (idempotent; supersedes on (S,P,O)-match-but-statement-differs; additive only). **Phase D simplification:** `search_facts` ships trigram-only inside an RRF-shaped pipeline — fact embeddings are wired through migration 0001's `target_kind = 'fact'` enum but the worker doesn't yet enqueue facts; the vector leg lands in M3 (search quality) alongside the cross-encoder reranker. **`correct_fact` provenance:** manual rows use the sentinel `extractor_model = "manual"`, `extractor_version = 0`, `source_run_id = NULL`, `confidence = 1.0`. Three-band confidence routing (the "flagged but committed" middle band from §_section_) is deferred — needs a `flagged` column on `facts` that doesn't exist yet. M2 success criteria #1–#5 met by code; #6 (operator dogfood ≥ 1 week) is the only remaining open item.
+- **2026-05-13** — **M2 complete.** Shipped in four phases A–D (see `docs/milestones/m2-progress.md`). Facts pipeline live: async embedding seam (capture enqueues; `engram worker` drains), reflector cron via `tokio-cron-scheduler` 0.15 (default off — opt-in via `[reflector] enabled = true`), `OpenAICompatibleExtractor` covering vLLM and OpenRouter via named-constructor presets, two new MCP tools (`search_facts`, `correct_fact`), `get_thought` now carries active `linked_facts`, and a new `engram reflect` subcommand with `--rerun [--since <RFC3339>]` for re-extracting historical thoughts (idempotent; supersedes on (S,P,O)-match-but-statement-differs; additive only). **Phase D simplification:** `search_facts` ships trigram-only inside an RRF-shaped pipeline — fact embeddings are wired through migration 0001's `target_kind = 'fact'` enum but the worker doesn't yet enqueue facts; the vector leg lands in M3 (search quality) alongside the cross-encoder reranker. **`correct_fact` provenance:** manual rows use the sentinel `extractor_model = "manual"`, `extractor_version = 0`, `source_run_id = NULL`, `confidence = 1.0`. Three-band confidence routing (the "flagged but committed" middle band from §10) is deferred — needs a `flagged` column on `facts` that doesn't exist yet. M2 success criteria #1–#5 met by code; #6 (operator dogfood ≥ 1 week) is the only remaining open item.
+- **2026-05-13** — Reconciled doc against shipped M1 + M2 code. §5 schema block extended with migration 0002's three tables (`pending_embeddings`, `reflector_runs`, `facts_review_queue`) and `facts.source_run_id`. §7 `SearchRequest` snippet matches the shipped struct (no `mode: SearchMode` or `include_facts: bool` — neither was implemented); added a `SearchFactsRequest` peer. §8 tool descriptions tightened: `capture` documents the always-pending return; `get_thought` calls out `linked_facts`; `search_facts` notes the trigram-only / M3-vector-leg state; `correct_fact` documents the manual-sentinel provenance and retract-via-no-replacement variant. §9 trait signatures match the code (`Embedder::model() -> &EmbeddingModel`, `Extractor` takes `&Thought`, both return typed errors with `is_transient()`); added the `Fact` read-shape struct; replaced the fictional `TeiEmbedder` / `CloudEmbedder` / `OpenRouterExtractor` defaults with the actual `OpenAICompatibleEmbedder` / `FakeEmbedder` / `OpenAICompatibleExtractor` / `FakeExtractor` set. §9 default-config TOML and §11 process-model paragraph match shipped fields and values (6-field cron, opt-in reflector, single-threshold routing). §10 mechanism #3 reframed as single-band with the three-band band noted as deferred; mechanism #5 documents `--rerun` as additive-only.
