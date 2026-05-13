@@ -35,7 +35,7 @@ DATABASE_URL='postgres://engram:engram@localhost:5432/engram' \
   cargo run --bin engram -- serve
 ```
 
-The server binds `127.0.0.1:8080` by default and exposes an MCP-over-SSE endpoint at `/sse`. Point an MCP-capable client (Claude Code, Claude Desktop, `mcp-inspector`) at `http://127.0.0.1:8080/sse` to use the four tools.
+The server binds `127.0.0.1:8080` by default and exposes a streamable-HTTP MCP endpoint at `/mcp` (per the current MCP spec, via rmcp's `StreamableHttpService`). Point an MCP-capable client (Claude Code, Claude Desktop, `mcp-inspector`) at `http://127.0.0.1:8080/mcp` to use the four tools.
 
 ## MCP surface (M1)
 

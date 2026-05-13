@@ -10,8 +10,11 @@ use clap::{Parser, Subcommand};
 use engram_core::{Embedder, EmbeddingModel};
 use engram_embed::{OpenAICompatibleConfig, OpenAICompatibleEmbedder};
 use engram_mcp::EngramServer;
-use rmcp::transport::sse_server::SseServer;
+use rmcp::transport::streamable_http_server::{
+    StreamableHttpService, session::local::LocalSessionManager,
+};
 use sqlx::postgres::PgPoolOptions;
+use tokio_util::sync::CancellationToken;
 
 use crate::config::{Config, EmbedderConfig};
 
@@ -88,13 +91,19 @@ async fn run_serve(config: Config) -> anyhow::Result<()> {
 
     let pool_for_factory = pool.clone();
     let embedder_for_factory = embedder.clone();
-    let factory = move || EngramServer::new(pool_for_factory.clone(), embedder_for_factory.clone());
+    let factory = move || Ok(EngramServer::new(pool_for_factory.clone(), embedder_for_factory.clone()));
 
-    let server = SseServer::serve(bind)
+    let cancel = CancellationToken::new();
+    let mcp_service = StreamableHttpService::new(
+        factory,
+        LocalSessionManager::default().into(),
+        Default::default(),
+    );
+
+    let app = axum::Router::new().nest_service("/mcp", mcp_service);
+    let listener = tokio::net::TcpListener::bind(bind)
         .await
-        .with_context(|| format!("binding SSE server to {bind}"))?;
-
-    let cancel = server.with_service(factory);
+        .with_context(|| format!("binding HTTP server to {bind}"))?;
 
     tracing::info!(
         bind = %bind,
@@ -103,11 +112,24 @@ async fn run_serve(config: Config) -> anyhow::Result<()> {
         "engram serve started"
     );
 
-    tokio::signal::ctrl_c()
+    let shutdown = {
+        let cancel = cancel.clone();
+        async move {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    tracing::info!("shutdown signal received");
+                }
+                _ = cancel.cancelled() => {
+                    tracing::info!("cancellation token tripped");
+                }
+            }
+        }
+    };
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
         .await
-        .context("listening for ctrl-c")?;
-    tracing::info!("shutdown signal received");
-    cancel.cancel();
+        .context("axum::serve")?;
 
     Ok(())
 }

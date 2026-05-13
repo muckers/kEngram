@@ -23,5 +23,6 @@ rmcp.workspace = true
 serde.workspace = true
 sqlx.workspace = true
 tokio = { workspace = true, features = ["full"] }
+tokio-util.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
