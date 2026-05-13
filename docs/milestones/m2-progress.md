@@ -29,23 +29,23 @@ Living checklist tracking M2 implementation. Each phase ends in a runnable, revi
 
 End state: migration applied; new crate compiles; types and traits exist; nothing wired up yet.
 
-- [ ] Migration `0002_facts_pipeline.sql`:
-  - [ ] `pending_embeddings` queue: `(id UUID PK, target_kind TEXT, target_id UUID, model_id TEXT, enqueued_at TIMESTAMPTZ, attempts INT, last_attempt_at TIMESTAMPTZ, last_error TEXT)`
-  - [ ] `facts_review_queue`: `(id UUID PK, statement, subject, predicate, object, confidence, source_thought_id, extractor_model, extractor_version, source_run_id, created_at, reviewed_at, decision TEXT)` — `decision` ∈ `pending|accept|reject`
-  - [ ] `reflector_runs` table: `(id UUID PK, started_at, finished_at, extractor_model, extractor_version, scope_filter TEXT, n_thoughts_processed INT, n_facts_committed INT, n_review_queue INT, error TEXT)`
-  - [ ] Add `source_run_id UUID REFERENCES reflector_runs(id)` to `facts` (nullable for `manual` rows)
-  - [ ] Index `pending_embeddings_dequeue_idx (enqueued_at ASC)` for FIFO drain
-  - [ ] Index `facts_review_queue_pending_idx (created_at ASC) WHERE decision = 'pending'`
-- [ ] New crate `engram-extract`:
-  - [ ] Workspace member added in root `Cargo.toml`
-  - [ ] Compiles empty
-- [ ] `engram-core` additions:
-  - [ ] `ExtractedFact { statement, subject?, predicate?, object?, confidence }` type
-  - [ ] `ExtractionContext { scope, source_thought_id, max_facts }` type
-  - [ ] `Extractor` trait with `model_id()`, `version()`, `async extract(thought, ctx) -> Result<Vec<ExtractedFact>, ExtractorError>`
-  - [ ] `ExtractorError` enum with `is_transient()` classification (Timeout, Unreachable, 5xx are transient — mirror `EmbedderError`)
-- [ ] `cargo test --workspace`: still 106 passing
-- [ ] `cargo clippy --all-targets -- -D warnings`: clean
+- [x] Migration `0002_facts_pipeline.sql`:
+  - [x] `pending_embeddings` queue: `(id UUID PK, target_kind TEXT, target_id UUID, model_id TEXT, enqueued_at TIMESTAMPTZ, attempts INT, last_attempt_at TIMESTAMPTZ, last_error TEXT)`
+  - [x] `facts_review_queue`: `(id UUID PK, statement, subject, predicate, object, confidence, source_thought_id, extractor_model, extractor_version, source_run_id, created_at, reviewed_at, decision TEXT)` — `decision` ∈ `pending|accept|reject`
+  - [x] `reflector_runs` table: `(id UUID PK, started_at, finished_at, extractor_model, extractor_version, scope_filter TEXT, n_thoughts_processed INT, n_facts_committed INT, n_review_queue INT, error TEXT)`
+  - [x] Add `source_run_id UUID REFERENCES reflector_runs(id)` to `facts` (nullable for `manual` rows)
+  - [x] Index `pending_embeddings_dequeue_idx (enqueued_at ASC)` for FIFO drain
+  - [x] Index `facts_review_queue_pending_idx (created_at ASC) WHERE decision = 'pending'`
+- [x] New crate `engram-extract`:
+  - [x] Workspace member added in root `Cargo.toml`
+  - [x] Compiles empty
+- [x] `engram-core` additions:
+  - [x] `ExtractedFact { statement, subject?, predicate?, object?, confidence }` type
+  - [x] `ExtractionContext { scope, max_facts }` type
+  - [x] `Extractor` trait with `model_id()`, `version()`, `async extract(thought, ctx) -> Result<Vec<ExtractedFact>, ExtractorError>`
+  - [x] `ExtractorError` enum with `is_transient()` classification (Timeout, Unreachable, 5xx are transient — mirror `EmbedderError`)
+- [x] `cargo test --workspace`: 114 passing (was 106; +8 new `extractor` tests)
+- [x] `cargo clippy --all-targets -- -D warnings`: clean
 
 ## Phase B — Async embedding seam
 
@@ -118,5 +118,7 @@ End state: M2 success criteria from m2-facts-pipeline.md met. Operator-driven do
 Dated notes appended as items land. Format: `YYYY-MM-DD — <one-line summary>`. Multi-line entries fine for decisions that need explanation.
 
 <!-- Most recent entry first. -->
+
+- **2026-05-12** — M2 Phase A landed. Migration `0002_facts_pipeline.sql` applied cleanly (three new tables — `pending_embeddings`, `reflector_runs`, `facts_review_queue` — plus `facts.source_run_id` FK both ways). New `engram-extract` crate compiles empty; the `Extractor` trait + `ExtractedFact` + `ExtractionContext` + `ExtractorError` live in `engram-core`, mirroring `Embedder`/`EmbedderError` in shape and `is_transient()` discipline. One drift from the plan: dropped `source_thought_id` from `ExtractionContext` because the `Thought` is already passed as the first argument to `extract()` — carrying the id separately would be redundant. Workspace test count 106 → 114 (the 8 new `extractor` tests).
 
 - **2026-05-12** — M2 design conversation closed. All 12 open questions in m2-facts-pipeline.md answered inline by RJF; only #4 diverged from the engineer's lean (operator opted **For** adding `source_run_id`, and during synthesis we agreed to back it with a small `reflector_runs` table so the data is actually queryable). Three additional sub-decisions settled: `engram embed-backfill` survives as an escape hatch; capture's `embedding_status` becomes `"pending"` as the normal return (semantic shift only — MCP wire shape unchanged); `reqwest 0.13.3` upgrade landed as its own commit (`ddd3aad`) before Phase A. Plan above is the next-conversation artifact; Phase A is the first concrete unit of work.

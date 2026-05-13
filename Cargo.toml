@@ -4,6 +4,7 @@ members = [
   "crates/engram-core",
   "crates/engram-storage",
   "crates/engram-embed",
+  "crates/engram-extract",
   "crates/engram-mcp",
   "crates/engram-cli",
 ]
@@ -19,6 +20,7 @@ authors = ["Ron Forrester <ron.forrester@me.com>"]
 engram-core    = { path = "crates/engram-core" }
 engram-storage = { path = "crates/engram-storage" }
 engram-embed   = { path = "crates/engram-embed" }
+engram-extract = { path = "crates/engram-extract" }
 engram-mcp     = { path = "crates/engram-mcp" }
 
 # Async runtime + traits
