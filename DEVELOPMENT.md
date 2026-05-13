@@ -65,9 +65,16 @@ cargo run --bin engram -- serve              # starts the MCP server on 127.0.0.
 cargo run --bin engram -- worker             # in a second shell — drains pending_embeddings
 ```
 
-Point an MCP-capable client (Claude Code, Claude Desktop, `mcp-inspector`) at `http://127.0.0.1:8080/mcp` (streamable-HTTP transport, per the current MCP spec).
+Point an MCP-capable client (Claude Code, Claude Desktop, `mcp-inspector`) at `http://127.0.0.1:8080/mcp` (streamable-HTTP transport, per the current MCP spec). Six tools are exposed:
 
-`engram serve` and `engram worker` are paired: `serve` writes thoughts and enqueues embedding jobs; `worker` drains the queue and writes the embedding rows. Running `serve` without `worker` is fine — thoughts are still durable and trigram-searchable — but vector kNN won't surface them until `worker` runs.
+- `capture` — write a thought; returns `thought_id` + `embedding_status: "pending"`.
+- `search_thoughts` — RRF-fused vector + trigram retrieval over thoughts; recency-boosted.
+- `recent_thoughts` — chronological browse.
+- `get_thought` — full thought + provenance + active `linked_facts`.
+- `search_facts` — trigram search over facts with source-thought enrichment (M3 adds the vector leg).
+- `correct_fact` — operator-driven supersede with optional manual-author replacement.
+
+`engram serve` and `engram worker` are paired: `serve` writes thoughts and enqueues embedding jobs; `worker` drains the queue and (with `reflector.enabled = true`) runs the reflector cron that produces facts. Running `serve` without `worker` is fine — thoughts are still durable and trigram-searchable — but vector kNN won't surface them and no facts will be extracted until the worker runs.
 
 `sqlx::query!` macros and the `sqlx::test` attribute both require `DATABASE_URL` to be set at *build time*, not just at runtime. The `.env` file at the workspace root is read by `sqlx-cli` but NOT by `cargo build` — set `DATABASE_URL` in your shell or pass it inline: `DATABASE_URL=... cargo build`.
 
@@ -93,6 +100,22 @@ docker compose logs -f postgres
 cargo run --bin engram -- embed-backfill --limit 1000
 # or restricted to one scope:
 cargo run --bin engram -- embed-backfill --scope work --limit 100
+
+# One-shot reflector run: like a single tick of the worker's cron task.
+# Requires vLLM (or another OpenAI-compatible extractor endpoint) up on the
+# `[extractor]` config's endpoint. Useful for catching up after the operator
+# captured a batch of thoughts with `reflector.enabled = false`.
+cargo run --bin engram -- reflect --limit 50
+cargo run --bin engram -- reflect --scope work --limit 100
+
+# Rerun: re-evaluate already-facted thoughts. Use this after upgrading the
+# extractor model — if the new extractor's (S, P, O) matches an existing
+# fact but rephrases the statement, the old row is superseded with
+# `superseded_by` pointing at the new row (audit trail preserved). Existing
+# facts the new extractor *doesn't* produce stay active (no subtractive
+# logic). Pair with --since to bound the rerun to recent thoughts.
+cargo run --bin engram -- reflect --rerun --scope work
+cargo run --bin engram -- reflect --rerun --since 2026-04-01T00:00:00Z
 ```
 
 ## Configuration

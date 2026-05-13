@@ -23,6 +23,7 @@ figment.workspace = true
 rmcp.workspace = true
 serde.workspace = true
 sqlx.workspace = true
+time.workspace = true
 tokio = { workspace = true, features = ["full"] }
 tokio-cron-scheduler.workspace = true
 tokio-util.workspace = true

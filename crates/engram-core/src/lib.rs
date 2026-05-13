@@ -6,6 +6,7 @@
 pub mod embedder;
 pub mod embedding;
 pub mod extractor;
+pub mod fact;
 pub mod metadata;
 pub mod scope;
 pub mod search;
@@ -15,6 +16,7 @@ pub mod thought;
 pub use embedder::{Embedder, EmbedderError};
 pub use embedding::{Embedding, EmbeddingError, EmbeddingModel, EmbeddingStatus};
 pub use extractor::{ExtractedFact, ExtractionContext, Extractor, ExtractorError};
+pub use fact::Fact;
 pub use metadata::Metadata;
 pub use scope::{Scope, ScopeError};
 pub use search::{DEFAULT_RECENCY_HALF_LIFE_DAYS, DEFAULT_RRF_K, Hit, recency_boost, rrf_fuse};

@@ -6,7 +6,7 @@
 //! the way of the macro (currently: only `insert_embedding`).
 
 use engram_core::{
-    Embedding, EmbeddingModel, EmbeddingStatus, Hit, Metadata, Scope, ScopeError, Source,
+    Embedding, EmbeddingModel, EmbeddingStatus, Fact, Hit, Metadata, Scope, ScopeError, Source,
     SourceError, Thought, ThoughtId,
 };
 use sqlx::PgPool;
@@ -730,6 +730,329 @@ pub async fn insert_review_queue_row(
     .fetch_one(pool)
     .await?;
     Ok(row.id)
+}
+
+// -- M2 Phase D: facts read surface (search, fetch, supersede, rerun) -------
+
+/// A trigram-search hit on `facts`, enriched with source-thought fields per
+/// m2-facts-pipeline.md Q12 (the agent should be able to make sense of a
+/// fact without a follow-up `get_thought` call).
+#[derive(Debug, Clone)]
+pub struct FactHit {
+    pub fact: Fact,
+    pub source_thought_content: String,
+    pub source_thought_scope: Scope,
+    pub source_thought_created_at: OffsetDateTime,
+    pub score: f32,
+}
+
+// Column unpacking helper shared across the read-side facts queries. The
+// argument list mirrors the SELECT order; clippy's "too_many_arguments"
+// lint fires here, but adding a row struct would be net-negative ceremony.
+#[allow(clippy::too_many_arguments)]
+fn fact_from_columns(
+    id: Uuid,
+    scope: String,
+    statement: String,
+    subject: Option<String>,
+    predicate: Option<String>,
+    object: Option<String>,
+    source_thought_id: Uuid,
+    extractor_model: String,
+    extractor_version: i32,
+    source_run_id: Option<Uuid>,
+    confidence: f32,
+    created_at: OffsetDateTime,
+) -> Result<Fact, StorageError> {
+    Ok(Fact {
+        id,
+        scope: Scope::new(scope)?,
+        statement,
+        subject,
+        predicate,
+        object,
+        source_thought_id: ThoughtId::from(source_thought_id),
+        extractor_model,
+        extractor_version,
+        source_run_id,
+        confidence,
+        created_at,
+    })
+}
+
+/// Trigram-similarity search over `facts.statement`, joined to `thoughts`
+/// for source-thought enrichment. Filters `superseded_at IS NULL` (matches
+/// the `facts_active_idx` partial index). Same min-similarity threshold
+/// (0.1) as `search_trigram` — facts are short, recall matters more than
+/// precision at the leg level (RRF fusion handles precision in the
+/// orchestrator).
+pub async fn search_facts_trigram(
+    pool: &PgPool,
+    query: &str,
+    scope: Option<&str>,
+    limit: i64,
+) -> Result<Vec<FactHit>, StorageError> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT f.id, f.scope, f.statement, f.subject, f.predicate, f.object,
+               f.source_thought_id AS "source_thought_id!",
+               f.extractor_model, f.extractor_version, f.source_run_id,
+               f.confidence, f.created_at,
+               t.content        AS source_thought_content,
+               t.scope          AS source_thought_scope,
+               t.created_at     AS source_thought_created_at,
+               similarity(f.statement, $1) AS "sim!: f32"
+        FROM facts f
+        JOIN thoughts t ON t.id = f.source_thought_id
+        WHERE similarity(f.statement, $1) > 0.1
+          AND f.superseded_at IS NULL
+          AND ($2::text IS NULL OR f.scope = $2)
+        ORDER BY similarity(f.statement, $1) DESC
+        LIMIT $3
+        "#,
+        query,
+        scope,
+        limit,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|r| {
+            let fact = fact_from_columns(
+                r.id,
+                r.scope,
+                r.statement,
+                r.subject,
+                r.predicate,
+                r.object,
+                r.source_thought_id,
+                r.extractor_model,
+                r.extractor_version,
+                r.source_run_id,
+                r.confidence,
+                r.created_at,
+            )?;
+            Ok(FactHit {
+                fact,
+                source_thought_content: r.source_thought_content,
+                source_thought_scope: Scope::new(r.source_thought_scope)?,
+                source_thought_created_at: r.source_thought_created_at,
+                score: r.sim,
+            })
+        })
+        .collect()
+}
+
+/// All active (non-superseded) facts for a thought, oldest first. Powers
+/// `get_thought`'s `linked_facts` field.
+pub async fn list_active_facts_for_thought(
+    pool: &PgPool,
+    thought_id: ThoughtId,
+) -> Result<Vec<Fact>, StorageError> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT id, scope, statement, subject, predicate, object,
+               source_thought_id AS "source_thought_id!",
+               extractor_model, extractor_version, source_run_id,
+               confidence, created_at
+        FROM facts
+        WHERE source_thought_id = $1
+          AND superseded_at IS NULL
+        ORDER BY created_at ASC
+        "#,
+        thought_id.into_uuid(),
+    )
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|r| {
+            fact_from_columns(
+                r.id,
+                r.scope,
+                r.statement,
+                r.subject,
+                r.predicate,
+                r.object,
+                r.source_thought_id,
+                r.extractor_model,
+                r.extractor_version,
+                r.source_run_id,
+                r.confidence,
+                r.created_at,
+            )
+        })
+        .collect()
+}
+
+/// Look up a single fact by id. Returns the full row regardless of
+/// supersession state — callers (`correct_fact`) decide what to do with a
+/// superseded row.
+pub async fn fetch_fact(
+    pool: &PgPool,
+    fact_id: Uuid,
+) -> Result<Option<Fact>, StorageError> {
+    let row = sqlx::query!(
+        r#"
+        SELECT id, scope, statement, subject, predicate, object,
+               source_thought_id AS "source_thought_id!",
+               extractor_model, extractor_version, source_run_id,
+               confidence, created_at, superseded_at
+        FROM facts
+        WHERE id = $1
+        "#,
+        fact_id,
+    )
+    .fetch_optional(pool)
+    .await?;
+
+    let Some(r) = row else {
+        return Ok(None);
+    };
+    // Note: we return the row even if superseded; callers inspect their own
+    // copy of the fact for state. The `superseded_at` column itself isn't on
+    // `Fact` (Phase D doesn't surface it through the read shape) — it's an
+    // internal supersession marker.
+    let _ = r.superseded_at;
+    let fact = fact_from_columns(
+        r.id,
+        r.scope,
+        r.statement,
+        r.subject,
+        r.predicate,
+        r.object,
+        r.source_thought_id,
+        r.extractor_model,
+        r.extractor_version,
+        r.source_run_id,
+        r.confidence,
+        r.created_at,
+    )?;
+    Ok(Some(fact))
+}
+
+/// Mark a fact as superseded. Atomic: the UPDATE only fires when the row
+/// is still active (`superseded_at IS NULL`), so a concurrent supersede
+/// loses cleanly. Returns `true` if the row was actually superseded;
+/// `false` if it was already superseded or doesn't exist.
+///
+/// `new_fact_id = None` is the "delete-by-supersede" path from
+/// m2-facts-pipeline.md — the row stays in `facts` with `superseded_at`
+/// set but no replacement pointer.
+pub async fn supersede_fact(
+    pool: &PgPool,
+    old_fact_id: Uuid,
+    new_fact_id: Option<Uuid>,
+) -> Result<bool, StorageError> {
+    let result = sqlx::query!(
+        r#"
+        UPDATE facts
+        SET superseded_by = $2, superseded_at = NOW()
+        WHERE id = $1 AND superseded_at IS NULL
+        "#,
+        old_fact_id,
+        new_fact_id,
+    )
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Thoughts that have at least one active (non-superseded) fact. Inverse of
+/// `find_unfacted_thoughts`. Used by `engram reflect --rerun` to re-evaluate
+/// already-facted thoughts. `since` filters by `thoughts.created_at` if
+/// provided.
+pub async fn find_facted_thoughts(
+    pool: &PgPool,
+    scope: Option<&str>,
+    since: Option<OffsetDateTime>,
+    limit: i64,
+) -> Result<Vec<Thought>, StorageError> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT DISTINCT t.id, t.scope, t.content, t.source, t.created_at, t.metadata
+        FROM thoughts t
+        INNER JOIN facts f
+            ON f.source_thought_id = t.id
+           AND f.superseded_at IS NULL
+        WHERE ($1::text IS NULL OR t.scope = $1)
+          AND ($2::timestamptz IS NULL OR t.created_at >= $2)
+        ORDER BY t.created_at ASC
+        LIMIT $3
+        "#,
+        scope,
+        since,
+        limit,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|r| {
+            Ok(Thought {
+                id: ThoughtId::from(r.id),
+                scope: Scope::new(r.scope)?,
+                content: r.content,
+                source: Source::new(r.source)?,
+                created_at: r.created_at,
+                metadata: Metadata::from(r.metadata),
+            })
+        })
+        .collect()
+}
+
+/// Find the active fact (if any) on this thought whose (subject, predicate,
+/// object) triple matches the given values. Uses `IS NOT DISTINCT FROM` so
+/// `NULL` vs `NULL` counts as a match (Postgres `=` returns NULL for that
+/// case). Used by `--rerun` to decide merge-vs-supersede.
+pub async fn find_matching_active_fact(
+    pool: &PgPool,
+    thought_id: ThoughtId,
+    subject: Option<&str>,
+    predicate: Option<&str>,
+    object: Option<&str>,
+) -> Result<Option<Fact>, StorageError> {
+    let row = sqlx::query!(
+        r#"
+        SELECT id, scope, statement, subject, predicate, object,
+               source_thought_id AS "source_thought_id!",
+               extractor_model, extractor_version, source_run_id,
+               confidence, created_at
+        FROM facts
+        WHERE source_thought_id = $1
+          AND superseded_at IS NULL
+          AND subject   IS NOT DISTINCT FROM $2
+          AND predicate IS NOT DISTINCT FROM $3
+          AND object    IS NOT DISTINCT FROM $4
+        LIMIT 1
+        "#,
+        thought_id.into_uuid(),
+        subject,
+        predicate,
+        object,
+    )
+    .fetch_optional(pool)
+    .await?;
+
+    let Some(r) = row else {
+        return Ok(None);
+    };
+    let fact = fact_from_columns(
+        r.id,
+        r.scope,
+        r.statement,
+        r.subject,
+        r.predicate,
+        r.object,
+        r.source_thought_id,
+        r.extractor_model,
+        r.extractor_version,
+        r.source_run_id,
+        r.confidence,
+        r.created_at,
+    )?;
+    Ok(Some(fact))
 }
 
 /// Vector-similarity kNN over `embeddings` for the given model. Hits are
@@ -1503,6 +1826,337 @@ mod tests {
         assert!((row.confidence - 0.91).abs() < 1e-5);
         assert_eq!(row.scope, "global");
         assert!(row.superseded_at.is_none());
+    }
+
+    // -- M2 Phase D: facts read surface --
+
+    async fn insert_active_fact(
+        pool: &PgPool,
+        thought_id: ThoughtId,
+        scope: &Scope,
+        statement: &str,
+        triple: (Option<&str>, Option<&str>, Option<&str>),
+        run_id: RunId,
+        confidence: f32,
+    ) -> Uuid {
+        insert_fact(
+            pool,
+            NewFact {
+                scope,
+                statement,
+                subject: triple.0,
+                predicate: triple.1,
+                object: triple.2,
+                source_thought_id: thought_id,
+                extractor_model: "fake/extractor",
+                extractor_version: 1,
+                source_run_id: Some(run_id),
+                confidence,
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_facts_trigram_finds_match_and_returns_source_thought_content(pool: PgPool) {
+        let scope = Scope::global();
+        let thought_id = insert_test_thought(&pool, "Engram uses pgvector for storage", "global").await;
+        let run_id = start_run(&pool, "fake/extractor", 1, None).await.unwrap();
+        insert_active_fact(
+            &pool,
+            thought_id,
+            &scope,
+            "Engram uses pgvector",
+            (Some("Engram"), Some("uses"), Some("pgvector")),
+            run_id,
+            0.9,
+        )
+        .await;
+
+        let hits = search_facts_trigram(&pool, "pgvector", None, 10).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].fact.statement, "Engram uses pgvector");
+        assert_eq!(hits[0].source_thought_content, "Engram uses pgvector for storage");
+        assert_eq!(hits[0].source_thought_scope, scope);
+        assert!(hits[0].score > 0.0);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_facts_trigram_filters_superseded(pool: PgPool) {
+        let scope = Scope::global();
+        let thought_id = insert_test_thought(&pool, "facts about widgets", "global").await;
+        let run_id = start_run(&pool, "fake/extractor", 1, None).await.unwrap();
+        let fact_id = insert_active_fact(
+            &pool,
+            thought_id,
+            &scope,
+            "widgets are useful",
+            (None, None, None),
+            run_id,
+            0.9,
+        )
+        .await;
+
+        // Visible before supersede.
+        let before = search_facts_trigram(&pool, "widgets", None, 10).await.unwrap();
+        assert_eq!(before.len(), 1);
+
+        // Supersede with no replacement.
+        let did = supersede_fact(&pool, fact_id, None).await.unwrap();
+        assert!(did);
+
+        // Filtered out after.
+        let after = search_facts_trigram(&pool, "widgets", None, 10).await.unwrap();
+        assert!(after.is_empty());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_facts_trigram_respects_scope_and_limit(pool: PgPool) {
+        let work = Scope::new("work").unwrap();
+        let personal = Scope::new("personal").unwrap();
+        let t1 = insert_test_thought(&pool, "work thought one", "work").await;
+        let t2 = insert_test_thought(&pool, "work thought two", "work").await;
+        let t3 = insert_test_thought(&pool, "personal thought", "personal").await;
+        let run_id = start_run(&pool, "fake/extractor", 1, None).await.unwrap();
+        insert_active_fact(&pool, t1, &work, "widget alpha", (None, None, None), run_id, 0.9).await;
+        insert_active_fact(&pool, t2, &work, "widget beta", (None, None, None), run_id, 0.9).await;
+        insert_active_fact(&pool, t3, &personal, "widget gamma", (None, None, None), run_id, 0.9).await;
+
+        let work_only = search_facts_trigram(&pool, "widget", Some("work"), 10).await.unwrap();
+        assert_eq!(work_only.len(), 2);
+        assert!(work_only.iter().all(|h| h.fact.scope.as_str() == "work"));
+
+        let limited = search_facts_trigram(&pool, "widget", None, 2).await.unwrap();
+        assert_eq!(limited.len(), 2);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn list_active_facts_for_thought_returns_only_active(pool: PgPool) {
+        let scope = Scope::global();
+        let thought_id = insert_test_thought(&pool, "anchor", "global").await;
+        let run_id = start_run(&pool, "fake/extractor", 1, None).await.unwrap();
+        let active = insert_active_fact(
+            &pool, thought_id, &scope, "still alive", (None, None, None), run_id, 0.9,
+        )
+        .await;
+        let _other = insert_active_fact(
+            &pool, thought_id, &scope, "also alive", (None, None, None), run_id, 0.9,
+        )
+        .await;
+        let gone = insert_active_fact(
+            &pool, thought_id, &scope, "to be superseded", (None, None, None), run_id, 0.9,
+        )
+        .await;
+        supersede_fact(&pool, gone, None).await.unwrap();
+
+        let facts = list_active_facts_for_thought(&pool, thought_id).await.unwrap();
+        assert_eq!(facts.len(), 2);
+        let ids: Vec<Uuid> = facts.iter().map(|f| f.id).collect();
+        assert!(ids.contains(&active));
+        assert!(!ids.contains(&gone));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn fetch_fact_returns_none_for_missing(pool: PgPool) {
+        let id = Uuid::new_v4();
+        let result = fetch_fact(&pool, id).await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn fetch_fact_returns_row_with_provenance(pool: PgPool) {
+        let scope = Scope::new("work").unwrap();
+        let thought_id = insert_test_thought(&pool, "anchor", "work").await;
+        let run_id = start_run(&pool, "fake/extractor", 1, None).await.unwrap();
+        let fact_id = insert_active_fact(
+            &pool, thought_id, &scope, "fetched", (Some("S"), Some("P"), Some("O")), run_id, 0.91,
+        )
+        .await;
+
+        let fact = fetch_fact(&pool, fact_id).await.unwrap().expect("must exist");
+        assert_eq!(fact.id, fact_id);
+        assert_eq!(fact.statement, "fetched");
+        assert_eq!(fact.subject.as_deref(), Some("S"));
+        assert_eq!(fact.source_thought_id, thought_id);
+        assert_eq!(fact.source_run_id, Some(run_id.0));
+        assert!((fact.confidence - 0.91).abs() < 1e-5);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn supersede_fact_with_replacement_sets_columns(pool: PgPool) {
+        let scope = Scope::global();
+        let thought_id = insert_test_thought(&pool, "anchor", "global").await;
+        let run_id = start_run(&pool, "fake/extractor", 1, None).await.unwrap();
+        let old = insert_active_fact(
+            &pool, thought_id, &scope, "old", (None, None, None), run_id, 0.9,
+        )
+        .await;
+        let new = insert_active_fact(
+            &pool, thought_id, &scope, "new", (None, None, None), run_id, 0.9,
+        )
+        .await;
+
+        let did = supersede_fact(&pool, old, Some(new)).await.unwrap();
+        assert!(did);
+
+        let row = sqlx::query!(
+            r#"SELECT superseded_by, superseded_at FROM facts WHERE id = $1"#,
+            old,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.superseded_by, Some(new));
+        assert!(row.superseded_at.is_some());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn supersede_fact_without_replacement_sets_only_timestamp(pool: PgPool) {
+        let scope = Scope::global();
+        let thought_id = insert_test_thought(&pool, "anchor", "global").await;
+        let run_id = start_run(&pool, "fake/extractor", 1, None).await.unwrap();
+        let fact_id = insert_active_fact(
+            &pool, thought_id, &scope, "doomed", (None, None, None), run_id, 0.9,
+        )
+        .await;
+
+        let did = supersede_fact(&pool, fact_id, None).await.unwrap();
+        assert!(did);
+
+        let row = sqlx::query!(
+            r#"SELECT superseded_by, superseded_at FROM facts WHERE id = $1"#,
+            fact_id,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(row.superseded_by.is_none());
+        assert!(row.superseded_at.is_some());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn supersede_fact_on_already_superseded_returns_false(pool: PgPool) {
+        let scope = Scope::global();
+        let thought_id = insert_test_thought(&pool, "anchor", "global").await;
+        let run_id = start_run(&pool, "fake/extractor", 1, None).await.unwrap();
+        let fact_id = insert_active_fact(
+            &pool, thought_id, &scope, "loser", (None, None, None), run_id, 0.9,
+        )
+        .await;
+
+        assert!(supersede_fact(&pool, fact_id, None).await.unwrap());
+        assert!(!supersede_fact(&pool, fact_id, None).await.unwrap(),
+                "second supersede must report no-change");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn find_facted_thoughts_returns_only_thoughts_with_active_facts(pool: PgPool) {
+        let scope = Scope::global();
+        let with_fact = insert_test_thought(&pool, "with fact", "global").await;
+        let _no_fact = insert_test_thought(&pool, "no fact", "global").await;
+        let only_superseded = insert_test_thought(&pool, "only superseded", "global").await;
+
+        let run_id = start_run(&pool, "fake/extractor", 1, None).await.unwrap();
+        insert_active_fact(&pool, with_fact, &scope, "active", (None, None, None), run_id, 0.9).await;
+        let gone = insert_active_fact(
+            &pool, only_superseded, &scope, "gone", (None, None, None), run_id, 0.9,
+        )
+        .await;
+        supersede_fact(&pool, gone, None).await.unwrap();
+
+        let facted = find_facted_thoughts(&pool, None, None, 100).await.unwrap();
+        let ids: Vec<ThoughtId> = facted.iter().map(|t| t.id).collect();
+        assert!(ids.contains(&with_fact));
+        assert!(!ids.contains(&only_superseded), "thought with only superseded facts must not appear");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn find_facted_thoughts_respects_since_scope_limit(pool: PgPool) {
+        let work = Scope::new("work").unwrap();
+        let personal = Scope::new("personal").unwrap();
+        let run_id = start_run(&pool, "fake/extractor", 1, None).await.unwrap();
+
+        let t_work = insert_test_thought(&pool, "work one", "work").await;
+        let t_personal = insert_test_thought(&pool, "personal one", "personal").await;
+        insert_active_fact(&pool, t_work, &work, "wf", (None, None, None), run_id, 0.9).await;
+        insert_active_fact(&pool, t_personal, &personal, "pf", (None, None, None), run_id, 0.9).await;
+
+        // Scope filter.
+        let work_only = find_facted_thoughts(&pool, Some("work"), None, 10).await.unwrap();
+        assert_eq!(work_only.len(), 1);
+        assert_eq!(work_only[0].id, t_work);
+
+        // Since-in-future filter eliminates everything.
+        let future = OffsetDateTime::now_utc() + time::Duration::days(1);
+        let empty = find_facted_thoughts(&pool, None, Some(future), 10).await.unwrap();
+        assert!(empty.is_empty());
+
+        // Since-in-past keeps both.
+        let past = OffsetDateTime::now_utc() - time::Duration::days(1);
+        let both = find_facted_thoughts(&pool, None, Some(past), 10).await.unwrap();
+        assert_eq!(both.len(), 2);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn find_matching_active_fact_handles_null_via_is_not_distinct_from(pool: PgPool) {
+        let scope = Scope::global();
+        let thought_id = insert_test_thought(&pool, "anchor", "global").await;
+        let run_id = start_run(&pool, "fake/extractor", 1, None).await.unwrap();
+        // Insert a fact with all-null triple.
+        let null_fact = insert_active_fact(
+            &pool, thought_id, &scope, "no triple", (None, None, None), run_id, 0.9,
+        )
+        .await;
+        // And one with a triple.
+        insert_active_fact(
+            &pool, thought_id, &scope, "with triple", (Some("S"), Some("P"), Some("O")), run_id, 0.9,
+        )
+        .await;
+
+        // (None, None, None) must match the null fact (Postgres `=` would
+        // return NULL here; `IS NOT DISTINCT FROM` is what makes it work).
+        let null_match = find_matching_active_fact(&pool, thought_id, None, None, None)
+            .await
+            .unwrap()
+            .expect("null triple should match");
+        assert_eq!(null_match.id, null_fact);
+
+        // Exact triple match.
+        let triple_match = find_matching_active_fact(
+            &pool, thought_id, Some("S"), Some("P"), Some("O"),
+        )
+        .await
+        .unwrap()
+        .expect("triple should match");
+        assert_eq!(triple_match.statement, "with triple");
+
+        // No match for an unrelated triple.
+        let none = find_matching_active_fact(
+            &pool, thought_id, Some("X"), Some("Y"), Some("Z"),
+        )
+        .await
+        .unwrap();
+        assert!(none.is_none());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn find_matching_active_fact_returns_none_for_superseded_match(pool: PgPool) {
+        let scope = Scope::global();
+        let thought_id = insert_test_thought(&pool, "anchor", "global").await;
+        let run_id = start_run(&pool, "fake/extractor", 1, None).await.unwrap();
+        let fact_id = insert_active_fact(
+            &pool, thought_id, &scope, "gone", (Some("S"), Some("P"), Some("O")), run_id, 0.9,
+        )
+        .await;
+        supersede_fact(&pool, fact_id, None).await.unwrap();
+
+        let result = find_matching_active_fact(
+            &pool, thought_id, Some("S"), Some("P"), Some("O"),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_none(), "superseded match must not be returned");
     }
 
     #[sqlx::test(migrations = "../../migrations")]

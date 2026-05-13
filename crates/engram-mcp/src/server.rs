@@ -16,9 +16,10 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use crate::capture::{self, CaptureError, CaptureRequest, MAX_CONTENT_LEN};
+use crate::correct::{self, CorrectError, CorrectFactRequest, FactReplacement};
 use crate::search::{
-    self, GetThoughtResponse, ReadError, RecentRequest, RecentResponse, SearchRequest,
-    SearchResponse,
+    self, GetThoughtResponse, ReadError, RecentRequest, RecentResponse, SearchFactsRequest,
+    SearchFactsResponse, SearchRequest, SearchResponse,
 };
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -64,6 +65,42 @@ pub struct RecentThoughtsArgs {
 pub struct GetThoughtArgs {
     #[schemars(description = "Thought ID (UUID string).")]
     pub thought_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SearchFactsArgs {
+    #[schemars(description = "Search query. Required, non-empty. Matched against fact.statement via trigram similarity.")]
+    pub query: String,
+
+    #[schemars(description = "Scope filter. Optional; when omitted, searches across all scopes.")]
+    pub scope: Option<String>,
+
+    #[schemars(description = "Max results. Optional; defaults to 10, max 100.")]
+    pub limit: Option<usize>,
+
+    #[schemars(description = "Recency boost half-life in days, keyed on the source thought's created_at. Optional; defaults to 30. Set to 0 to disable.")]
+    pub recency_half_life_days: Option<f32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CorrectFactArgs {
+    #[schemars(description = "Fact ID (UUID string) to correct or retract.")]
+    pub fact_id: String,
+
+    #[schemars(description = "Optional replacement. If present, a new fact is inserted with manual-author provenance (extractor_model='manual', extractor_version=0, confidence=1.0) and the old fact is superseded with `superseded_by` pointing at the new row. If omitted, the old fact is superseded with no replacement (delete-by-supersede).")]
+    pub replacement: Option<CorrectFactReplacementArgs>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CorrectFactReplacementArgs {
+    #[schemars(description = "Natural-language statement for the corrected fact. Required, non-empty.")]
+    pub statement: String,
+    #[schemars(description = "Optional subject of the (S, P, O) triple.")]
+    pub subject: Option<String>,
+    #[schemars(description = "Optional predicate of the (S, P, O) triple.")]
+    pub predicate: Option<String>,
+    #[schemars(description = "Optional object of the (S, P, O) triple.")]
+    pub object: Option<String>,
 }
 
 #[derive(Clone)]
@@ -176,7 +213,7 @@ impl EngramServer {
             .map_err(|e| format!("response serialization error: {e}"))
     }
 
-    #[tool(description = "Fetch a single thought by ID along with its provenance: whether it's been embedded ('indexed' or 'pending'), when it was embedded, and (M2+) linked extracted facts.")]
+    #[tool(description = "Fetch a single thought by ID along with its provenance: whether it's been embedded ('indexed' or 'pending'), when it was embedded, and the active (non-superseded) facts derived from it.")]
     async fn get_thought(
         &self,
         Parameters(args): Parameters<GetThoughtArgs>,
@@ -189,6 +226,57 @@ impl EngramServer {
             .map_err(map_read_error)?;
 
         serde_json::to_string(&get_thought_response_json(&resp))
+            .map_err(|e| format!("response serialization error: {e}"))
+    }
+
+    #[tool(description = "Search across extracted facts via trigram similarity over fact.statement, filtered to active (non-superseded) facts. Each result includes the fact's S/P/O triple, confidence, score, and the source thought's content/scope/created_at so the agent doesn't need a follow-up get_thought call.")]
+    async fn search_facts(
+        &self,
+        Parameters(args): Parameters<SearchFactsArgs>,
+    ) -> Result<String, String> {
+        let scope = match args.scope {
+            Some(s) => Some(Scope::new(s).map_err(|e| format!("invalid scope: {e}"))?),
+            None => None,
+        };
+
+        let request = SearchFactsRequest {
+            query: args.query,
+            scope,
+            limit: args.limit,
+            recency_half_life_days: args.recency_half_life_days,
+        };
+
+        let resp = search::search_facts(&self.pool, request)
+            .await
+            .map_err(map_read_error)?;
+
+        serde_json::to_string(&search_facts_response_json(&resp))
+            .map_err(|e| format!("response serialization error: {e}"))
+    }
+
+    #[tool(description = "Correct or retract a fact. With a replacement, inserts a new fact (manual provenance: extractor_model='manual', version=0, confidence=1.0) and supersedes the old one; the audit trail (superseded_by, superseded_at) is preserved. Without a replacement, the fact is superseded with no successor — the row stays in the DB but search_facts and get_thought will no longer surface it.")]
+    async fn correct_fact(
+        &self,
+        Parameters(args): Parameters<CorrectFactArgs>,
+    ) -> Result<String, String> {
+        let fact_id = uuid::Uuid::from_str(&args.fact_id)
+            .map_err(|e| format!("invalid fact_id: {e}"))?;
+        let replacement = args.replacement.map(|r| FactReplacement {
+            statement: r.statement,
+            subject: r.subject,
+            predicate: r.predicate,
+            object: r.object,
+        });
+
+        let resp = correct::correct_fact(&self.pool, CorrectFactRequest { fact_id, replacement })
+            .await
+            .map_err(map_correct_error)?;
+
+        let body = serde_json::json!({
+            "superseded": resp.superseded,
+            "new_fact_id": resp.new_fact_id.map(|u| u.to_string()),
+        });
+        serde_json::to_string(&body)
             .map_err(|e| format!("response serialization error: {e}"))
     }
 }
@@ -215,6 +303,21 @@ fn map_read_error(err: ReadError) -> String {
         ReadError::NotFound => "thought not found".to_string(),
         ReadError::Storage(e) => {
             tracing::error!(error = %e, "read storage error");
+            "internal database error".to_string()
+        }
+    }
+}
+
+fn map_correct_error(err: CorrectError) -> String {
+    match err {
+        CorrectError::AlreadySupersededOrMissing(id) => {
+            format!("fact not found or already superseded: {id}")
+        }
+        CorrectError::EmptyReplacementStatement => {
+            "replacement statement must not be empty".to_string()
+        }
+        CorrectError::Storage(e) => {
+            tracing::error!(error = %e, "correct_fact storage error");
             "internal database error".to_string()
         }
     }
@@ -261,6 +364,23 @@ fn recent_response_json(resp: &RecentResponse) -> serde_json::Value {
 }
 
 fn get_thought_response_json(resp: &GetThoughtResponse) -> serde_json::Value {
+    let linked_facts: Vec<serde_json::Value> = resp
+        .linked_facts
+        .iter()
+        .map(|f| {
+            serde_json::json!({
+                "fact_id": f.id.to_string(),
+                "statement": f.statement,
+                "subject": f.subject,
+                "predicate": f.predicate,
+                "object": f.object,
+                "confidence": f.confidence,
+                "extractor_model": f.extractor_model,
+                "extractor_version": f.extractor_version,
+                "created_at": f.created_at.format(&time::format_description::well_known::Rfc3339).unwrap_or_default(),
+            })
+        })
+        .collect();
     serde_json::json!({
         "thought": {
             "thought_id": resp.thought.id.to_string(),
@@ -273,9 +393,32 @@ fn get_thought_response_json(resp: &GetThoughtResponse) -> serde_json::Value {
         "provenance": {
             "embedding_status": resp.embedding_status,
             "embedded_at": resp.embedded_at.and_then(|t| t.format(&time::format_description::well_known::Rfc3339).ok()),
-            "linked_facts": [],
+            "linked_facts": linked_facts,
         },
     })
+}
+
+fn search_facts_response_json(resp: &SearchFactsResponse) -> serde_json::Value {
+    let results: Vec<serde_json::Value> = resp
+        .results
+        .iter()
+        .map(|h| {
+            serde_json::json!({
+                "fact_id": h.fact_id.to_string(),
+                "statement": h.statement,
+                "subject": h.subject,
+                "predicate": h.predicate,
+                "object": h.object,
+                "confidence": h.confidence,
+                "source_thought_id": h.source_thought_id.to_string(),
+                "source_thought_content": h.source_thought_content,
+                "source_thought_scope": h.source_thought_scope.as_str(),
+                "source_thought_created_at": h.source_thought_created_at.format(&time::format_description::well_known::Rfc3339).unwrap_or_default(),
+                "score": h.score,
+            })
+        })
+        .collect();
+    serde_json::json!({ "results": results })
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -432,6 +575,163 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("invalid thought_id"));
+    }
+
+    // -- M2 Phase D tool tests --
+
+    async fn seed_fact_for_tool_test(
+        pool: &PgPool,
+        thought_content: &str,
+        statement: &str,
+    ) -> (String, String) {
+        // Capture a thought, insert a fact against it, return (thought_id, fact_id).
+        let scope = Scope::global();
+        let source = Source::new("test").unwrap();
+        let metadata = engram_core::Metadata::empty();
+        let inserted = engram_storage::insert_thought(
+            pool,
+            engram_storage::NewThought {
+                scope: &scope,
+                content: thought_content,
+                source: &source,
+                metadata: &metadata,
+            },
+        )
+        .await
+        .unwrap();
+        let run_id = engram_storage::start_run(pool, "fake/extractor", 1, None)
+            .await
+            .unwrap();
+        let fact_id = engram_storage::insert_fact(
+            pool,
+            engram_storage::NewFact {
+                scope: &scope,
+                statement,
+                subject: None,
+                predicate: None,
+                object: None,
+                source_thought_id: inserted.id,
+                extractor_model: "fake/extractor",
+                extractor_version: 1,
+                source_run_id: Some(run_id),
+                confidence: 0.9,
+            },
+        )
+        .await
+        .unwrap();
+        (inserted.id.to_string(), fact_id.to_string())
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_facts_tool_returns_results_with_source_thought_content(pool: PgPool) {
+        seed_fact_for_tool_test(&pool, "Engram uses pgvector", "pgvector is the vector store").await;
+
+        let s = server(pool);
+        let raw = s
+            .search_facts(Parameters(SearchFactsArgs {
+                query: "pgvector".to_string(),
+                scope: None,
+                limit: None,
+                recency_half_life_days: Some(0.0),
+            }))
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let results = json["results"].as_array().unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0]["fact_id"].is_string());
+        assert_eq!(results[0]["statement"], "pgvector is the vector store");
+        assert_eq!(results[0]["source_thought_content"], "Engram uses pgvector");
+        assert_eq!(results[0]["source_thought_scope"], "global");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn correct_fact_tool_supersedes_with_replacement(pool: PgPool) {
+        let (_thought_id, fact_id) =
+            seed_fact_for_tool_test(&pool, "anchor", "old wording").await;
+        let s = server(pool.clone());
+
+        let raw = s
+            .correct_fact(Parameters(CorrectFactArgs {
+                fact_id: fact_id.clone(),
+                replacement: Some(CorrectFactReplacementArgs {
+                    statement: "new wording".to_string(),
+                    subject: Some("S".to_string()),
+                    predicate: Some("P".to_string()),
+                    object: Some("O".to_string()),
+                }),
+            }))
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(json["superseded"], true);
+        assert!(json["new_fact_id"].is_string());
+
+        // Old fact is superseded; new fact exists with manual sentinel.
+        let old_uuid = uuid::Uuid::from_str(&fact_id).unwrap();
+        let old_row = sqlx::query!(
+            r#"SELECT superseded_at FROM facts WHERE id = $1"#,
+            old_uuid,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(old_row.superseded_at.is_some());
+
+        let new_uuid =
+            uuid::Uuid::from_str(json["new_fact_id"].as_str().unwrap()).unwrap();
+        let new_row = sqlx::query!(
+            r#"SELECT extractor_model, extractor_version FROM facts WHERE id = $1"#,
+            new_uuid,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(new_row.extractor_model, "manual");
+        assert_eq!(new_row.extractor_version, 0);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn correct_fact_tool_errors_on_unknown_id(pool: PgPool) {
+        let s = server(pool);
+        let err = s
+            .correct_fact(Parameters(CorrectFactArgs {
+                fact_id: uuid::Uuid::new_v4().to_string(),
+                replacement: None,
+            }))
+            .await
+            .unwrap_err();
+        assert!(err.contains("not found or already superseded"));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn correct_fact_tool_invalid_uuid_errors(pool: PgPool) {
+        let s = server(pool);
+        let err = s
+            .correct_fact(Parameters(CorrectFactArgs {
+                fact_id: "not-a-uuid".to_string(),
+                replacement: None,
+            }))
+            .await
+            .unwrap_err();
+        assert!(err.contains("invalid fact_id"));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn get_thought_tool_includes_linked_facts(pool: PgPool) {
+        let (thought_id, _fact_id) =
+            seed_fact_for_tool_test(&pool, "with linked fact", "the fact").await;
+        let s = server(pool);
+
+        let raw = s
+            .get_thought(Parameters(GetThoughtArgs { thought_id }))
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let facts = json["provenance"]["linked_facts"].as_array().unwrap();
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0]["statement"], "the fact");
+        assert!(facts[0]["fact_id"].is_string());
     }
 
     #[sqlx::test(migrations = "../../migrations")]

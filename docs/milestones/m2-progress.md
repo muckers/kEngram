@@ -100,19 +100,19 @@ End state: vLLM-driven extractor produces facts; reflector cron walks unfacted t
 
 End state: M2 success criteria from m2-facts-pipeline.md met. Operator-driven dogfood ticked off after a week of use.
 
-- [ ] `engram-mcp` tools:
-  - [ ] `search_facts(query, scope?, limit?) -> { results: [{ fact_id, statement, subject?, predicate?, object?, confidence, source_thought_id, source_thought_content, source_thought_scope, source_thought_created_at, score }] }` — same RRF hybrid as thoughts, filters `WHERE superseded_at IS NULL`
-  - [ ] `correct_fact(fact_id, replacement?) -> { new_fact_id?, superseded: bool }` — special `extractor_model = "manual"`, `extractor_version = 0`; sets `superseded_by`, `superseded_at` on old row; inserts new row pointing at same `source_thought_id` if `replacement` provided
-  - [ ] `get_thought` updated to include `linked_facts: [...]` (rows where `source_thought_id = ?` and `superseded_at IS NULL`)
-  - [ ] `sqlx::test`s for each: round trip, supersession audit, `search_facts` filters superseded
-- [ ] `engram reflect` subcommand:
-  - [ ] `engram reflect [--scope <s>] [--limit <n>]` — one-shot reflector run, exits when done
-  - [ ] `engram reflect --rerun --scope <s> [--since <date>]` — re-extract historical thoughts; for each, if `(subject, predicate, object)` matches an existing non-superseded fact, **merge** (no new row); if it conflicts, supersede via `superseded_by`. Audit trail preserved.
-  - [ ] `sqlx::test`: rerun twice produces identical fact set (idempotency criterion)
-- [ ] Documentation:
-  - [ ] README.md status table: M2 ✅ with brief sentence
-  - [ ] DEVELOPMENT.md: vLLM prerequisites, `engram worker` runbook, `engram reflect` examples
-  - [ ] Design doc revision-history entry
+- [x] `engram-mcp` tools:
+  - [x] `search_facts(query, scope?, limit?, recency_half_life_days?) -> { results: [...] }` — trigram-only inside the RRF-shape pipeline (vector leg = M3); response includes `source_thought_content`, `source_thought_scope`, `source_thought_created_at` per Q12; filters `WHERE superseded_at IS NULL`
+  - [x] `correct_fact(fact_id, replacement?) -> { superseded, new_fact_id? }` — sentinel `extractor_model = "manual"`, `extractor_version = 0`, `confidence = 1.0`; inserts new fact + supersedes old in a tx; supports retract (replacement: null)
+  - [x] `get_thought` carries `linked_facts: [...]` (active facts for the thought)
+  - [x] `sqlx::test`s: round trip, supersession audit, `search_facts` filters superseded, `linked_facts` includes/excludes the right rows
+- [x] `engram reflect` subcommand:
+  - [x] `engram reflect [--scope <s>] [--limit <n>]` — one-shot reflector pass over unfacted thoughts
+  - [x] `engram reflect --rerun [--scope <s>] [--since <RFC3339>]` — re-extract historical thoughts; merge on exact (S,P,O,statement) match, supersede when (S,P,O) match but statement differs, insert new on no triple match. **Subtractive logic deliberately not implemented** (existing facts the new extractor no longer produces stay active).
+  - [x] `sqlx::test`: rerun twice produces identical fact set (idempotency keystone)
+- [x] Documentation:
+  - [x] README.md status table: M2 ✅ + one-line summary; MCP surface table updated for six tools; crate layout updated for engram-extract
+  - [x] DEVELOPMENT.md: MCP tool surface, `engram reflect` examples (one-shot + rerun + since)
+  - [x] Design doc revision-history entry (2026-05-13)
 - [ ] **Operator-driven**: MCP smoke test from Claude Code / `mcp-inspector` invoking `search_facts`, `correct_fact`, and the updated `get_thought` against `engram serve` (with `engram worker` running in parallel)
 - [ ] **Operator-driven**: real dogfood — run engram with extractor for ≥1 week, confirm fact rate and false-positive/-negative balance is acceptable, do at least one `correct_fact` round trip
 
@@ -121,6 +121,8 @@ End state: M2 success criteria from m2-facts-pipeline.md met. Operator-driven do
 Dated notes appended as items land. Format: `YYYY-MM-DD — <one-line summary>`. Multi-line entries fine for decisions that need explanation.
 
 <!-- Most recent entry first. -->
+
+- **2026-05-13** — **M2 Phase D landed; M2 is complete except for operator dogfood.** Six MCP tools live: `capture`, `search_thoughts`, `recent_thoughts`, `get_thought` (now with `linked_facts`), plus the two new Phase D tools `search_facts` and `correct_fact`. New `engram reflect` CLI subcommand with `--rerun [--since <RFC3339>]` for re-extracting historical thoughts (idempotent: rerun twice produces identical state). Six new storage repo fns (`search_facts_trigram`, `list_active_facts_for_thought`, `fetch_fact`, `supersede_fact`, `find_facted_thoughts`, `find_matching_active_fact`) plus the `Fact` domain type in `engram-core`. Test count 166 → 205 (+39 net: storage +13, mcp/search +8, mcp/correct +6, mcp/reflect +5, mcp/server +5, engram-core +2). Three engineering decisions documented up front: (1) **`search_facts` is trigram-only**; the vector leg waits for M3 alongside the cross-encoder reranker — the RRF pipeline shape stays consistent with `search_thoughts` so M3 can drop in the vector leg without touching the MCP wire contract. (2) **`correct_fact` writes manual-sentinel provenance** (`extractor_model = "manual"`, `extractor_version = 0`, `source_run_id = NULL`, `confidence = 1.0`) per Q10 so a single query separates machine vs. human authorship. (3) **`--rerun` is additive only** — facts the new extractor no longer produces stay active; operators retract obsolete rows manually via `correct_fact`. Rationale: a single rerun reflects model drift in *how* facts are stated, not *what* the thought says; subtractive logic risks losing real facts to sampling variance. Build, test, clippy all green; `engram reflect --since X` without `--rerun` correctly errors at CLI parse time.
 
 - **2026-05-13** — M2 Phase C landed. Reflector cron + concrete extractor impls are live. `OpenAICompatibleExtractor` (one Rust type, two named-constructor presets — `vllm_local()` and `open_router(api_key, model)` — rather than two separate types, mirroring how `OpenAICompatibleEmbedder` already covers Ollama/TEI/OpenAI by config). `FakeExtractor` with `Deterministic`/`Timeout`/`Unreachable`/`Misconfigured` behaviors plus `with_confidence(f32)` and `with_facts(Vec<ExtractedFact>)` constructors for routing/explicit tests. Five new storage functions (`start_run`, `finish_run`, `find_unfacted_thoughts`, `insert_fact`, `insert_review_queue_row`) + `RunId`, `NewFact`, `NewReviewRow` types. `engram-mcp::reflect::run_reflector_once` orchestrates a single pass (start_run → LEFT-JOIN unfacted → for each thought: extract → route by `review_queue_below` → insert → finish_run). The cron loop wraps that call inside `tokio-cron-scheduler` 0.15.1 (latest stable per `cargo info`); `engram worker` runs the loop as a second `JoinSet` task alongside the embed-drainer when `reflector.enabled = true`. Three engineering decisions worth documenting: (1) one extractor type with two presets, not two types; (2) single-band routing (`review_queue_below` only) — m2-facts-pipeline.md's three-band design with a "flagged but committed" middle band would require a new column on `facts` that doesn't exist, so it's deferred; (3) `reflector.enabled` defaults to `false` so `engram worker` works without vLLM. Live smoke verified: with vLLM down, `engram worker` with `ENGRAM_REFLECTOR__ENABLED=true ENGRAM_REFLECTOR__SCHEDULE="*/3 * * * * *"` fires on cron, soft-fails per thought (Q9 path), and exits cleanly on SIGINT. Test count 129 → 166 (+37: storage +8, extract +17, mcp/reflect +8, cli config +4).
 

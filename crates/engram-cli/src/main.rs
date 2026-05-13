@@ -52,6 +52,25 @@ enum Command {
         #[arg(long, default_value_t = 1000)]
         limit: i64,
     },
+    /// One-shot reflector run. By default acts on unfacted thoughts (same as
+    /// the worker's cron tick). With --rerun, re-evaluates already-facted
+    /// thoughts and supersedes obsolete extractions (preserving the audit
+    /// trail) — useful after upgrading the extractor model or schema.
+    Reflect {
+        /// Restrict to a single scope. Overrides `[reflector] scope_filter`.
+        #[arg(long)]
+        scope: Option<String>,
+        /// Max thoughts to process. Overrides `[reflector] max_thoughts_per_run`.
+        #[arg(long)]
+        limit: Option<i64>,
+        /// Re-evaluate already-facted thoughts. Pairs naturally with --since.
+        #[arg(long)]
+        rerun: bool,
+        /// With --rerun, only re-evaluate thoughts created at or after this
+        /// RFC-3339 timestamp. Rejected without --rerun.
+        #[arg(long)]
+        since: Option<String>,
+    },
 }
 
 fn init_tracing() {
@@ -369,6 +388,78 @@ async fn run_embed_backfill(
     Ok(())
 }
 
+async fn run_reflect(
+    config: Config,
+    scope: Option<String>,
+    limit: Option<i64>,
+    rerun: bool,
+    since: Option<String>,
+) -> anyhow::Result<()> {
+    if since.is_some() && !rerun {
+        anyhow::bail!("--since is only meaningful with --rerun");
+    }
+
+    let parsed_since = match since {
+        Some(s) => Some(
+            time::OffsetDateTime::parse(&s, &time::format_description::well_known::Rfc3339)
+                .with_context(|| format!("parsing --since={s:?} as RFC-3339"))?,
+        ),
+        None => None,
+    };
+
+    let pool = PgPoolOptions::new()
+        .max_connections(config.database.max_connections)
+        .connect(&config.database.url)
+        .await
+        .with_context(|| format!("connecting to {}", config.database.url))?;
+    let extractor = build_extractor(&config.extractor)?;
+
+    // CLI flags override config defaults.
+    let mut options = config.reflector.clone();
+    if let Some(s) = scope {
+        options.scope_filter = Some(s);
+    }
+    if let Some(l) = limit {
+        options.max_thoughts_per_run = l;
+    }
+
+    let report = if rerun {
+        tracing::info!(
+            scope = ?options.scope_filter,
+            limit = options.max_thoughts_per_run,
+            since = ?parsed_since,
+            "engram reflect --rerun starting",
+        );
+        engram_mcp::run_reflector_rerun(&pool, extractor.as_ref(), &options, parsed_since).await?
+    } else {
+        tracing::info!(
+            scope = ?options.scope_filter,
+            limit = options.max_thoughts_per_run,
+            "engram reflect starting",
+        );
+        engram_mcp::run_reflector_once(&pool, extractor.as_ref(), &options).await?
+    };
+
+    tracing::info!(
+        run_id = %report.run_id,
+        processed = report.n_thoughts_processed,
+        committed = report.n_facts_committed,
+        review = report.n_review_queue,
+        failures = report.n_extractor_failures,
+        "reflect complete",
+    );
+
+    if report.n_extractor_failures > 0 {
+        anyhow::bail!(
+            "{} thoughts failed extraction (see logs); {} committed, {} routed to review",
+            report.n_extractor_failures,
+            report.n_facts_committed,
+            report.n_review_queue,
+        );
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     init_tracing();
@@ -380,5 +471,8 @@ async fn main() -> anyhow::Result<()> {
         Command::Migrate => run_migrate(config).await,
         Command::Worker => run_worker(config).await,
         Command::EmbedBackfill { scope, limit } => run_embed_backfill(config, scope, limit).await,
+        Command::Reflect { scope, limit, rerun, since } => {
+            run_reflect(config, scope, limit, rerun, since).await
+        }
     }
 }
