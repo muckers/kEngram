@@ -7,16 +7,20 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use engram_core::{Embedder, EmbeddingModel};
+use engram_core::{Embedder, EmbeddingModel, Extractor};
 use engram_embed::{OpenAICompatibleConfig, OpenAICompatibleEmbedder};
-use engram_mcp::EngramServer;
+use engram_extract::{
+    OpenAICompatibleConfig as ExtractorConfigBuilder, OpenAICompatibleExtractor,
+};
+use engram_mcp::{EngramServer, ReflectorOptions};
 use rmcp::transport::streamable_http_server::{
     StreamableHttpService, session::local::LocalSessionManager,
 };
 use sqlx::postgres::PgPoolOptions;
+use tokio_cron_scheduler::{Job, JobScheduler};
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{Config, EmbedderConfig, WorkerConfig};
+use crate::config::{Config, EmbedderConfig, ExtractorConfig, WorkerConfig};
 
 #[derive(Parser, Debug)]
 #[command(name = "engram", version, about = "Self-hosted MCP-native memory service")]
@@ -74,6 +78,28 @@ fn build_embedder(c: &EmbedderConfig) -> anyhow::Result<Arc<dyn Embedder>> {
         }
         other => anyhow::bail!(
             "unknown embedder provider: {other:?} (valid: 'openai-compatible')"
+        ),
+    }
+}
+
+fn build_extractor(c: &ExtractorConfig) -> anyhow::Result<Arc<dyn Extractor>> {
+    match c.provider.as_str() {
+        "openai-compatible" | "openrouter" => {
+            let extractor = OpenAICompatibleExtractor::new(ExtractorConfigBuilder {
+                endpoint: c.endpoint.clone(),
+                model_name: c.model_name.clone(),
+                model_id: c.model_id.clone(),
+                model_version: c.model_version,
+                api_key: c.api_key.clone(),
+                timeout: Duration::from_secs(c.timeout_seconds),
+                temperature: c.temperature,
+                max_facts_per_thought: c.max_facts_per_thought,
+            })
+            .with_context(|| format!("constructing extractor for endpoint {}", c.endpoint))?;
+            Ok(Arc::new(extractor))
+        }
+        other => anyhow::bail!(
+            "unknown extractor provider: {other:?} (valid: 'openai-compatible', 'openrouter')"
         ),
     }
 }
@@ -177,11 +203,36 @@ async fn run_worker(config: Config) -> anyhow::Result<()> {
         embed_drainer_loop(drain_pool, drain_embedder, interval, batch_size, drain_cancel).await;
     });
 
+    // Reflector task is opt-in. Build the extractor only when enabled so
+    // `engram worker` with `reflector.enabled = false` doesn't require vLLM
+    // (or even an `[extractor]` block validating cleanly).
+    let reflector_enabled = config.reflector.enabled;
+    let reflector_summary = if reflector_enabled {
+        let extractor = build_extractor(&config.extractor)?;
+        let reflector_pool = pool.clone();
+        let reflector_cancel = cancel.clone();
+        let reflector_options = config.reflector.clone();
+        let schedule = reflector_options.schedule.clone();
+        let model_id = extractor.model_id().to_string();
+        set.spawn(async move {
+            if let Err(err) =
+                reflector_loop(reflector_pool, extractor, reflector_options, reflector_cancel)
+                    .await
+            {
+                tracing::error!(error = ?err, "reflector loop exited with error");
+            }
+        });
+        format!("reflector enabled (schedule={schedule:?}, model={model_id})")
+    } else {
+        "reflector disabled".to_string()
+    };
+
     tracing::info!(
         tick_interval_seconds,
         batch_size,
         embedder_endpoint = %config.embedder.endpoint,
         model_id = %config.embedder.model_id,
+        reflector = %reflector_summary,
         "engram worker started"
     );
 
@@ -203,6 +254,49 @@ async fn run_worker(config: Config) -> anyhow::Result<()> {
             set.abort_all();
         }
     }
+    Ok(())
+}
+
+async fn reflector_loop(
+    pool: sqlx::PgPool,
+    extractor: Arc<dyn Extractor>,
+    options: ReflectorOptions,
+    cancel: CancellationToken,
+) -> anyhow::Result<()> {
+    let mut sched = JobScheduler::new()
+        .await
+        .context("constructing JobScheduler")?;
+
+    let pool_for_job = pool.clone();
+    let extractor_for_job = extractor.clone();
+    let options_for_job = options.clone();
+    let job = Job::new_async(options.schedule.as_str(), move |_uuid, _l| {
+        let pool = pool_for_job.clone();
+        let extractor = extractor_for_job.clone();
+        let options = options_for_job.clone();
+        Box::pin(async move {
+            match engram_mcp::run_reflector_once(&pool, extractor.as_ref(), &options).await {
+                Ok(r) => tracing::info!(
+                    run_id = %r.run_id,
+                    processed = r.n_thoughts_processed,
+                    committed = r.n_facts_committed,
+                    review = r.n_review_queue,
+                    failures = r.n_extractor_failures,
+                    "reflector run complete",
+                ),
+                Err(err) => tracing::error!(error = ?err, "reflector run failed"),
+            }
+        })
+    })
+    .with_context(|| format!("parsing cron schedule {:?}", options.schedule))?;
+
+    sched.add(job).await.context("registering reflector job")?;
+    sched.start().await.context("starting JobScheduler")?;
+    tracing::info!(schedule = %options.schedule, "reflector scheduler started");
+
+    cancel.cancelled().await;
+    tracing::info!("reflector shutting down");
+    let _ = sched.shutdown().await;
     Ok(())
 }
 

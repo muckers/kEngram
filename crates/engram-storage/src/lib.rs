@@ -516,6 +516,222 @@ pub async fn count_pending(pool: &PgPool) -> Result<i64, StorageError> {
     Ok(row.count)
 }
 
+// -- M2 Phase C: facts pipeline (reflector_runs, facts, facts_review_queue) -
+
+/// Strongly-typed wrapper around `reflector_runs.id`. Returned by
+/// `start_run`, consumed by `finish_run`, embedded in `NewFact.source_run_id`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RunId(pub Uuid);
+
+impl RunId {
+    pub fn as_uuid(&self) -> &Uuid {
+        &self.0
+    }
+
+    pub fn into_uuid(self) -> Uuid {
+        self.0
+    }
+}
+
+impl std::fmt::Display for RunId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// Inputs for `insert_fact`. Borrowing keeps the call cheap; the reflector
+/// loops over many thoughts and produces many facts per run.
+#[derive(Debug, Clone, Copy)]
+pub struct NewFact<'a> {
+    pub scope: &'a Scope,
+    pub statement: &'a str,
+    pub subject: Option<&'a str>,
+    pub predicate: Option<&'a str>,
+    pub object: Option<&'a str>,
+    pub source_thought_id: ThoughtId,
+    pub extractor_model: &'a str,
+    pub extractor_version: i32,
+    pub source_run_id: Option<RunId>,
+    pub confidence: f32,
+}
+
+/// Inputs for `insert_review_queue_row`. Note: review-queue rows don't carry
+/// scope — they reference the source thought, which has the scope. The
+/// `decision` column defaults to `'pending'` via the schema; this struct
+/// doesn't expose it (callers always insert pending rows; reviewers update
+/// them later via a separate path that lands in Phase D).
+#[derive(Debug, Clone, Copy)]
+pub struct NewReviewRow<'a> {
+    pub statement: &'a str,
+    pub subject: Option<&'a str>,
+    pub predicate: Option<&'a str>,
+    pub object: Option<&'a str>,
+    pub source_thought_id: ThoughtId,
+    pub extractor_model: &'a str,
+    pub extractor_version: i32,
+    pub source_run_id: Option<RunId>,
+    pub confidence: f32,
+}
+
+/// Open a reflector run. Returns the new `RunId`. `started_at` defaults to
+/// NOW(); the counts default to 0 and are bumped by `finish_run`.
+pub async fn start_run(
+    pool: &PgPool,
+    extractor_model: &str,
+    extractor_version: i32,
+    scope_filter: Option<&str>,
+) -> Result<RunId, StorageError> {
+    let row = sqlx::query!(
+        r#"
+        INSERT INTO reflector_runs (extractor_model, extractor_version, scope_filter)
+        VALUES ($1, $2, $3)
+        RETURNING id
+        "#,
+        extractor_model,
+        extractor_version,
+        scope_filter,
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(RunId(row.id))
+}
+
+/// Close out a reflector run with final counts. `error` is `Some(_)` only
+/// when the run itself errored at the orchestrator level (per-thought
+/// extractor failures are counted via `n_thoughts_processed` minus committed
+/// + review, and don't populate `error`).
+pub async fn finish_run(
+    pool: &PgPool,
+    run_id: RunId,
+    n_processed: i32,
+    n_committed: i32,
+    n_review: i32,
+    error: Option<&str>,
+) -> Result<(), StorageError> {
+    sqlx::query!(
+        r#"
+        UPDATE reflector_runs
+        SET finished_at = NOW(),
+            n_thoughts_processed = $2,
+            n_facts_committed = $3,
+            n_review_queue = $4,
+            error = $5
+        WHERE id = $1
+        "#,
+        run_id.0,
+        n_processed,
+        n_committed,
+        n_review,
+        error,
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Find thoughts that don't yet have any row in `facts` pointing at them.
+/// Oldest first — reflector should drain the backlog FIFO.
+///
+/// A thought whose facts have all been *superseded* still has rows in
+/// `facts` (with `superseded_at` set), so it's correctly excluded by this
+/// query — re-extracting a corrected thought would defeat the operator's
+/// correction. Phase D's `engram reflect --rerun` will use a different
+/// query for the explicit-rerun case.
+pub async fn find_unfacted_thoughts(
+    pool: &PgPool,
+    scope: Option<&str>,
+    limit: i64,
+) -> Result<Vec<Thought>, StorageError> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT t.id, t.scope, t.content, t.source, t.created_at, t.metadata
+        FROM thoughts t
+        LEFT JOIN facts f
+            ON f.source_thought_id = t.id
+        WHERE f.id IS NULL
+          AND ($1::text IS NULL OR t.scope = $1)
+        ORDER BY t.created_at ASC
+        LIMIT $2
+        "#,
+        scope,
+        limit,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|r| {
+            Ok(Thought {
+                id: ThoughtId::from(r.id),
+                scope: Scope::new(r.scope)?,
+                content: r.content,
+                source: Source::new(r.source)?,
+                created_at: r.created_at,
+                metadata: Metadata::from(r.metadata),
+            })
+        })
+        .collect()
+}
+
+/// Insert a committed fact. Returns the new row id.
+pub async fn insert_fact(pool: &PgPool, f: NewFact<'_>) -> Result<Uuid, StorageError> {
+    let row = sqlx::query!(
+        r#"
+        INSERT INTO facts (
+            scope, statement, subject, predicate, object,
+            source_thought_id, extractor_model, extractor_version,
+            source_run_id, confidence
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        RETURNING id
+        "#,
+        f.scope.as_str(),
+        f.statement,
+        f.subject,
+        f.predicate,
+        f.object,
+        f.source_thought_id.into_uuid(),
+        f.extractor_model,
+        f.extractor_version,
+        f.source_run_id.map(|r| r.0),
+        f.confidence,
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(row.id)
+}
+
+/// Insert a low-confidence extraction into `facts_review_queue` for operator
+/// review. The `decision` column defaults to `'pending'` via the schema.
+pub async fn insert_review_queue_row(
+    pool: &PgPool,
+    r: NewReviewRow<'_>,
+) -> Result<Uuid, StorageError> {
+    let row = sqlx::query!(
+        r#"
+        INSERT INTO facts_review_queue (
+            statement, subject, predicate, object,
+            source_thought_id, extractor_model, extractor_version,
+            source_run_id, confidence
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        RETURNING id
+        "#,
+        r.statement,
+        r.subject,
+        r.predicate,
+        r.object,
+        r.source_thought_id.into_uuid(),
+        r.extractor_model,
+        r.extractor_version,
+        r.source_run_id.map(|x| x.0),
+        r.confidence,
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(row.id)
+}
+
 /// Vector-similarity kNN over `embeddings` for the given model. Hits are
 /// returned in descending order of cosine similarity (`1 - cosine_distance`).
 /// Uses the per-model HNSW partial index (`embeddings_<model>_hnsw`).
@@ -1117,5 +1333,212 @@ mod tests {
             .expect("second insert must be a no-op, not a UNIQUE violation");
 
         assert!(thought_has_embedding(&pool, id, &model).await.unwrap());
+    }
+
+    // -- M2 Phase C: reflector_runs + facts + facts_review_queue ------------
+
+    fn new_fact<'a>(
+        scope: &'a Scope,
+        statement: &'a str,
+        thought_id: ThoughtId,
+        run_id: RunId,
+        confidence: f32,
+    ) -> NewFact<'a> {
+        NewFact {
+            scope,
+            statement,
+            subject: None,
+            predicate: None,
+            object: None,
+            source_thought_id: thought_id,
+            extractor_model: "fake/extractor",
+            extractor_version: 1,
+            source_run_id: Some(run_id),
+            confidence,
+        }
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn start_run_inserts_row_with_started_at(pool: PgPool) {
+        let run_id = start_run(&pool, "fake/extractor", 1, None).await.unwrap();
+        let row = sqlx::query!(
+            r#"SELECT started_at, finished_at, extractor_model, extractor_version, scope_filter
+               FROM reflector_runs WHERE id = $1"#,
+            run_id.0,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        // started_at must be recent; finished_at must still be NULL.
+        let drift = (OffsetDateTime::now_utc() - row.started_at).whole_seconds().abs();
+        assert!(drift < 10, "started_at drift {drift}s");
+        assert!(row.finished_at.is_none());
+        assert_eq!(row.extractor_model, "fake/extractor");
+        assert_eq!(row.extractor_version, 1);
+        assert!(row.scope_filter.is_none());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn finish_run_sets_finished_at_and_counts_and_error(pool: PgPool) {
+        let run_id = start_run(&pool, "fake/extractor", 1, Some("work")).await.unwrap();
+        finish_run(&pool, run_id, 5, 3, 2, Some("partial failure")).await.unwrap();
+
+        let row = sqlx::query!(
+            r#"SELECT finished_at, n_thoughts_processed, n_facts_committed,
+                      n_review_queue, error
+               FROM reflector_runs WHERE id = $1"#,
+            run_id.0,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(row.finished_at.is_some());
+        assert_eq!(row.n_thoughts_processed, 5);
+        assert_eq!(row.n_facts_committed, 3);
+        assert_eq!(row.n_review_queue, 2);
+        assert_eq!(row.error.as_deref(), Some("partial failure"));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn find_unfacted_thoughts_returns_thought_without_facts(pool: PgPool) {
+        let unfacted = insert_test_thought(&pool, "no facts yet", "global").await;
+        let unfacted_too = insert_test_thought(&pool, "also fresh", "global").await;
+
+        let pending = find_unfacted_thoughts(&pool, None, 100).await.unwrap();
+        let ids: Vec<ThoughtId> = pending.iter().map(|t| t.id).collect();
+        assert!(ids.contains(&unfacted));
+        assert!(ids.contains(&unfacted_too));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn find_unfacted_thoughts_skips_thought_with_existing_fact(pool: PgPool) {
+        let facted = insert_test_thought(&pool, "already extracted", "global").await;
+        let scope = Scope::global();
+        let run_id = start_run(&pool, "fake/extractor", 1, None).await.unwrap();
+        insert_fact(&pool, new_fact(&scope, "a fact", facted, run_id, 0.9))
+            .await
+            .unwrap();
+        let unfacted = insert_test_thought(&pool, "still fresh", "global").await;
+
+        let pending = find_unfacted_thoughts(&pool, None, 100).await.unwrap();
+        let ids: Vec<ThoughtId> = pending.iter().map(|t| t.id).collect();
+        assert!(ids.contains(&unfacted));
+        assert!(!ids.contains(&facted));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn find_unfacted_thoughts_orders_ascending_by_created_at(pool: PgPool) {
+        insert_test_thought(&pool, "first", "global").await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        insert_test_thought(&pool, "second", "global").await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        insert_test_thought(&pool, "third", "global").await;
+
+        let pending = find_unfacted_thoughts(&pool, None, 10).await.unwrap();
+        assert_eq!(pending.len(), 3);
+        assert_eq!(pending[0].content, "first");
+        assert_eq!(pending[1].content, "second");
+        assert_eq!(pending[2].content, "third");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn find_unfacted_thoughts_respects_scope_and_limit(pool: PgPool) {
+        for i in 0..5 {
+            insert_test_thought(&pool, &format!("work-{i}"), "work").await;
+        }
+        for i in 0..3 {
+            insert_test_thought(&pool, &format!("personal-{i}"), "personal").await;
+        }
+
+        let work = find_unfacted_thoughts(&pool, Some("work"), 100).await.unwrap();
+        assert_eq!(work.len(), 5);
+        assert!(work.iter().all(|t| t.scope.as_str() == "work"));
+
+        let limited = find_unfacted_thoughts(&pool, None, 4).await.unwrap();
+        assert_eq!(limited.len(), 4);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn insert_fact_persists_with_provenance(pool: PgPool) {
+        let thought_id = insert_test_thought(&pool, "source", "global").await;
+        let scope = Scope::global();
+        let run_id = start_run(&pool, "fake/extractor", 7, None).await.unwrap();
+
+        let fact_id = insert_fact(
+            &pool,
+            NewFact {
+                scope: &scope,
+                statement: "Engram uses pgvector",
+                subject: Some("Engram"),
+                predicate: Some("uses"),
+                object: Some("pgvector"),
+                source_thought_id: thought_id,
+                extractor_model: "fake/extractor",
+                extractor_version: 7,
+                source_run_id: Some(run_id),
+                confidence: 0.91,
+            },
+        )
+        .await
+        .unwrap();
+
+        let row = sqlx::query!(
+            r#"SELECT statement, subject, predicate, object, source_thought_id,
+                      extractor_model, extractor_version, source_run_id,
+                      confidence, scope, superseded_at
+               FROM facts WHERE id = $1"#,
+            fact_id,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.statement, "Engram uses pgvector");
+        assert_eq!(row.subject.as_deref(), Some("Engram"));
+        assert_eq!(row.predicate.as_deref(), Some("uses"));
+        assert_eq!(row.object.as_deref(), Some("pgvector"));
+        assert_eq!(row.source_thought_id, Some(thought_id.into_uuid()));
+        assert_eq!(row.extractor_model, "fake/extractor");
+        assert_eq!(row.extractor_version, 7);
+        assert_eq!(row.source_run_id, Some(run_id.0));
+        assert!((row.confidence - 0.91).abs() < 1e-5);
+        assert_eq!(row.scope, "global");
+        assert!(row.superseded_at.is_none());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn insert_review_queue_row_defaults_decision_to_pending(pool: PgPool) {
+        let thought_id = insert_test_thought(&pool, "questionable claim", "global").await;
+        let run_id = start_run(&pool, "fake/extractor", 1, None).await.unwrap();
+
+        let row_id = insert_review_queue_row(
+            &pool,
+            NewReviewRow {
+                statement: "weak fact",
+                subject: None,
+                predicate: None,
+                object: None,
+                source_thought_id: thought_id,
+                extractor_model: "fake/extractor",
+                extractor_version: 1,
+                source_run_id: Some(run_id),
+                confidence: 0.3,
+            },
+        )
+        .await
+        .unwrap();
+
+        let row = sqlx::query!(
+            r#"SELECT statement, decision, confidence, reviewed_at, source_run_id
+               FROM facts_review_queue WHERE id = $1"#,
+            row_id,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.statement, "weak fact");
+        assert_eq!(row.decision, "pending");
+        assert!((row.confidence - 0.3).abs() < 1e-5);
+        assert!(row.reviewed_at.is_none());
+        assert_eq!(row.source_run_id, Some(run_id.0));
     }
 }

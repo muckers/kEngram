@@ -22,5 +22,6 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+engram-extract.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tracing-subscriber.workspace = true

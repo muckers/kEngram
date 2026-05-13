@@ -76,25 +76,25 @@ End state: capture handler no longer calls `Embedder::embed` inline; it enqueues
 
 End state: vLLM-driven extractor produces facts; reflector cron walks unfacted thoughts and writes facts with run provenance; review queue receives low-confidence rows.
 
-- [ ] `engram-extract` impls:
-  - [ ] `OpenAICompatibleExtractor` — `/v1/chat/completions` with `response_format: { type: "json_schema", json_schema: {...} }`; default `endpoint = http://localhost:8000/v1`; default model name from config
-  - [ ] `OpenRouterExtractor` — same shape, with `Authorization: Bearer <key>` and OpenRouter's endpoint
-  - [ ] Tests with `wiremock`: valid response → facts; malformed JSON → MalformedResponse error; 5xx → transient; missing API key → fatal
-  - [ ] **`integration` feature**: live test against running vLLM (skipped by default, run with `--features integration`)
-- [ ] `engram-storage` repository functions for facts:
-  - [ ] `start_run(pool, extractor_model, extractor_version, scope_filter) -> RunId`
-  - [ ] `finish_run(pool, run_id, n_processed, n_committed, n_review, error?)`
-  - [ ] `find_unfacted_thoughts(pool, scope?, limit) -> Vec<Thought>` (LEFT JOIN facts IS NULL, ASC by created_at)
-  - [ ] `insert_fact(pool, NewFact)` with `extractor_model`, `extractor_version`, `source_run_id`, `confidence`
-  - [ ] `insert_review_queue_row(pool, NewReviewRow)`
-- [ ] Reflector task (in `engram-cli` worker):
-  - [ ] `tokio-cron-scheduler` set up with default schedule from config (`0 3 * * *`)
-  - [ ] On tick: `start_run`, walk unfacted thoughts in scope-order, call extractor per thought, soft-fail on extractor unreachable, route facts to `facts` or `facts_review_queue` per confidence thresholds, `finish_run`
-  - [ ] `sqlx::test` with `FakeExtractor` (analogue of `FakeEmbedder`): produces N facts, all committed; thresholds route low-confidence to review queue; failed extractor calls bump nothing
-- [ ] Config:
-  - [ ] `[extractor]` section in `engram.toml`: provider, endpoint, model, temperature, max_facts_per_thought, response_format
-  - [ ] `[reflector]` section: schedule cron string, `review_queue_below`, `min_confidence_to_store`
-  - [ ] Validation: extractor present only if M2+ features needed; `engram serve` doesn't require it
+- [x] `engram-extract` impls:
+  - [x] `OpenAICompatibleExtractor` — `/v1/chat/completions` with `response_format: { type: "json_schema", json_schema: {...} }`; default `endpoint = http://localhost:8000/v1`; default model name from config
+  - [x] OpenRouter support — same Rust type, named-constructor preset (`OpenAICompatibleConfig::open_router(api_key, model)`) rather than a separate type. Avoids near-duplicate code. The CLI's `extractor.provider = "openrouter"` chooses the preset.
+  - [x] Tests with `wiremock`: valid response → facts; malformed JSON → MalformedResponse; 5xx → transient Backend; 4xx → non-transient Backend; bearer auth header verified; system prompt substitution verified; misconfigured-endpoint check
+  - [x] **`integration` feature**: live test against running vLLM (skipped by default, run with `--features integration`)
+- [x] `engram-storage` repository functions for facts:
+  - [x] `start_run(pool, extractor_model, extractor_version, scope_filter) -> RunId`
+  - [x] `finish_run(pool, run_id, n_processed, n_committed, n_review, error?)`
+  - [x] `find_unfacted_thoughts(pool, scope?, limit) -> Vec<Thought>` (LEFT JOIN facts IS NULL, ASC by created_at)
+  - [x] `insert_fact(pool, NewFact)` with `extractor_model`, `extractor_version`, `source_run_id`, `confidence`
+  - [x] `insert_review_queue_row(pool, NewReviewRow)`
+- [x] Reflector task (in `engram-cli` worker):
+  - [x] `tokio-cron-scheduler` (0.15.1) set up with default schedule from config (`0 0 3 * * *` — 6-field cron with seconds)
+  - [x] On tick: `start_run`, walk unfacted thoughts in scope-order, call extractor per thought, soft-fail on extractor unreachable, route facts to `facts` or `facts_review_queue` per `review_queue_below` threshold, `finish_run`
+  - [x] `sqlx::test` with `FakeExtractor` (analogue of `FakeEmbedder`): 8 tests covering high-confidence commit, low-confidence routing, source_run_id provenance, soft-fail path, idempotency on rerun, run counts, scope filter, explicit-facts override
+- [x] Config:
+  - [x] `[extractor]` section in `engram.toml`: provider, endpoint, model_name, model_id, model_version, api_key, timeout_seconds, temperature, max_facts_per_thought
+  - [x] `[reflector]` section: enabled (default false), schedule, scope_filter, max_thoughts_per_run, max_facts_per_thought, review_queue_below
+  - [x] Validation: `engram serve` doesn't require an extractor; `engram worker` only builds the extractor when `reflector.enabled = true`. Default-off keeps single-user dogfood drag-free.
 
 ## Phase D — MCP tools + manual reflect + dogfood
 
@@ -121,6 +121,8 @@ End state: M2 success criteria from m2-facts-pipeline.md met. Operator-driven do
 Dated notes appended as items land. Format: `YYYY-MM-DD — <one-line summary>`. Multi-line entries fine for decisions that need explanation.
 
 <!-- Most recent entry first. -->
+
+- **2026-05-13** — M2 Phase C landed. Reflector cron + concrete extractor impls are live. `OpenAICompatibleExtractor` (one Rust type, two named-constructor presets — `vllm_local()` and `open_router(api_key, model)` — rather than two separate types, mirroring how `OpenAICompatibleEmbedder` already covers Ollama/TEI/OpenAI by config). `FakeExtractor` with `Deterministic`/`Timeout`/`Unreachable`/`Misconfigured` behaviors plus `with_confidence(f32)` and `with_facts(Vec<ExtractedFact>)` constructors for routing/explicit tests. Five new storage functions (`start_run`, `finish_run`, `find_unfacted_thoughts`, `insert_fact`, `insert_review_queue_row`) + `RunId`, `NewFact`, `NewReviewRow` types. `engram-mcp::reflect::run_reflector_once` orchestrates a single pass (start_run → LEFT-JOIN unfacted → for each thought: extract → route by `review_queue_below` → insert → finish_run). The cron loop wraps that call inside `tokio-cron-scheduler` 0.15.1 (latest stable per `cargo info`); `engram worker` runs the loop as a second `JoinSet` task alongside the embed-drainer when `reflector.enabled = true`. Three engineering decisions worth documenting: (1) one extractor type with two presets, not two types; (2) single-band routing (`review_queue_below` only) — m2-facts-pipeline.md's three-band design with a "flagged but committed" middle band would require a new column on `facts` that doesn't exist, so it's deferred; (3) `reflector.enabled` defaults to `false` so `engram worker` works without vLLM. Live smoke verified: with vLLM down, `engram worker` with `ENGRAM_REFLECTOR__ENABLED=true ENGRAM_REFLECTOR__SCHEDULE="*/3 * * * * *"` fires on cron, soft-fails per thought (Q9 path), and exits cleanly on SIGINT. Test count 129 → 166 (+37: storage +8, extract +17, mcp/reflect +8, cli config +4).
 
 - **2026-05-12** — M2 Phase B landed. Async embedding seam in place: `capture` no longer takes an `Embedder` arg — it inserts the thought, enqueues a `pending_embeddings` row keyed by the active model id, and always returns `embedding_status: "pending"`. New `engram worker` subcommand drains the queue every 5s in a `tokio::task::JoinSet` (designed for Phase C's reflector task to plug in alongside it). `embed-backfill` rewritten as heal-then-drain (enqueues any unembedded thoughts → drains the queue, bounded by `--limit`). Three engineering refinements during synthesis: (1) `claim_pending` is single-statement `UPDATE ... FROM (... FOR UPDATE SKIP LOCKED)` rather than the originally-prescribed long-held tx — same SKIP LOCKED safety, no held connection; (2) `insert_thought_embedding` now `ON CONFLICT DO NOTHING` so a worker that crashes between embed and `mark_embedded` is harmless on replay; (3) `ExtractionContext` only carries scope + max_facts since the `Thought` is passed separately. Test count 114 → 129 (storage 20→29, mcp 29→35, plus a `WorkerConfig` default test). Manual smoke: `engram worker` starts cleanly, drains the queue every 5s, exits within ~1s of SIGINT.
 

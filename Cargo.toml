@@ -61,5 +61,8 @@ clap = { version = "4", features = ["derive"] }
 # MCP
 rmcp = { version = "1.6", features = ["server", "macros", "transport-streamable-http-server"] }
 
+# Cron scheduling (M2 Phase C reflector). 0.15.1 is latest stable per cargo info.
+tokio-cron-scheduler = "0.15"
+
 # Test utilities (dev-deps)
 wiremock = "0.6"

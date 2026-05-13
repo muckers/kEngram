@@ -13,6 +13,7 @@ path = "src/main.rs"
 engram-core.workspace = true
 engram-storage.workspace = true
 engram-embed.workspace = true
+engram-extract.workspace = true
 engram-mcp.workspace = true
 
 anyhow.workspace = true
@@ -23,6 +24,7 @@ rmcp.workspace = true
 serde.workspace = true
 sqlx.workspace = true
 tokio = { workspace = true, features = ["full"] }
+tokio-cron-scheduler.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

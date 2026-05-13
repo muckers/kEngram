@@ -18,6 +18,8 @@ pub struct Config {
     pub database: DatabaseConfig,
     pub embedder: EmbedderConfig,
     pub worker: WorkerConfig,
+    pub extractor: ExtractorConfig,
+    pub reflector: engram_mcp::ReflectorOptions,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,6 +110,46 @@ impl Default for WorkerConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ExtractorConfig {
+    /// `"openai-compatible"` (vLLM, etc.) or `"openrouter"`. Other providers
+    /// can be added later by extending the `build_extractor` match.
+    pub provider: String,
+    /// `/v1` base URL. For vLLM: `"http://localhost:8000/v1"`. For
+    /// OpenRouter: `"https://openrouter.ai/api/v1"`.
+    pub endpoint: String,
+    /// Backend model name. For vLLM: the deployed model (`"qwen2.5-7b-instruct"`).
+    /// For OpenRouter: a model slug (`"anthropic/claude-haiku-4.5"`).
+    pub model_name: String,
+    /// Engram-side stable identity written into `facts.extractor_model`.
+    /// Conventionally `<vendor>/<model>`. Defaults to `"vllm/qwen2.5-7b-instruct"`.
+    pub model_id: String,
+    /// Schema-version for `facts.extractor_version`. Bump when the prompt
+    /// or schema changes such that prior facts are no longer comparable.
+    pub model_version: i32,
+    pub api_key: Option<String>,
+    pub timeout_seconds: u64,
+    pub temperature: f32,
+    pub max_facts_per_thought: usize,
+}
+
+impl Default for ExtractorConfig {
+    fn default() -> Self {
+        Self {
+            provider: "openai-compatible".to_string(),
+            endpoint: "http://localhost:8000/v1".to_string(),
+            model_name: "qwen2.5-7b-instruct".to_string(),
+            model_id: "vllm/qwen2.5-7b-instruct".to_string(),
+            model_version: 1,
+            api_key: None,
+            timeout_seconds: 60,
+            temperature: 0.2,
+            max_facts_per_thought: 8,
+        }
+    }
+}
+
 pub fn default_config_path() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/engram/engram.toml"))
 }
@@ -163,5 +205,35 @@ mod tests {
         let c = Config::default();
         assert_eq!(c.worker.tick_interval_seconds, 5);
         assert_eq!(c.worker.batch_size, 16);
+    }
+
+    #[test]
+    fn default_extractor_targets_vllm_localhost() {
+        let c = Config::default();
+        assert_eq!(c.extractor.provider, "openai-compatible");
+        assert_eq!(c.extractor.endpoint, "http://localhost:8000/v1");
+        assert_eq!(c.extractor.model_name, "qwen2.5-7b-instruct");
+        assert_eq!(c.extractor.model_id, "vllm/qwen2.5-7b-instruct");
+        assert_eq!(c.extractor.model_version, 1);
+        assert!(c.extractor.api_key.is_none());
+        assert_eq!(c.extractor.max_facts_per_thought, 8);
+    }
+
+    #[test]
+    fn default_reflector_is_disabled() {
+        let c = Config::default();
+        assert!(!c.reflector.enabled, "reflector must default to off — opt-in");
+    }
+
+    #[test]
+    fn default_reflector_schedule_is_3am_daily() {
+        let c = Config::default();
+        assert_eq!(c.reflector.schedule, "0 0 3 * * *");
+    }
+
+    #[test]
+    fn default_reflector_review_queue_below_is_0_7() {
+        let c = Config::default();
+        assert!((c.reflector.review_queue_below - 0.7).abs() < f32::EPSILON);
     }
 }

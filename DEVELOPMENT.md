@@ -120,9 +120,27 @@ timeout_seconds = 5
 [worker]
 tick_interval_seconds = 5                # how often `engram worker` drains the queue
 batch_size = 16                          # max jobs per tick
+
+[extractor]
+provider = "openai-compatible"           # also "openrouter"
+endpoint = "http://localhost:8000/v1"    # vLLM default; OpenRouter is https://openrouter.ai/api/v1
+model_name = "qwen2.5-7b-instruct"       # the model the backend serves
+model_id = "vllm/qwen2.5-7b-instruct"    # provenance written into facts.extractor_model
+model_version = 1                        # bump when prompt/schema changes
+timeout_seconds = 60                     # vLLM JSON-Schema responses can run long
+temperature = 0.2
+max_facts_per_thought = 8
+
+[reflector]
+enabled = false                          # opt-in: flip to true when vLLM is running
+schedule = "0 0 3 * * *"                 # 6-field cron: sec min hour dom month dow (03:00 daily)
+scope_filter = ""                        # leave blank for all scopes
+max_thoughts_per_run = 1000
+max_facts_per_thought = 8
+review_queue_below = 0.7                 # confidence below → facts_review_queue; ≥ → facts
 ```
 
-Env override examples: `ENGRAM_WORKER__TICK_INTERVAL_SECONDS=2 cargo run --bin engram -- worker` (snappier ticks for development), `ENGRAM_WORKER__BATCH_SIZE=64` (kinder to the embedder on a backlog).
+Env override examples: `ENGRAM_WORKER__TICK_INTERVAL_SECONDS=2 cargo run --bin engram -- worker` (snappier ticks for development), `ENGRAM_REFLECTOR__ENABLED=true ENGRAM_REFLECTOR__SCHEDULE="*/30 * * * * *"` (every 30 seconds — useful for live dogfood), `ENGRAM_EXTRACTOR__API_KEY=sk-...` (OpenRouter key without checking it into config).
 
 ## Port conflicts
 
