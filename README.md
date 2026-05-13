@@ -91,6 +91,91 @@ timeout_seconds = 5
 
 **Heads-up on dimensions:** the M1 migration ships exactly one HNSW partial index (`embeddings_bge_m3_hnsw` over `WHERE model_id = 'bge-m3:1024'`). Switching to a model with different dimensions or a different `model_id` requires a new migration that adds the matching partial index — see [`docs/engram-design-v0.md`](docs/engram-design-v0.md) §5 and §9. Sticking with `bge-m3:1024` via Ollama/TEI/HF requires no schema change.
 
+## Configuring the extractor backend (M2+)
+
+The **reflector** — the `engram worker` task that turns captured thoughts into structured facts — talks to an OpenAI-compatible `/v1/chat/completions` endpoint with `response_format: { type: "json_schema", ... }`. Two presets ship: local vLLM (production sidecar) and OpenRouter (cloud fallback). Any other OpenAI-compatible chat endpoint that supports JSON-Schema response_format also works via the `openai-compatible` provider.
+
+The reflector is **opt-in**. `engram worker` always runs the embed-drainer; the reflector task only spawns when `[reflector] enabled = true`. So nothing in this section matters until you flip that flag.
+
+### vLLM (default preset)
+
+Engram's `[extractor]` defaults point at `http://localhost:8000/v1` serving `qwen2.5-7b-instruct`. To bring vLLM up alongside Engram:
+
+```bash
+# Install (CUDA/ROCm prereqs apply — see https://docs.vllm.ai/en/latest/getting_started/installation.html)
+pip install vllm                   # or `uv pip install vllm`
+
+# Serve a tool-capable model with JSON-Schema guided decoding
+vllm serve Qwen/Qwen2.5-7B-Instruct \
+  --host 127.0.0.1 --port 8000 \
+  --guided-decoding-backend xgrammar
+
+# Verify the chat-completions endpoint
+curl http://localhost:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "Qwen/Qwen2.5-7B-Instruct",
+    "messages": [{"role": "user", "content": "Say hi in one word."}]
+  }' | jq '.choices[0].message.content'
+```
+
+If your vLLM model name differs from Engram's default, update `[extractor].model_name` to match what vLLM serves. `model_id` is Engram's stable provenance label (written to `facts.extractor_model`) — bump `model_version` whenever the prompt or schema changes such that prior facts shouldn't be considered comparable.
+
+### OpenRouter (cloud fallback)
+
+No local GPU? Use OpenRouter — the `openrouter` provider preset sets the base URL and bearer auth automatically:
+
+```bash
+ENGRAM_REFLECTOR__ENABLED=true \
+ENGRAM_EXTRACTOR__PROVIDER=openrouter \
+ENGRAM_EXTRACTOR__ENDPOINT='https://openrouter.ai/api/v1' \
+ENGRAM_EXTRACTOR__MODEL_NAME='anthropic/claude-haiku-4.5' \
+ENGRAM_EXTRACTOR__MODEL_ID='openrouter/anthropic/claude-haiku-4.5' \
+ENGRAM_EXTRACTOR__API_KEY='sk-or-...' \
+  cargo run --bin engram -- worker
+```
+
+Equivalent TOML in `~/.config/engram/engram.toml`:
+
+```toml
+[extractor]
+provider              = "openrouter"
+endpoint              = "https://openrouter.ai/api/v1"
+model_name            = "anthropic/claude-haiku-4.5"
+model_id              = "openrouter/anthropic/claude-haiku-4.5"
+api_key               = "sk-or-..."
+timeout_seconds       = 60
+temperature           = 0.2
+max_facts_per_thought = 8
+```
+
+### Turning the reflector on
+
+```toml
+[reflector]
+enabled               = true
+schedule              = "0 0 3 * * *"   # 6-field cron (sec min hour dom month dow). 03:00 daily.
+review_queue_below    = 0.7             # confidence < this → facts_review_queue; ≥ → facts
+scope_filter          = ""               # leave blank for all scopes
+max_thoughts_per_run  = 1000
+max_facts_per_thought = 8
+```
+
+For development, tighten the schedule to something like `"*/30 * * * * *"` (every 30 seconds) and watch the worker logs. Alternatively, drive a one-shot pass without waiting for cron:
+
+```bash
+cargo run --bin engram -- reflect --scope smoke-test --limit 10
+```
+
+`engram reflect --rerun [--since <RFC3339>]` re-extracts already-facted thoughts and supersedes obsolete rows (preserving the audit trail) — useful after upgrading the extractor model.
+
+### Model selection notes
+
+The reflector uses structured outputs, so the model + serving stack must:
+
+- **Support `response_format: { type: "json_schema" }`** — vLLM's `xgrammar` and `outlines` guided-decoding backends do; most OpenRouter chat models do.
+- **Be instruction-following enough to populate the (S, P, O) triple cleanly** — Qwen 2.5 7B/14B Instruct, Llama 3.1 8B+, Claude Haiku / Sonnet via OpenRouter all work well. Smaller / non-instruct models often return malformed payloads (logged as `ExtractorError::MalformedResponse` and soft-failed per Q9).
+
 ## Connecting MCP clients
 
 ### Claude Code
