@@ -47,7 +47,11 @@ impl OpenAICompatibleConfig {
             endpoint: "http://localhost:8000/v1".to_string(),
             model_name: "qwen2.5-7b-instruct".to_string(),
             model_id: "vllm/qwen2.5-7b-instruct".to_string(),
-            model_version: 1,
+            // v2 = revised system prompt with confidence-rubric anchors and
+            // explicit episodic-content skip guidance (2026-05-13). Earlier
+            // facts in the DB carry version=1 and can be re-extracted via
+            // `engram reflect --rerun`.
+            model_version: 2,
             api_key: None,
             timeout: Duration::from_secs(60),
             temperature: 0.2,
@@ -64,7 +68,7 @@ impl OpenAICompatibleConfig {
             endpoint: "https://openrouter.ai/api/v1".to_string(),
             model_id: format!("openrouter/{model_name}"),
             model_name,
-            model_version: 1,
+            model_version: 2, // see `vllm_local()` for rationale on the bump
             api_key: Some(api_key),
             timeout: Duration::from_secs(60),
             temperature: 0.2,
@@ -119,17 +123,30 @@ impl OpenAICompatibleExtractor {
     }
 }
 
+// Prompt version is paired with `OpenAICompatibleConfig::model_version`
+// (default 2). Bump the default version whenever this prompt or the
+// response schema changes such that prior facts shouldn't be considered
+// comparable; `engram reflect --rerun` then re-extracts under the new
+// version. See docs/engram-design-v0.md §6.5 and §10.
 const SYSTEM_PROMPT: &str = "\
 You are an information-extraction assistant. Given a single thought from a memory service, identify discrete factual claims and return them as structured JSON.
 
 Each fact has:
 - statement: a self-contained natural-language sentence the user could read on its own.
 - subject, predicate, object: optional (S, P, O) triple if the fact maps cleanly to one. Use null when no clean triple exists.
-- confidence: your self-reported [0.0, 1.0] score. Use lower values (< 0.7) when the claim is hedged, inferred, or you'd want a human to double-check.
+- confidence: your self-reported [0.0, 1.0] calibrated score (see rubric below).
+
+Confidence calibration — default to 0.85; deviate only when the rubric below justifies it. Most paraphrased facts should land in 0.80–0.90; reserve 0.95+ for direct restatements.
+- 0.95–1.00: direct quotation or near-verbatim restatement of the source. Use only when the source unambiguously asserts this exact claim, in roughly these words.
+- 0.85–0.95: clean paraphrase, no added inference. The typical band.
+- 0.70–0.85: claim involves some interpretation, but is well-supported by the source.
+- 0.50–0.70: claim is hedged in the source ('likely', 'might', 'I suspect'), or required inference from context.
+- below 0.50: speculative; a human should review.
 
 Rules:
-- Do not invent facts that aren't supported by the input.
+- Do not invent facts that aren't supported by the input. If the source is uncertain, the fact's confidence must reflect that uncertainty.
 - Skip purely conversational, social, or temporal-greeting content — return an empty facts array.
+- Skip episodic / transient content: descriptions of one-off operations ('a search was conducted', 'the test returned X', 'today I ran Y'), individual test runs, or snapshots of system state at a particular moment. Extract durable claims about how the system or domain works, not what happened during a session.
 - One fact per claim. Don't bundle multiple distinct claims into a single statement.
 - Return at most {MAX_FACTS} facts.";
 
