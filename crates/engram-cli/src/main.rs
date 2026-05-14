@@ -14,7 +14,7 @@ use engram_extract::{
 };
 use engram_mcp::{EngramServer, ReflectorOptions};
 use rmcp::transport::streamable_http_server::{
-    StreamableHttpService, session::local::LocalSessionManager,
+    StreamableHttpService, StreamableHttpServerConfig, session::local::LocalSessionManager,
 };
 use sqlx::postgres::PgPoolOptions;
 use tokio_cron_scheduler::{Job, JobScheduler};
@@ -143,10 +143,21 @@ async fn run_serve(config: Config) -> anyhow::Result<()> {
     let factory = move || Ok(EngramServer::new(pool_for_factory.clone(), embedder_for_factory.clone()));
 
     let cancel = CancellationToken::new();
+    // Stateless mode (allowed by MCP Streamable HTTP spec 2025-06-18 for
+    // simple request-response tools). Engram has no per-session state — every
+    // tool is `Result<Response, Error>`, returns synchronously, doesn't push
+    // events. Disabling stateful mode means rmcp never issues a session id,
+    // never runs the idle-session reaper, and therefore can't return
+    // `Session not found` 404s when a long-lived MCP client (Claude Desktop,
+    // mcp-remote bridge) comes back after idling past the 5-minute default.
+    // `json_response: true` pairs naturally — replies are plain JSON, no SSE
+    // framing overhead.
     let mcp_service = StreamableHttpService::new(
         factory,
         LocalSessionManager::default().into(),
-        Default::default(),
+        StreamableHttpServerConfig::default()
+            .with_stateful_mode(false)
+            .with_json_response(true),
     );
 
     let app = axum::Router::new().nest_service("/mcp", mcp_service);
