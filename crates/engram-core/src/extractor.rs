@@ -24,18 +24,52 @@ pub struct ExtractedFact {
     pub confidence: f32,
 }
 
+/// Per-thought extraction mode, plumbed from the source thought's
+/// `metadata.extract` field through the reflector to the extractor.
+///
+/// - `All` (default, also matches absent flag for back-compat): extract every
+///   durable claim per the bundled prompt's rules.
+/// - `DurableOnly`: the captured thought is known to mix durable claims with
+///   transient session narrative; the extractor receives an additional system
+///   message instructing it to extract only the durable claims. The bundled
+///   prompt's mixed-content rule covers this in principle, but the operator
+///   may want to lean harder per-thought.
+///
+/// `metadata.extract: "none"` is handled in the reflector before the
+/// extractor is called and therefore does not surface here as a variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExtractMode {
+    #[default]
+    All,
+    DurableOnly,
+}
+
 /// Knobs the reflector hands to each per-thought extraction call. `scope` is
 /// echoed so the extractor can prompt-condition on it; `max_facts` caps the
-/// extractor's output to keep response sizes bounded.
+/// extractor's output to keep response sizes bounded; `extract_mode` lets
+/// the operator mark mixed-content thoughts at capture time (see [`ExtractMode`]).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExtractionContext {
     pub scope: Scope,
     pub max_facts: usize,
+    pub extract_mode: ExtractMode,
 }
 
 impl ExtractionContext {
     pub fn new(scope: Scope, max_facts: usize) -> Self {
-        Self { scope, max_facts }
+        Self {
+            scope,
+            max_facts,
+            extract_mode: ExtractMode::default(),
+        }
+    }
+
+    /// Builder-style override for `extract_mode`. Lets the reflector compose
+    /// a context that propagates a thought's `metadata.extract` decision
+    /// without breaking existing callers that don't care about the mode.
+    pub fn with_extract_mode(mut self, mode: ExtractMode) -> Self {
+        self.extract_mode = mode;
+        self
     }
 }
 

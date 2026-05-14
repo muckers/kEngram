@@ -151,10 +151,11 @@ impl Default for ExtractorConfig {
             endpoint: "http://localhost:8000/v1".to_string(),
             model_name: "qwen2.5-7b-instruct".to_string(),
             model_id: "vllm/qwen2.5-7b-instruct".to_string(),
-            // v2 = revised system prompt with confidence-rubric anchors and
-            // explicit episodic-content skip guidance (2026-05-13). See
+            // v3 = SPO decomposition rules + tighter confidence rubric +
+            // two new episodic-skip negatives + JSON envelope in prose
+            // (2026-05-14, M3 Phase A). See
             // crates/engram-extract/src/openai_compatible.rs.
-            model_version: 2,
+            model_version: 3,
             api_key: None,
             timeout_seconds: 60,
             temperature: 0.2,
@@ -228,9 +229,11 @@ mod tests {
         assert_eq!(c.extractor.endpoint, "http://localhost:8000/v1");
         assert_eq!(c.extractor.model_name, "qwen2.5-7b-instruct");
         assert_eq!(c.extractor.model_id, "vllm/qwen2.5-7b-instruct");
-        // Bumped to 2 on 2026-05-13 when the system prompt gained a
-        // confidence-rubric and explicit episodic-content skip guidance.
-        assert_eq!(c.extractor.model_version, 2);
+        // Bumped to 3 on 2026-05-14 (M3 Phase A) when the system prompt
+        // gained SPO decomposition rules, tighter confidence rubric, and
+        // two new episodic-skip negatives. (v2 = 2026-05-13: confidence
+        // rubric anchors + episodic-content skip.)
+        assert_eq!(c.extractor.model_version, 3);
         assert!(c.extractor.api_key.is_none());
         assert_eq!(c.extractor.max_facts_per_thought, 8);
         // Default is the bundled prompt — no file override.

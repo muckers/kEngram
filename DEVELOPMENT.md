@@ -109,11 +109,19 @@ cargo run --bin engram -- reflect --limit 50
 cargo run --bin engram -- reflect --scope work --limit 100
 
 # Rerun: re-evaluate already-facted thoughts. Use this after upgrading the
-# extractor model — if the new extractor's (S, P, O) matches an existing
-# fact but rephrases the statement, the old row is superseded with
-# `superseded_by` pointing at the new row (audit trail preserved). Existing
-# facts the new extractor *doesn't* produce stay active (no subtractive
-# logic). Pair with --since to bound the rerun to recent thoughts.
+# extractor model. Dedup predicate is "statement match OR (S, P, O) match" —
+# either signal counts as the same claim. For each new extraction:
+#   - no match → insert as a brand-new claim.
+#   - match, byte-identical to an active row → no-op (no insert, no
+#     supersession); drift rows on the same claim fold into the byte-
+#     identical canonical via `superseded_by`.
+#   - match, none byte-identical → insert the new row as canonical; drift
+#     rows fold into it via `superseded_by`. Audit trail preserved.
+# Existing facts the new extractor *doesn't* produce stay active (no
+# subtractive logic — sampling variance shouldn't silently lose claims).
+# Low-confidence rerun extractions route to the review queue and do NOT
+# supersede the active row. Pair with --since to bound the rerun to recent
+# thoughts.
 cargo run --bin engram -- reflect --rerun --scope work
 cargo run --bin engram -- reflect --rerun --since 2026-04-01T00:00:00Z
 ```
@@ -149,7 +157,7 @@ provider = "openai-compatible"           # also "openrouter"
 endpoint = "http://localhost:8000/v1"    # vLLM default; OpenRouter is https://openrouter.ai/api/v1
 model_name = "qwen2.5-7b-instruct"       # the model the backend serves
 model_id = "vllm/qwen2.5-7b-instruct"    # provenance written into facts.extractor_model
-model_version = 2                        # bump when prompt/schema changes; v2 = rubric-anchored prompt (2026-05-13)
+model_version = 3                        # bump when prompt/schema changes; v3 = SPO decomposition rules + tighter confidence rubric + new episodic negatives (2026-05-14)
 timeout_seconds = 60                     # vLLM JSON-Schema responses can run long
 temperature = 0.2
 max_facts_per_thought = 8

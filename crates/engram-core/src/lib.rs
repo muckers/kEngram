@@ -15,7 +15,7 @@ pub mod thought;
 
 pub use embedder::{Embedder, EmbedderError};
 pub use embedding::{Embedding, EmbeddingError, EmbeddingModel, EmbeddingStatus};
-pub use extractor::{ExtractedFact, ExtractionContext, Extractor, ExtractorError};
+pub use extractor::{ExtractMode, ExtractedFact, ExtractionContext, Extractor, ExtractorError};
 pub use fact::Fact;
 pub use metadata::Metadata;
 pub use scope::{Scope, ScopeError};

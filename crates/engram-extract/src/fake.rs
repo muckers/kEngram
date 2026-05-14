@@ -8,6 +8,7 @@
 
 use async_trait::async_trait;
 use engram_core::{ExtractedFact, ExtractionContext, Extractor, ExtractorError, Thought};
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone)]
 pub struct FakeExtractor {
@@ -19,6 +20,12 @@ pub struct FakeExtractor {
     /// the thought content at `default_confidence`.
     output_override: Option<Vec<ExtractedFact>>,
     default_confidence: f32,
+    /// Records the `ExtractionContext` of the most recent successful
+    /// `extract()` call, so tests can assert that the reflector propagated
+    /// `metadata.extract` / `ExtractMode` correctly. `Arc<Mutex<_>>` because
+    /// `FakeExtractor` is passed by shared reference through the reflector
+    /// loop and tests need to inspect the post-run state.
+    last_ctx: Arc<Mutex<Option<ExtractionContext>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,7 +50,15 @@ impl FakeExtractor {
             behavior: FakeBehavior::Deterministic,
             output_override: None,
             default_confidence: 0.9,
+            last_ctx: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Returns the `ExtractionContext` of the most recent successful
+    /// `extract()` call, if any. Tests use this to assert the reflector
+    /// propagated `metadata.extract` → `ExtractMode` correctly.
+    pub fn last_ctx(&self) -> Option<ExtractionContext> {
+        self.last_ctx.lock().expect("last_ctx mutex poisoned").clone()
     }
 
     pub fn with_model(model_id: impl Into<String>, version: i32) -> Self {
@@ -113,6 +128,7 @@ impl Extractor for FakeExtractor {
                 "fake extractor configured to fail".into(),
             )),
             FakeBehavior::Deterministic => {
+                *self.last_ctx.lock().expect("last_ctx mutex poisoned") = Some(ctx.clone());
                 let facts = if let Some(ref overridden) = self.output_override {
                     overridden.clone()
                 } else {

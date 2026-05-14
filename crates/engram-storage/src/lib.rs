@@ -621,6 +621,7 @@ pub async fn finish_run(
     n_processed: i32,
     n_committed: i32,
     n_review: i32,
+    n_failures: i32,
     error: Option<&str>,
 ) -> Result<(), StorageError> {
     sqlx::query!(
@@ -630,13 +631,15 @@ pub async fn finish_run(
             n_thoughts_processed = $2,
             n_facts_committed = $3,
             n_review_queue = $4,
-            error = $5
+            n_extractor_failures = $5,
+            error = $6
         WHERE id = $1
         "#,
         run_id.0,
         n_processed,
         n_committed,
         n_review,
+        n_failures,
         error,
     )
     .execute(pool)
@@ -808,23 +811,42 @@ pub async fn search_facts_trigram(
     scope: Option<&str>,
     limit: i64,
 ) -> Result<Vec<FactHit>, StorageError> {
+    // Lexical scoring concatenates statement + (subject, predicate, object)
+    // so a query whose terms only appear in the triple (e.g. `subject="Ron"`
+    // on a fact whose statement starts with "When Rust is unavailable…")
+    // still matches via the trigram leg. Empty/null triple components fall
+    // back to an empty string and contribute nothing to the score.
+    //
+    // Uses `word_similarity(query, target)` rather than the symmetric
+    // `similarity(...)` because `word_similarity` finds the best matching
+    // window of trigrams within the target — so a short query like
+    // "Ron Go" against a long concatenated text scores by the best window,
+    // not by the global trigram-set ratio (which dilutes with target length).
     let rows = sqlx::query!(
         r#"
-        SELECT f.id, f.scope, f.statement, f.subject, f.predicate, f.object,
-               f.source_thought_id AS "source_thought_id!",
-               f.extractor_model, f.extractor_version, f.source_run_id,
-               f.confidence, f.created_at,
+        WITH searchable AS (
+            SELECT f.*,
+                   f.statement
+                   || ' ' || COALESCE(f.subject, '')
+                   || ' ' || COALESCE(f.predicate, '')
+                   || ' ' || COALESCE(f.object, '') AS searchable_text
+            FROM facts f
+            WHERE f.superseded_at IS NULL
+              AND ($2::text IS NULL OR f.scope = $2)
+        )
+        SELECT s.id, s.scope, s.statement, s.subject, s.predicate, s.object,
+               s.source_thought_id AS "source_thought_id!",
+               s.extractor_model, s.extractor_version, s.source_run_id,
+               s.confidence, s.created_at,
                t.content        AS source_thought_content,
                t.scope          AS source_thought_scope,
                t.created_at     AS source_thought_created_at,
-               similarity(f.statement, $1) AS "sim!: f32"
-        FROM facts f
-        JOIN thoughts t ON t.id = f.source_thought_id
-        WHERE similarity(f.statement, $1) > 0.1
-          AND f.superseded_at IS NULL
+               word_similarity($1, s.searchable_text) AS "sim!: f32"
+        FROM searchable s
+        JOIN thoughts t ON t.id = s.source_thought_id
+        WHERE word_similarity($1, s.searchable_text) > 0.3
           AND t.retracted_at IS NULL
-          AND ($2::text IS NULL OR f.scope = $2)
-        ORDER BY similarity(f.statement, $1) DESC
+        ORDER BY word_similarity($1, s.searchable_text) DESC
         LIMIT $3
         "#,
         query,
@@ -1095,14 +1117,30 @@ pub async fn find_facted_thoughts(
 /// object) triple matches the given values. Uses `IS NOT DISTINCT FROM` so
 /// `NULL` vs `NULL` counts as a match (Postgres `=` returns NULL for that
 /// case). Used by `--rerun` to decide merge-vs-supersede.
-pub async fn find_matching_active_fact(
+/// Returns the active facts on `thought_id` that match the proposed new fact
+/// on either of two predicates:
+///
+///   1. Exact statement match (`facts.statement = $2`), or
+///   2. Triple match via `IS NOT DISTINCT FROM` (NULL-aware) on
+///      `(subject, predicate, object)`.
+///
+/// The reflector rerun loop uses this to fold drift duplicates into a single
+/// canonical row: an LLM may produce the same statement with a different
+/// (S, P, O) decomposition on a different sampling, and either signal is
+/// enough to recognize "the same claim." Multiple rows may match if the
+/// audit table is already in a pre-existing duplicated state — callers
+/// supersede all of them.
+///
+/// Ordered by `created_at ASC` so audit consumers see the oldest match first.
+pub async fn find_matching_active_facts(
     pool: &PgPool,
     thought_id: ThoughtId,
+    statement: &str,
     subject: Option<&str>,
     predicate: Option<&str>,
     object: Option<&str>,
-) -> Result<Option<Fact>, StorageError> {
-    let row = sqlx::query!(
+) -> Result<Vec<Fact>, StorageError> {
+    let rows = sqlx::query!(
         r#"
         SELECT id, scope, statement, subject, predicate, object,
                source_thought_id AS "source_thought_id!",
@@ -1111,37 +1149,41 @@ pub async fn find_matching_active_fact(
         FROM facts
         WHERE source_thought_id = $1
           AND superseded_at IS NULL
-          AND subject   IS NOT DISTINCT FROM $2
-          AND predicate IS NOT DISTINCT FROM $3
-          AND object    IS NOT DISTINCT FROM $4
-        LIMIT 1
+          AND (
+              statement = $2
+              OR (subject   IS NOT DISTINCT FROM $3
+              AND predicate IS NOT DISTINCT FROM $4
+              AND object    IS NOT DISTINCT FROM $5)
+          )
+        ORDER BY created_at ASC
         "#,
         thought_id.into_uuid(),
+        statement,
         subject,
         predicate,
         object,
     )
-    .fetch_optional(pool)
+    .fetch_all(pool)
     .await?;
 
-    let Some(r) = row else {
-        return Ok(None);
-    };
-    let fact = fact_from_columns(
-        r.id,
-        r.scope,
-        r.statement,
-        r.subject,
-        r.predicate,
-        r.object,
-        r.source_thought_id,
-        r.extractor_model,
-        r.extractor_version,
-        r.source_run_id,
-        r.confidence,
-        r.created_at,
-    )?;
-    Ok(Some(fact))
+    let mut facts = Vec::with_capacity(rows.len());
+    for r in rows {
+        facts.push(fact_from_columns(
+            r.id,
+            r.scope,
+            r.statement,
+            r.subject,
+            r.predicate,
+            r.object,
+            r.source_thought_id,
+            r.extractor_model,
+            r.extractor_version,
+            r.source_run_id,
+            r.confidence,
+            r.created_at,
+        )?);
+    }
+    Ok(facts)
 }
 
 /// Vector-similarity kNN over `embeddings` for the given model. Hits are
@@ -1794,11 +1836,11 @@ mod tests {
     #[sqlx::test(migrations = "../../migrations")]
     async fn finish_run_sets_finished_at_and_counts_and_error(pool: PgPool) {
         let run_id = start_run(&pool, "fake/extractor", 1, Some("work")).await.unwrap();
-        finish_run(&pool, run_id, 5, 3, 2, Some("partial failure")).await.unwrap();
+        finish_run(&pool, run_id, 5, 3, 2, 1, Some("partial failure")).await.unwrap();
 
         let row = sqlx::query!(
             r#"SELECT finished_at, n_thoughts_processed, n_facts_committed,
-                      n_review_queue, error
+                      n_review_queue, n_extractor_failures, error
                FROM reflector_runs WHERE id = $1"#,
             run_id.0,
         )
@@ -1809,7 +1851,27 @@ mod tests {
         assert_eq!(row.n_thoughts_processed, 5);
         assert_eq!(row.n_facts_committed, 3);
         assert_eq!(row.n_review_queue, 2);
+        assert_eq!(row.n_extractor_failures, 1);
         assert_eq!(row.error.as_deref(), Some("partial failure"));
+    }
+
+    /// `n_extractor_failures` defaults to 0 (the migration's column default)
+    /// so existing reflector_runs rows from pre-0004 schema don't crash any
+    /// reader. New rows written by post-M3-Phase-A finish_run propagate the
+    /// reflector's observed failure count.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn finish_run_persists_n_extractor_failures(pool: PgPool) {
+        let run_id = start_run(&pool, "fake/extractor", 1, None).await.unwrap();
+        finish_run(&pool, run_id, 10, 4, 1, 5, None).await.unwrap();
+
+        let n_failures = sqlx::query_scalar!(
+            r#"SELECT n_extractor_failures FROM reflector_runs WHERE id = $1"#,
+            run_id.0,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(n_failures, 5);
     }
 
     #[sqlx::test(migrations = "../../migrations")]
@@ -2021,6 +2083,51 @@ mod tests {
         assert_eq!(limited.len(), 2);
     }
 
+    /// M3 Phase A: lexical scoring now consults `subject || predicate || object`
+    /// in addition to `statement`. A fact whose subject is "Ron" but whose
+    /// statement starts "When Rust is unavailable…" should match a search
+    /// for "Ron Go" via the trigram leg.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_facts_trigram_matches_via_triple_when_statement_does_not_mention_query(
+        pool: PgPool,
+    ) {
+        let scope = Scope::global();
+        let thought_id = insert_test_thought(&pool, "language preferences", "global").await;
+        let run_id = start_run(&pool, "fake/extractor", 1, None).await.unwrap();
+        insert_active_fact(
+            &pool,
+            thought_id,
+            &scope,
+            "When Rust is not available or appropriate, Go is the next choice.",
+            (Some("Ron"), Some("prefers as fallback"), Some("Go")),
+            run_id,
+            0.9,
+        )
+        .await;
+        // A decoy fact with no Ron / Go content.
+        insert_active_fact(
+            &pool,
+            thought_id,
+            &scope,
+            "JavaScript is widely deployed in browsers.",
+            (Some("JavaScript"), Some("is deployed in"), Some("browsers")),
+            run_id,
+            0.9,
+        )
+        .await;
+
+        let hits = search_facts_trigram(&pool, "Ron Go", None, 10).await.unwrap();
+        assert!(!hits.is_empty(), "trigram leg should match via triple");
+        assert!(
+            hits[0]
+                .fact
+                .statement
+                .contains("Rust is not available"),
+            "expected Ron/Go fact to be the top hit, got: {}",
+            hits[0].fact.statement
+        );
+    }
+
     #[sqlx::test(migrations = "../../migrations")]
     async fn list_active_facts_for_thought_returns_only_active(pool: PgPool) {
         let scope = Scope::global();
@@ -2189,7 +2296,7 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../../migrations")]
-    async fn find_matching_active_fact_handles_null_via_is_not_distinct_from(pool: PgPool) {
+    async fn find_matching_active_facts_handles_null_via_is_not_distinct_from(pool: PgPool) {
         let scope = Scope::global();
         let thought_id = insert_test_thought(&pool, "anchor", "global").await;
         let run_id = start_run(&pool, "fake/extractor", 1, None).await.unwrap();
@@ -2204,34 +2311,37 @@ mod tests {
         )
         .await;
 
-        // (None, None, None) must match the null fact (Postgres `=` would
-        // return NULL here; `IS NOT DISTINCT FROM` is what makes it work).
-        let null_match = find_matching_active_fact(&pool, thought_id, None, None, None)
-            .await
-            .unwrap()
-            .expect("null triple should match");
-        assert_eq!(null_match.id, null_fact);
+        // Statement-or-triple OR predicate with a null-triple probe matches
+        // the null-triple row by the triple branch (Postgres `=` would return
+        // NULL on (NULL, NULL, NULL); `IS NOT DISTINCT FROM` is what makes
+        // it work).
+        let matches =
+            find_matching_active_facts(&pool, thought_id, "unrelated statement", None, None, None)
+                .await
+                .unwrap();
+        assert_eq!(matches.len(), 1, "null triple should match exactly one row");
+        assert_eq!(matches[0].id, null_fact);
 
         // Exact triple match.
-        let triple_match = find_matching_active_fact(
-            &pool, thought_id, Some("S"), Some("P"), Some("O"),
-        )
-        .await
-        .unwrap()
-        .expect("triple should match");
-        assert_eq!(triple_match.statement, "with triple");
-
-        // No match for an unrelated triple.
-        let none = find_matching_active_fact(
-            &pool, thought_id, Some("X"), Some("Y"), Some("Z"),
+        let triple_match = find_matching_active_facts(
+            &pool, thought_id, "unrelated statement", Some("S"), Some("P"), Some("O"),
         )
         .await
         .unwrap();
-        assert!(none.is_none());
+        assert_eq!(triple_match.len(), 1);
+        assert_eq!(triple_match[0].statement, "with triple");
+
+        // No match for an unrelated triple AND an unrelated statement.
+        let none = find_matching_active_facts(
+            &pool, thought_id, "still unrelated", Some("X"), Some("Y"), Some("Z"),
+        )
+        .await
+        .unwrap();
+        assert!(none.is_empty());
     }
 
     #[sqlx::test(migrations = "../../migrations")]
-    async fn find_matching_active_fact_returns_none_for_superseded_match(pool: PgPool) {
+    async fn find_matching_active_facts_skips_superseded(pool: PgPool) {
         let scope = Scope::global();
         let thought_id = insert_test_thought(&pool, "anchor", "global").await;
         let run_id = start_run(&pool, "fake/extractor", 1, None).await.unwrap();
@@ -2241,12 +2351,134 @@ mod tests {
         .await;
         supersede_fact(&pool, fact_id, None).await.unwrap();
 
-        let result = find_matching_active_fact(
-            &pool, thought_id, Some("S"), Some("P"), Some("O"),
+        let result = find_matching_active_facts(
+            &pool, thought_id, "gone", Some("S"), Some("P"), Some("O"),
         )
         .await
         .unwrap();
-        assert!(result.is_none(), "superseded match must not be returned");
+        assert!(
+            result.is_empty(),
+            "superseded match must not be returned"
+        );
+    }
+
+    /// The M2 dogfood failure case: v1 fact has statement S, triple (a, b, c);
+    /// v2 extraction produces the same statement S but triple (x, y, z).
+    /// (S, P, O) match is empty; statement match catches it.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn find_matching_active_facts_matches_on_statement_alone_when_triple_differs(
+        pool: PgPool,
+    ) {
+        let scope = Scope::global();
+        let thought_id = insert_test_thought(&pool, "anchor", "global").await;
+        let run_id = start_run(&pool, "fake/extractor", 1, None).await.unwrap();
+        let v1 = insert_active_fact(
+            &pool,
+            thought_id,
+            &scope,
+            "current API surface is append-only",
+            (Some("current API surface"), Some("is"), Some("append-only")),
+            run_id,
+            0.9,
+        )
+        .await;
+
+        // v2 probe: same statement, different decomposition.
+        let matches = find_matching_active_facts(
+            &pool,
+            thought_id,
+            "current API surface is append-only",
+            Some("thoughts in current API surface"),
+            Some("are"),
+            Some("append-only"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(matches.len(), 1, "statement match must catch the v1 row");
+        assert_eq!(matches[0].id, v1);
+    }
+
+    /// The prior intended case: v1 has triple T and statement S; v2 produces
+    /// the same triple T but a different statement S'. Triple match catches it.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn find_matching_active_facts_matches_on_triple_alone_when_statement_differs(
+        pool: PgPool,
+    ) {
+        let scope = Scope::global();
+        let thought_id = insert_test_thought(&pool, "anchor", "global").await;
+        let run_id = start_run(&pool, "fake/extractor", 1, None).await.unwrap();
+        let v1 = insert_active_fact(
+            &pool,
+            thought_id,
+            &scope,
+            "old wording",
+            (Some("S"), Some("P"), Some("O")),
+            run_id,
+            0.9,
+        )
+        .await;
+
+        let matches = find_matching_active_facts(
+            &pool,
+            thought_id,
+            "rephrased wording",
+            Some("S"),
+            Some("P"),
+            Some("O"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].id, v1);
+    }
+
+    /// Pre-existing audit-corrupt state: two parallel-active rows that both
+    /// match the new probe. Both should come back so the caller can fold
+    /// them into one canonical row.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn find_matching_active_facts_returns_multiple_when_audit_already_corrupt(
+        pool: PgPool,
+    ) {
+        let scope = Scope::global();
+        let thought_id = insert_test_thought(&pool, "anchor", "global").await;
+        let run_id = start_run(&pool, "fake/extractor", 1, None).await.unwrap();
+        // Two pre-existing actives: one matches by statement, the other by triple.
+        let a = insert_active_fact(
+            &pool,
+            thought_id,
+            &scope,
+            "shared statement",
+            (Some("a"), Some("b"), Some("c")),
+            run_id,
+            0.9,
+        )
+        .await;
+        let b = insert_active_fact(
+            &pool,
+            thought_id,
+            &scope,
+            "different wording",
+            (Some("S"), Some("P"), Some("O")),
+            run_id,
+            0.9,
+        )
+        .await;
+
+        // Probe matches `a` by statement and `b` by triple.
+        let matches = find_matching_active_facts(
+            &pool,
+            thought_id,
+            "shared statement",
+            Some("S"),
+            Some("P"),
+            Some("O"),
+        )
+        .await
+        .unwrap();
+        let ids: Vec<_> = matches.iter().map(|f| f.id).collect();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&a));
+        assert!(ids.contains(&b));
     }
 
     #[sqlx::test(migrations = "../../migrations")]

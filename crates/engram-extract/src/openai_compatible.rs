@@ -8,7 +8,7 @@
 //! `http://localhost:8000/v1`.
 
 use async_trait::async_trait;
-use engram_core::{ExtractedFact, ExtractionContext, Extractor, ExtractorError, Thought};
+use engram_core::{ExtractMode, ExtractedFact, ExtractionContext, Extractor, ExtractorError, Thought};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -54,11 +54,13 @@ impl OpenAICompatibleConfig {
             endpoint: "http://localhost:8000/v1".to_string(),
             model_name: "qwen2.5-7b-instruct".to_string(),
             model_id: "vllm/qwen2.5-7b-instruct".to_string(),
-            // v2 = revised system prompt with confidence-rubric anchors and
-            // explicit episodic-content skip guidance (2026-05-13). Earlier
-            // facts in the DB carry version=1 and can be re-extracted via
+            // v3 = SPO decomposition rules (comparative S/O mapping,
+            // self-referential rejection, conditional-as-subject), tighter
+            // confidence rubric, two new episodic-skip negatives, JSON
+            // envelope restated in prose (2026-05-14, M3 Phase A). Earlier
+            // facts carry version=1 or 2 and can be re-extracted via
             // `engram reflect --rerun`.
-            model_version: 2,
+            model_version: 3,
             api_key: None,
             timeout: Duration::from_secs(60),
             temperature: 0.2,
@@ -76,7 +78,7 @@ impl OpenAICompatibleConfig {
             endpoint: "https://openrouter.ai/api/v1".to_string(),
             model_id: format!("openrouter/{model_name}"),
             model_name,
-            model_version: 2, // see `vllm_local()` for rationale on the bump
+            model_version: 3, // see `vllm_local()` for rationale on the bump
             api_key: Some(api_key),
             timeout: Duration::from_secs(60),
             temperature: 0.2,
@@ -184,30 +186,65 @@ impl OpenAICompatibleExtractor {
 pub const BUNDLED_SYSTEM_PROMPT: &str = "\
 You are an information-extraction assistant. Given a single thought from a memory service, identify discrete factual claims and return them as structured JSON.
 
+# Output shape
+
+You MUST return a JSON object of the form:
+  { \"facts\": [ { \"statement\": …, \"subject\": …, \"predicate\": …, \"object\": …, \"confidence\": … }, … ] }
+The wrapper key is always \"facts\" and the value is always an array (possibly empty). Each item describes one fact.
+
 Each fact has:
-- statement: a self-contained natural-language sentence the user could read on its own.
+- statement: a self-contained natural-language sentence a reader could understand on its own.
 - subject, predicate, object: optional (S, P, O) triple if the fact maps cleanly to one. Use null when no clean triple exists.
 - confidence: your self-reported [0.0, 1.0] calibrated score (see rubric below).
 
-Confidence calibration — default to 0.85; deviate only when the rubric below justifies it. Most paraphrased facts should land in 0.80–0.90; reserve 0.95+ for direct restatements.
-- 0.95–1.00: direct quotation or near-verbatim restatement of the source. Use only when the source unambiguously asserts this exact claim, in roughly these words.
-- 0.85–0.95: clean paraphrase, no added inference. The typical band.
-- 0.70–0.85: claim involves some interpretation, but is well-supported by the source.
-- 0.50–0.70: claim is hedged in the source ('likely', 'might', 'I suspect'), or required inference from context.
+# (S, P, O) decomposition rules
+
+Subject and object must be *distinct* entities. If you cannot identify two distinct entities, set subject and/or object to null and rely on the statement to carry the claim.
+
+For comparatives (\"A is more X than B\" / \"A is simpler than B\" / \"A outperforms B\"): the subject is A and the object is B.
+  Example: \"Bazel is more powerful than Make\" → subject=\"Bazel\", predicate=\"is more powerful than\", object=\"Make\". NOT subject=\"Make\".
+
+For conditionals (\"If <condition>, A is the right choice for X\"): the subject is A; the condition belongs in the statement context, not in the subject slot.
+  Example: \"If you need sub-millisecond reads at high throughput, Redis is usually the right choice\" → subject=\"Redis\", NOT subject=\"sub-millisecond reads at high throughput\".
+
+# Confidence calibration
+
+Pick the band the source actually supports — DO NOT default to a single value. Vary across hedged vs declarative claims.
+- 0.95–1.00: direct quotation or near-verbatim restatement. The source unambiguously asserts this exact claim, in roughly these words.
+- 0.90–0.95: clean paraphrase of a declarative statement, no hedging in the source, no added inference.
+- 0.70–0.90: declarative claim that required moderate paraphrase, or a claim qualified by mild hedges ('usually', 'most', 'tends to').
+- 0.50–0.70: claim is strongly hedged in the source ('likely', 'might', 'I suspect', 'often but not always'), or requires inference from surrounding context.
 - below 0.50: speculative; a human should review.
 
-Rules:
+# Rules
+
 - Do not invent facts that aren't supported by the input. If the source is uncertain, the fact's confidence must reflect that uncertainty.
 - Skip purely conversational, social, or temporal-greeting content — return an empty facts array.
 - Skip episodic / transient content: descriptions of one-off operations ('a search was conducted', 'the test returned X', 'today I ran Y'), individual test runs, or snapshots of system state at a particular moment. Extract durable claims about how the system or domain works, not what happened during a session.
+- Skip single-benchmark measurements as if they were durable properties. \"simd-json was 3.2x faster than serde_json for parsing 100MB of test JSON\" is a one-run observation; the durable claim is \"SIMD parsing tends to outperform scalar JSON parsing on documents over ~1MB.\" Extract the latter, not the specific 3.2x measurement.
+- Skip hardware-spec / session-metadata phrasings ('The benchmark was conducted on this hardware (M2 Pro, 16GB)'). These are observational context, not durable claims.
+- Useful sanity check: would this claim still be useful to a reader six months from now, independent of when it was captured? If no, skip.
+- For mixed-content thoughts (a thought containing both a durable finding and a transient session-narrative): extract only the finding.
 - One fact per claim. Don't bundle multiple distinct claims into a single statement.
 - Return at most {MAX_FACTS} facts.";
+
+/// Additional system message appended after [`BUNDLED_SYSTEM_PROMPT`] when
+/// `ctx.extract_mode == ExtractMode::DurableOnly`. Plumbed from the source
+/// thought's `metadata.extract` field by the reflector. The bundled prompt
+/// already includes a mixed-content rule; this hint reinforces it per-thought
+/// when the operator has explicitly flagged the capture as mixed-content.
+pub const DURABLE_ONLY_HINT: &str = "\
+The captured thought is known to mix durable claims with transient session narrative — the operator has flagged it as mixed-content. \
+Extract only the durable claims; skip the session-narrative parts entirely, even if they're well-formed sentences.";
 
 #[derive(Serialize)]
 struct ChatRequestBody<'a> {
     model: &'a str,
     temperature: f32,
-    messages: [ChatMessage<'a>; 2],
+    /// Length-varying because `ExtractMode::DurableOnly` appends a second
+    /// system message after the bundled prompt. JSON wire shape is unchanged
+    /// (an array of role/content objects).
+    messages: Vec<ChatMessage<'a>>,
     response_format: serde_json::Value,
 }
 
@@ -280,19 +317,30 @@ impl Extractor for OpenAICompatibleExtractor {
         let url = format!("{}/chat/completions", self.endpoint.trim_end_matches('/'));
 
         let system_prompt = self.system_prompt.replace("{MAX_FACTS}", &max_facts.to_string());
+        let mut messages: Vec<ChatMessage<'_>> = Vec::with_capacity(3);
+        messages.push(ChatMessage {
+            role: "system",
+            content: system_prompt,
+        });
+        // Per-thought `metadata.extract = "durable-only"` propagates through
+        // `ctx.extract_mode` and adds a second system message instructing the
+        // model to bias toward durable claims. The bundled prompt's
+        // mixed-content rule does most of the work; this hint reinforces it
+        // when the operator has explicitly flagged the thought.
+        if ctx.extract_mode == ExtractMode::DurableOnly {
+            messages.push(ChatMessage {
+                role: "system",
+                content: DURABLE_ONLY_HINT.to_string(),
+            });
+        }
+        messages.push(ChatMessage {
+            role: "user",
+            content: thought.content.clone(),
+        });
         let body = ChatRequestBody {
             model: &self.model_name,
             temperature: self.temperature,
-            messages: [
-                ChatMessage {
-                    role: "system",
-                    content: system_prompt,
-                },
-                ChatMessage {
-                    role: "user",
-                    content: thought.content.clone(),
-                },
-            ],
+            messages,
             response_format: facts_response_format(),
         };
 

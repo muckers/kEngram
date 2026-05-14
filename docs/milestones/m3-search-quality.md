@@ -139,9 +139,9 @@ Estimated effort: ~1 week of mostly-passive operator use; ~half a day of close-o
 ## Schema impact
 
 - ✅ Migration 0003 (already landed): `thoughts.retracted_at` + `retracted_reason` + active-thoughts partial index.
-- New migrations expected during M3:
-  - `0004_facts_flagged.sql` — adds `facts.flagged BOOLEAN NOT NULL DEFAULT FALSE` for three-band routing.
-  - `0005_reflector_runs_failures.sql` — adds `reflector_runs.n_extractor_failures INT NOT NULL DEFAULT 0` for the observability gap.
+- ✅ Migration 0004 (M3 Phase A, 2026-05-14): `reflector_runs.n_extractor_failures INT NOT NULL DEFAULT 0` for the observability gap.
+- Migration expected later in M3:
+  - `0005_facts_flagged.sql` (Phase C) — adds `facts.flagged BOOLEAN NOT NULL DEFAULT FALSE` for three-band routing.
 - **No** migration for fact embeddings — `embeddings.target_kind` already includes `'fact'` (migration 0001, M1 schema).
 
 ## MCP surface delta
