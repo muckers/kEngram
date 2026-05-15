@@ -35,14 +35,19 @@ End state: dogfood-driven SPO bugs corrected at the prompt level; within-call de
 - [x] `cargo test --workspace`: 235 passing (was 229; +7 new − 1 deleted `finish_run_sets_finished_at` superseded by extended assert).
 - [x] `cargo clippy --all-targets -- -D warnings`: clean.
 
-**Operator-driven (post-merge):**
+**Dogfood validation (2026-05-14):**
 
-- [ ] Re-extract the 2026-05-14 dogfood corpus via `engram reflect --rerun` and verify the listed fact_ids:
-  - SPO comparatives (`8da1fa45`, `64e26652`, `fb38bf42`, `51744197`, `e0238c2f`) have correct S=A / O=B mappings.
-  - Self-referential triples (`39016e00`, `eeced4b3`, `582b76e1`) are no longer emitted; or, if emitted, have `subject != object`.
-  - Conditional-as-subject (`103f44c9`, `bea3629d`, `e9032602`) have the named system as subject (not the conditional clause).
-  - Episodic negatives (`e69eff9b`, `ec465660`) no longer extracted.
-  - Confidence varies across hedged vs declarative claims rather than uniformly anchoring at 0.85.
+- [x] Re-extract the dogfood corpus via `engram reflect --rerun` against v3 prompt + `qwen3-coder:30b`. **Partial pass.**
+  - ✓ `commit_or_supersede` pipeline working as designed: 54 commits over 11 thoughts under the v3 prompt, dedup-via-supersession folding statement-matched drift; review-queue routed 1 fact (confidence rubric no longer uniformly anchoring at 0.85).
+  - ⚠ SPO rules land inconsistently with `qwen3-coder:30b`. Comparative inversion still present on most affected fact_ids; self-referential triples still being emitted (5 new instances on the WebSockets thought alone). Some atomic-claim emissions DO follow the new rules (e.g. fact `2472dc0c`: S=Bazel/O=Make for "Bazel is more powerful than Make"), but the model isn't reliable.
+  - 🐞 **New failure mode** surfaced: within a single extraction call the LLM is emitting two facts with byte-identical statements but different SPO decompositions (one per clause of a compound statement). `commit_or_supersede` folds them via the statement-match predicate, picking the *last* emission as canonical — which is non-deterministic on correctness. Documented as a new M3 backlog item ("Quality-aware dedup for within-call duplicates") under `## In scope > Pipeline quality`.
+  - **Conclusion:** v3 prompt + dedup pipeline are correctly *in the binary* (Phase A code is closed), but v3-prompt effectiveness under `qwen3-coder:30b` is mediocre. A v3.1 prompt iteration and/or a quality-aware dedup pass would help; Phase B's A/B harness is the right tool for measuring this objectively across models. Not a Phase A blocker — the failure modes are now well-characterized and on the backlog.
+
+**Side findings during dogfood (2026-05-14):**
+
+- 🐞 `map_send_error` hardcoded `seconds: 60` in the timeout error display; fixed in commit `1d627e4` to report the actual configured value.
+- 🐞 Extractor startup `tracing::info!` only logged the system prompt source; expanded in commit `1d627e4` to also log `model_name`, `model_version`, `timeout_seconds` so config-merge results are visible without per-fact debugging.
+- 🔬 Tried `qwen3.5:35b-a3b-coding-nvfp4` as a more-capable alternative; nvfp4 quantization is NVIDIA-Blackwell-specific and falls back to CPU on Apple Silicon, producing 180s+ per-extraction timeouts. Reverted to `qwen3-coder:30b`. Metal-friendly counterpart `qwen3.5:35b-a3b-q4_K_M` exists (24 GB) but model comparison is properly Phase B A/B-harness work, not Phase A.
 
 ## Phase B — Retrieval quality
 
@@ -78,6 +83,8 @@ Not yet planned. Items:
 Dated notes appended as items land. Format: `YYYY-MM-DD — <one-line summary>`. Multi-line entries fine for decisions that need explanation.
 
 <!-- Most recent entry first. -->
+
+- **2026-05-14** — **M3 Phase A closed out.** Validated Phase A via dogfood `engram reflect --rerun` against v3 prompt + `qwen3-coder:30b` (54 commits, 11 thoughts, 1 review-queue routing, 0 failures). Pipeline plumbing all works — v3 prompt content is being sent (logged `system_prompt=bundled`), `commit_or_supersede` is folding statement-matched drift into canonicals via supersession, the new review-queue routing fires when confidence drops below 0.7. Two operator-discovered bugs fixed in follow-up commit `1d627e4` (cosmetic hardcoded "60s" timeout display + missing config-resolution startup log). Detected limitations of v3 prompt under `qwen3-coder:30b`: SPO inversion / self-referential triples / compound-statement-multi-decomp not reliably suppressed. Documented in `## Pipeline quality` of m3-search-quality.md as a new "Quality-aware dedup for within-call duplicates" backlog item. v3-prompt-effectiveness across models is Phase B A/B-harness territory; Phase A's success criterion ("v3 prompt is in the binary, dedup pipeline works") is met. Brief detour to evaluate `qwen3.5:35b-a3b-coding-nvfp4` ran into 180s timeouts (nvfp4 isn't Metal-accelerated on Apple Silicon); reverted. Phase A is in the books.
 
 - **2026-05-14** — **M3 Phase A landed.** Single bundled commit `M3 Phase A: pipeline-quality fixes` covering v3 prompt revision (SPO decomposition rules: comparative S=A/O=B, self-referential subject-MUST-NOT-equal-object, conditional-as-subject; tighter per-hedging-level confidence rubric; two new episodic-skip negatives; JSON envelope restated in prose; `model_version` 2 → 3), `commit_or_supersede` helper factored out of `run_reflector_rerun` and applied to `run_reflector_once` (within-call dedup-via-supersession parity), `extract` metadata flag (`none` skips extraction entirely; `durable-only` injects a second system message at reflect time; absent / `all` / unknown extract as today via back-compat fallthrough), `n_extractor_failures` column on `reflector_runs` (migration 0004) so operators can distinguish "no facts found" from "extractor unreachable" via SQL alone, and `(S, P, O)` trigram (lexical scoring now consults `statement || subject || predicate || object` via `word_similarity`; switched from symmetric `similarity` because short queries against long concatenated text scored too low under the previous threshold). Test count 229 → 235 (+7 new: 2 storage, 4 reflect, 1 finish_run extension; net counting an updated existing `finish_run_sets_finished_at` test as carried-forward). All `cargo build --workspace`, `cargo test --workspace`, `cargo clippy --all-targets -- -D warnings` green. Phase A's "Done means" lines (one per item) are encoded as the regression-test set above; operator-driven re-extraction of the dogfood corpus is the next checkpoint.
 
