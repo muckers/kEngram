@@ -116,7 +116,10 @@ fn build_extractor(c: &ExtractorConfig) -> anyhow::Result<Arc<dyn Extractor>> {
             Some(p) => format!("file:{}", p.display()),
             None => "bundled".to_string(),
         },
-        "extractor: resolved system prompt",
+        model_name = %c.model_name,
+        model_version = c.model_version,
+        timeout_seconds = c.timeout_seconds,
+        "extractor: resolved config",
     );
 
     match c.provider.as_str() {

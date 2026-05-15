@@ -102,6 +102,10 @@ pub struct OpenAICompatibleExtractor {
     /// re-resolve on every request. The `{MAX_FACTS}` placeholder inside
     /// is substituted per-call.
     system_prompt: String,
+    /// Stored alongside the client so the timeout-error path reports the
+    /// actual configured value (the reqwest client owns the same duration
+    /// internally but doesn't expose it).
+    timeout_seconds: u64,
     client: Client,
 }
 
@@ -161,6 +165,7 @@ impl OpenAICompatibleExtractor {
             temperature: config.temperature,
             max_facts_per_thought: config.max_facts_per_thought,
             system_prompt,
+            timeout_seconds: config.timeout.as_secs(),
             client,
         })
     }
@@ -349,7 +354,10 @@ impl Extractor for OpenAICompatibleExtractor {
             req = req.bearer_auth(key);
         }
 
-        let resp = req.send().await.map_err(map_send_error)?;
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| map_send_error(e, self.timeout_seconds))?;
         let status = resp.status();
         if !status.is_success() {
             let message = resp.text().await.unwrap_or_default();
@@ -421,9 +429,11 @@ fn facts_response_format() -> serde_json::Value {
     })
 }
 
-fn map_send_error(e: reqwest::Error) -> ExtractorError {
+fn map_send_error(e: reqwest::Error, timeout_seconds: u64) -> ExtractorError {
     if e.is_timeout() {
-        ExtractorError::Timeout { seconds: 60 }
+        ExtractorError::Timeout {
+            seconds: timeout_seconds,
+        }
     } else if e.is_connect() {
         ExtractorError::Unreachable(e.to_string())
     } else if let Some(status) = e.status() {
