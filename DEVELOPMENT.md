@@ -50,8 +50,9 @@ The M3 Phase B step 2 cross-encoder reranker runs in a TEI Docker container alon
 
 ```bash
 docker compose up -d tei
-# First boot downloads ~600 MB (BAAI/bge-reranker-v2-m3); subsequent boots
-# are warm. The healthcheck has a 60s start_period to accommodate.
+# First boot downloads ~85 MB (cross-encoder/ms-marco-MiniLM-L-6-v2) and
+# warms up in a few seconds. The healthcheck has a 120s start_period
+# (mostly headroom for first-time downloads on slow networks).
 
 docker compose ps tei
 # STATUS should reach "healthy"
@@ -60,8 +61,8 @@ docker compose ps tei
 Smoke:
 
 ```bash
-curl -s http://localhost:8080/health | jq .
-# expect: {"status": "ok"} or similar
+curl -s http://localhost:8080/health
+# expect: 200 (empty body is OK)
 
 curl -s http://localhost:8080/rerank \
   -H 'Content-Type: application/json' \
@@ -72,7 +73,9 @@ curl -s http://localhost:8080/rerank \
 
 Then add a `[reranker]` section to your `engram.toml` (see Configuration below) and `engram serve`'s startup log will show `reranker: resolved config`.
 
-The Apple Silicon variant of the image (`cpu-arm64-latest`) is what's pinned in `docker-compose.yml`. Production deployments use TEI as a systemd-managed sidecar, not Docker — same HTTP interface either way.
+**Model choice.** `docker-compose.yml` pins `cross-encoder/ms-marco-MiniLM-L-6-v2` — the small (~22M parameter) dev reranker that has ONNX exports on HF (TEI takes the fast ORT path; sub-100ms per call on Apple Silicon CPU). For production with a GPU host, override via `[reranker].model_id` to `BAAI/bge-reranker-v2-m3` or another full-size model.
+
+The Apple Silicon variant of the image (`cpu-arm64-latest`) is what's pinned. Production deployments use TEI as a systemd-managed sidecar, not Docker — same HTTP interface either way.
 
 ### 4. Run migrations
 
@@ -205,10 +208,10 @@ max_thoughts_per_run = 1000
 max_facts_per_thought = 8
 review_queue_below = 0.7                 # confidence below → facts_review_queue; ≥ → facts
 
-[reranker]                               # M3 Phase B step 2; opt-in
-provider = "tei"                         # "" = disabled (default); "tei" = TEI sidecar
-endpoint = "http://localhost:8080"       # no /v1 suffix; reranker appends /rerank
-model_id = "BAAI/bge-reranker-v2-m3"
+[reranker]                                              # M3 Phase B step 2; opt-in
+provider = "tei"                                        # "" = disabled (default); "tei" = TEI sidecar
+endpoint = "http://localhost:8080"                      # no /v1 suffix; reranker appends /rerank
+model_id = "cross-encoder/ms-marco-MiniLM-L-6-v2"      # small/fast dev default; bigger models for prod
 timeout_seconds = 30
 ```
 

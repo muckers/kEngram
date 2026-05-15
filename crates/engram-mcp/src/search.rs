@@ -21,10 +21,14 @@ use uuid::Uuid;
 pub const DEFAULT_SEARCH_LIMIT: usize = 10;
 pub const MAX_SEARCH_LIMIT: usize = 100;
 pub const DEFAULT_TOP_K_PER_LEG: usize = 50;
-/// Default `candidate_pool` for the rerank stage: retrieve top-50 via RRF +
-/// recency, rerank those 50 to produce the final top-`limit`. Larger pools
-/// give the reranker more material to work with at higher rerank latency.
-pub const DEFAULT_RERANK_CANDIDATE_POOL: usize = 50;
+/// Default `candidate_pool` for the rerank stage: retrieve top-32 via RRF +
+/// recency, rerank those 32 to produce the final top-`limit`. Matches TEI's
+/// default `--max-client-batch-size` of 32 so the default request shape
+/// works out of the box. Larger pools give the reranker more material at
+/// higher latency; per-call callers override via the `candidate_pool`
+/// request field. Bumping this default would also require bumping TEI's
+/// flag (warmup-time cost on CPU is significant — see docker-compose.yml).
+pub const DEFAULT_RERANK_CANDIDATE_POOL: usize = 32;
 
 #[derive(Debug, Clone)]
 pub struct SearchRequest {
@@ -57,6 +61,10 @@ pub struct SearchHit {
     pub vector_score: Option<f32>,
     /// Raw `word_similarity` from the trigram leg (`None` if not in that leg).
     pub trigram_score: Option<f32>,
+    /// RRF + recency-boost score, captured before rerank overwrote `score`.
+    /// `None` when rerank didn't run (in which case `score` itself is the
+    /// RRF+recency value).
+    pub rrf_score: Option<f32>,
     /// Calibrated absolute score from the reranker (`None` if rerank was
     /// off, unavailable, or this hit fell outside the candidate pool).
     pub rerank_score: Option<f32>,
@@ -126,6 +134,7 @@ pub struct SearchFactHit {
     pub score: f32,
     pub vector_score: Option<f32>,
     pub trigram_score: Option<f32>,
+    pub rrf_score: Option<f32>,
     pub rerank_score: Option<f32>,
 }
 
@@ -245,6 +254,7 @@ pub async fn search_thoughts(
             score: h.score,
             vector_score: h.vector_score,
             trigram_score: h.trigram_score,
+            rrf_score: h.rrf_score,
             rerank_score: h.rerank_score,
         })
         .collect();
@@ -257,10 +267,17 @@ pub async fn search_thoughts(
 }
 
 /// Run the cross-encoder rerank stage over the top `candidate_pool` hits.
-/// Mutates `hits` in place: rerank scores are written to `rerank_score`
-/// AND mirrored into `score` so consumers sorting by `score` get the
-/// rerank-ordered list. Hits outside the candidate pool retain their
-/// pre-rerank `score` and `rerank_score: None`.
+/// On success, mutates `hits` in place: rerank scores are written to
+/// `rerank_score` and mirrored into `score`; the un-reranked tail is
+/// **truncated** so the response contains only the reranker's verdict on
+/// the candidate pool. Re-sorts by rerank score descending.
+///
+/// Truncating is necessary because rerank scores and RRF+recency scores
+/// aren't on the same scale: a small cross-encoder like MiniLM produces
+/// scores in [0, 1] with most candidates well below 0.01, while RRF+recency
+/// caps at ~0.033. Mixing them in a single sort lets the un-reranked tail
+/// outrank the reranker's verdict — defeating the purpose of running the
+/// reranker.
 ///
 /// Returns `true` if rerank actually ran; `false` on transient failure
 /// (logged + soft-fall-through to the RRF order). Non-transient errors
@@ -269,7 +286,7 @@ pub async fn search_thoughts(
 async fn apply_rerank_to_thought_hits(
     reranker: &dyn Reranker,
     query: &str,
-    hits: &mut [engram_core::Hit],
+    hits: &mut Vec<engram_core::Hit>,
     candidate_pool: usize,
 ) -> bool {
     if hits.is_empty() {
@@ -288,18 +305,18 @@ async fn apply_rerank_to_thought_hits(
             return false;
         }
     };
-    // Map back to hits via RerankScore.index, set rerank_score + score.
+    // Map back to hits via RerankScore.index, capture pre-rerank `score`
+    // into `rrf_score` so the A/B harness (and inquisitive consumers) can
+    // see both rankings, then overwrite `score` with the rerank score.
     for s in scores {
         if let Some(hit) = hits.get_mut(s.index) {
+            hit.rrf_score = Some(hit.score);
             hit.rerank_score = Some(s.score);
             hit.score = s.score;
         }
     }
-    // Re-sort the (mutated) candidate-pool prefix by rerank score desc;
-    // tail (hits outside the pool) keeps its post-recency order. Stable
-    // sort over the full slice handles this correctly because un-reranked
-    // hits keep their original `score` and naturally fall behind any
-    // reranked hit whose rerank score exceeds the original RRF score.
+    // Drop the un-reranked tail and sort the reranked candidates by score.
+    hits.truncate(pool_len);
     hits.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
@@ -464,6 +481,7 @@ pub async fn search_facts(
             score: h.score,
             vector_score: h.vector_score,
             trigram_score: h.trigram_score,
+            rrf_score: h.rrf_score,
             rerank_score: h.rerank_score,
         })
         .collect();
@@ -476,12 +494,14 @@ pub async fn search_facts(
 }
 
 /// Fact-side counterpart of `apply_rerank_to_thought_hits`. Cross-encoder
-/// scores each fact's `statement` against the query, mutates the hits in
-/// place (writes `rerank_score` + mirrors into `score`), re-sorts.
+/// scores each fact's `statement` against the query; on success mutates
+/// hits in place (writes `rerank_score`, mirrors into `score`), truncates
+/// the un-reranked tail (see thought-side doc for why), and re-sorts the
+/// reranked candidate pool by score descending.
 async fn apply_rerank_to_fact_hits(
     reranker: &dyn Reranker,
     query: &str,
-    hits: &mut [engram_storage::FactHit],
+    hits: &mut Vec<engram_storage::FactHit>,
     candidate_pool: usize,
 ) -> bool {
     if hits.is_empty() {
@@ -492,6 +512,7 @@ async fn apply_rerank_to_fact_hits(
         .iter()
         .map(|h| h.fact.statement.as_str())
         .collect();
+    let candidates_len = candidates.len();
     let scores = match reranker.rerank(query, &candidates).await {
         Ok(s) => s,
         Err(e) => {
@@ -503,12 +524,27 @@ async fn apply_rerank_to_fact_hits(
             return false;
         }
     };
+    let scores_len = scores.len();
+    let mut applied = 0usize;
+    let mut out_of_range = 0usize;
     for s in scores {
         if let Some(hit) = hits.get_mut(s.index) {
+            hit.rrf_score = Some(hit.score);
             hit.rerank_score = Some(s.score);
             hit.score = s.score;
+            applied += 1;
+        } else {
+            out_of_range += 1;
         }
     }
+    tracing::debug!(
+        candidates = candidates_len,
+        scores_returned = scores_len,
+        applied,
+        out_of_range,
+        "fact rerank stage applied",
+    );
+    hits.truncate(pool_len);
     hits.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
@@ -1269,6 +1305,87 @@ mod tests {
         // After rerank, the Nix fact (boosted to 1.0) wins.
         assert_eq!(resp.results[0].statement, "Nix is reproducible");
         assert_eq!(resp.results[0].rerank_score, Some(1.0));
+    }
+
+    /// Regression for the score-scale-collision bug surfaced during the
+    /// 2026-05-15 step 2 dogfood: when rerank scores are all numerically
+    /// smaller than the un-reranked tail's RRF+recency scores, the old
+    /// sort-the-whole-vec approach let the tail outrank the reranker's
+    /// verdict. The fix truncates fused to the candidate pool after rerank
+    /// fires. This test uses `PositionAscending` scoring so the reranker
+    /// produces *very small* scores (0.0, 0.05, 0.10, ...) — far below
+    /// typical RRF-recency scores. The response must still contain only
+    /// reranked candidates (every hit carries `rerank_score`), not the
+    /// un-reranked tail.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_facts_rerank_truncates_un_reranked_tail(pool: PgPool) {
+        let embedder = FakeEmbedder::new();
+        let id = cap(&pool, "anchor", "global").await;
+        // Insert 6 facts, then embed all of them so the vector leg returns
+        // them all. With candidate_pool=3, the rerank fires on the top 3
+        // and the bottom 3 should be dropped.
+        let mut fact_ids = Vec::new();
+        for i in 0..6 {
+            let fid = insert_test_fact(
+                &pool,
+                id,
+                "global",
+                &format!("fact number {i}"),
+                (None, None, None),
+                0.9,
+            )
+            .await;
+            fact_ids.push(fid);
+            engram_storage::enqueue_embedding(
+                &pool,
+                engram_storage::target::FACT,
+                fid,
+                &embedder.model().id,
+            )
+            .await
+            .unwrap();
+        }
+        drain_pending_embeddings(&pool, &embedder, 16).await.unwrap();
+
+        // PositionAscending: rerank score for index 0 is 0.0, index 1 is 0.05,
+        // etc. These are numerically *below* every plausible RRF-recency
+        // score (which max out around 0.033). Pre-fix, the un-reranked tail
+        // would sort above the reranked candidates.
+        let reranker = FakeReranker::with_scoring(FakeRerankerScoring::PositionAscending);
+
+        let resp = search_facts(
+            &pool,
+            &embedder,
+            Some(&reranker),
+            SearchFactsRequest {
+                query: "fact".to_string(),
+                scope: None,
+                limit: Some(10),
+                recency_half_life_days: Some(0.0),
+                rerank: None,
+                candidate_pool: Some(3),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(resp.rerank_used);
+        // All returned hits must be reranked (no un-reranked tail leak).
+        assert_eq!(
+            resp.results.len(),
+            3,
+            "after rerank, only the candidate pool's worth of hits should remain"
+        );
+        for hit in &resp.results {
+            assert!(
+                hit.rerank_score.is_some(),
+                "every returned hit must carry a rerank_score"
+            );
+            assert!(
+                hit.rrf_score.is_some(),
+                "every reranked hit must carry rrf_score (captured pre-rerank)"
+            );
+        }
     }
 
     /// Per-leg scores are populated on the response: a hit that matched

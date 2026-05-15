@@ -49,6 +49,12 @@ pub struct Hit {
     /// Raw `word_similarity` from the trigram leg. `None` when the hit did
     /// not appear in the trigram leg.
     pub trigram_score: Option<f32>,
+    /// Reciprocal Rank Fusion + recency-boost score, captured *before*
+    /// rerank overwrites `score`. `None` when rerank didn't run (in which
+    /// case `score` itself is already the RRF+recency value). Lets the
+    /// A/B harness compare RRF-only ordering against rerank ordering
+    /// without re-running search.
+    pub rrf_score: Option<f32>,
     /// Calibrated absolute relevance score from the cross-encoder
     /// reranker. `None` when rerank was off, no reranker was configured,
     /// or the hit fell outside the reranked candidate pool.
@@ -65,6 +71,7 @@ impl Hit {
             score: cosine_similarity,
             vector_score: Some(cosine_similarity),
             trigram_score: None,
+            rrf_score: None,
             rerank_score: None,
         }
     }
@@ -78,6 +85,7 @@ impl Hit {
             score: word_similarity,
             vector_score: None,
             trigram_score: Some(word_similarity),
+            rrf_score: None,
             rerank_score: None,
         }
     }
@@ -113,6 +121,7 @@ pub fn rrf_fuse(rankings: Vec<Vec<Hit>>, k: f32) -> Vec<Hit> {
                         score: contribution,
                         vector_score: hit.vector_score,
                         trigram_score: hit.trigram_score,
+                        rrf_score: None,
                         rerank_score: None,
                     };
                     acc.insert(id, merged);
@@ -173,6 +182,7 @@ mod tests {
             score,
             vector_score: None,
             trigram_score: None,
+            rrf_score: None,
             rerank_score: None,
         }
     }

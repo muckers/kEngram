@@ -46,15 +46,36 @@ services:
     volumes:
       - engram-tei-models:/data
     command:
-      - --model-id=BAAI/bge-reranker-v2-m3
+      - --model-id=cross-encoder/ms-marco-MiniLM-L-6-v2
+      # MiniLM-L-6-v2 is the small (~22M params) dev reranker — ONNX
+      # exports on HF (TEI takes the fast ORT path), sub-second warmup,
+      # sub-100ms per-call latency on Apple Silicon CPU. BGE-reranker-v2-m3
+      # was the first choice (Phase B step 2 plan); on Apple Silicon CPU
+      # the 568M model with no ONNX export warms up via candle/safetensors,
+      # which can take 5+ minutes and makes every per-call rerank slow.
+      # Production deployments override via [reranker].model_id to a
+      # larger model on a GPU host. Quality difference between MiniLM and
+      # BGE-v2-m3 is measurable on retrieval benchmarks but isn't a Mac-dev
+      # blocker; Phase B step 3's A/B harness can compare both.
+      #
+      # We use TEI's default max-client-batch-size of 32. TEI warms up the
+      # model for each power-of-2 batch size up to this limit on first
+      # boot; on Apple Silicon CPU each warmup step takes seconds, so
+      # bumping the cap to 128 (an early Phase B step 2 attempt) made
+      # warmup hang for many minutes. The matching `DEFAULT_RERANK_
+      # CANDIDATE_POOL` in engram-mcp/src/search.rs is 32; per-call
+      # callers can override via the `candidate_pool` request field if
+      # they need a larger pool for quality measurement.
     healthcheck:
-      # TEI's /health endpoint returns 200 once the model is loaded. First
-      # boot downloads ~600 MB so the first health check may take a minute.
+      # TEI's /health endpoint returns 200 once the model is loaded and
+      # the warmup pass completes. First boot downloads ~600 MB; even on a
+      # warm `tei-models` volume the warmup pass on Apple Silicon takes
+      # 60-90s. 120s gives headroom for recreate cycles.
       test: ["CMD", "curl", "-fsS", "http://localhost/health"]
       interval: 10s
       timeout: 5s
       retries: 30
-      start_period: 60s
+      start_period: 120s
 
 volumes:
   engram-pg-data:

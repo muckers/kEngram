@@ -832,6 +832,12 @@ pub struct FactHit {
     /// Raw `word_similarity` from the trigram leg. `None` when the hit did
     /// not match in the trigram leg.
     pub trigram_score: Option<f32>,
+    /// Reciprocal Rank Fusion + recency-boost score, captured before
+    /// rerank overwrites `score`. `None` when rerank didn't run (in which
+    /// case `score` itself is the RRF+recency value). Lets consumers
+    /// compare RRF-only ordering against rerank ordering without
+    /// re-running search.
+    pub rrf_score: Option<f32>,
     /// Calibrated absolute score from the cross-encoder reranker. `None`
     /// when rerank was off, no reranker was configured, or the hit fell
     /// outside the reranked candidate pool.
@@ -953,6 +959,7 @@ pub async fn search_facts_trigram(
                 score: r.sim,
                 vector_score: None,
                 trigram_score: Some(r.sim),
+                rrf_score: None,
                 rerank_score: None,
             })
         })
@@ -1403,6 +1410,7 @@ pub async fn search_facts_vector_knn(
                 score,
                 vector_score: Some(score),
                 trigram_score: None,
+                rrf_score: None,
                 rerank_score: None,
             })
         })

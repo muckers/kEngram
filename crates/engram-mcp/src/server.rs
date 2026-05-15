@@ -426,6 +426,7 @@ fn search_response_json(resp: &SearchResponse) -> serde_json::Value {
                 "score": h.score,
                 "vector_score": h.vector_score,
                 "trigram_score": h.trigram_score,
+                "rrf_score": h.rrf_score,
                 "rerank_score": h.rerank_score,
             })
         })
@@ -511,6 +512,7 @@ fn search_facts_response_json(resp: &SearchFactsResponse) -> serde_json::Value {
                 "score": h.score,
                 "vector_score": h.vector_score,
                 "trigram_score": h.trigram_score,
+                "rrf_score": h.rrf_score,
                 "rerank_score": h.rerank_score,
             })
         })
