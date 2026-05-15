@@ -1,14 +1,19 @@
 //! Read operations: `search_thoughts`, `recent_thoughts`, `get_thought`.
 //!
 //! `search_thoughts` is the hybrid retrieval path: vector kNN ∪ trigram
-//! similarity, fused by RRF, then recency-boosted. If the embedder is
-//! unreachable, the vector leg is skipped and `vector_search_available`
-//! flips to `false`; trigram-only results still come back.
+//! similarity, fused by RRF, then recency-boosted, then (M3 Phase B step 2)
+//! optionally reranked by a cross-encoder model over the top
+//! `candidate_pool` candidates. If the embedder is unreachable, the
+//! vector leg is skipped and `vector_search_available` flips to `false`.
+//! If the reranker is unreachable or not configured, the rerank stage is
+//! skipped and `rerank_used` flips to `false`; trigram + vector + RRF
+//! results still come back.
 
 use engram_core::{
     DEFAULT_RECENCY_HALF_LIFE_DAYS, DEFAULT_RRF_K, Embedder, EmbeddingModel, EmbeddingStatus, Fact,
     Metadata, Scope, Source, Thought, ThoughtId, recency_boost, rrf_fuse,
 };
+use engram_embed::Reranker;
 use sqlx::PgPool;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -16,6 +21,10 @@ use uuid::Uuid;
 pub const DEFAULT_SEARCH_LIMIT: usize = 10;
 pub const MAX_SEARCH_LIMIT: usize = 100;
 pub const DEFAULT_TOP_K_PER_LEG: usize = 50;
+/// Default `candidate_pool` for the rerank stage: retrieve top-50 via RRF +
+/// recency, rerank those 50 to produce the final top-`limit`. Larger pools
+/// give the reranker more material to work with at higher rerank latency.
+pub const DEFAULT_RERANK_CANDIDATE_POOL: usize = 50;
 
 #[derive(Debug, Clone)]
 pub struct SearchRequest {
@@ -23,6 +32,14 @@ pub struct SearchRequest {
     pub scope: Option<Scope>,
     pub limit: Option<usize>,
     pub recency_half_life_days: Option<f32>,
+    /// Apply the cross-encoder rerank stage over the top `candidate_pool`
+    /// post-RRF candidates. Defaults to `true` when omitted (M3 Phase B
+    /// step 2 success criterion #3). Set `Some(false)` to skip rerank
+    /// even when a reranker is configured (useful for A/B comparison).
+    pub rerank: Option<bool>,
+    /// Number of post-RRF candidates fed into the reranker. Ignored when
+    /// rerank is off. Defaults to [`DEFAULT_RERANK_CANDIDATE_POOL`].
+    pub candidate_pool: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -33,13 +50,27 @@ pub struct SearchHit {
     pub source: Source,
     pub created_at: OffsetDateTime,
     pub metadata: Metadata,
+    /// Final score after the pipeline (RRF → recency → optional rerank).
+    /// Consumers sorting by `score` get the final-stage ordering.
     pub score: f32,
+    /// Raw cosine similarity from the vector leg (`None` if not in that leg).
+    pub vector_score: Option<f32>,
+    /// Raw `word_similarity` from the trigram leg (`None` if not in that leg).
+    pub trigram_score: Option<f32>,
+    /// Calibrated absolute score from the reranker (`None` if rerank was
+    /// off, unavailable, or this hit fell outside the candidate pool).
+    pub rerank_score: Option<f32>,
 }
 
 #[derive(Debug, Clone)]
 pub struct SearchResponse {
     pub results: Vec<SearchHit>,
     pub vector_search_available: bool,
+    /// `true` when the rerank stage actually ran. `false` when rerank was
+    /// disabled per-request, no reranker was configured, or the reranker
+    /// failed at runtime (in which case results come from the RRF + recency
+    /// pipeline). Mirrors `vector_search_available`'s soft-fail semantics.
+    pub rerank_used: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -75,6 +106,8 @@ pub struct SearchFactsRequest {
     pub scope: Option<Scope>,
     pub limit: Option<usize>,
     pub recency_half_life_days: Option<f32>,
+    pub rerank: Option<bool>,
+    pub candidate_pool: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -89,7 +122,11 @@ pub struct SearchFactHit {
     pub source_thought_content: String,
     pub source_thought_scope: Scope,
     pub source_thought_created_at: OffsetDateTime,
+    /// Final score after the pipeline (RRF → recency → optional rerank).
     pub score: f32,
+    pub vector_score: Option<f32>,
+    pub trigram_score: Option<f32>,
+    pub rerank_score: Option<f32>,
 }
 
 #[derive(Debug, Clone)]
@@ -100,6 +137,8 @@ pub struct SearchFactsResponse {
     /// `SearchResponse.vector_search_available` so clients can warn about
     /// degraded retrieval.
     pub vector_search_available: bool,
+    /// See [`SearchResponse::rerank_used`] for semantics.
+    pub rerank_used: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -120,6 +159,7 @@ pub enum ReadError {
 pub async fn search_thoughts(
     pool: &PgPool,
     embedder: &dyn Embedder,
+    reranker: Option<&dyn Reranker>,
     request: SearchRequest,
 ) -> Result<SearchResponse, ReadError> {
     if request.query.is_empty() {
@@ -171,12 +211,26 @@ pub async fn search_thoughts(
     )
     .await?;
 
-    // RRF fuse → recency boost → truncate.
+    // RRF fuse → recency boost.
     let mut fused = rrf_fuse(vec![vector_hits, trigram_hits], DEFAULT_RRF_K);
     let half_life = request
         .recency_half_life_days
         .unwrap_or(DEFAULT_RECENCY_HALF_LIFE_DAYS);
     recency_boost(&mut fused, half_life, OffsetDateTime::now_utc());
+
+    // Optional rerank stage: feed the top `candidate_pool` post-RRF hits
+    // into the cross-encoder, replace `score` with the rerank score, and
+    // re-sort by it. Soft-fails to RRF order on transient errors.
+    let rerank_enabled = request.rerank.unwrap_or(true);
+    let candidate_pool = request
+        .candidate_pool
+        .unwrap_or(DEFAULT_RERANK_CANDIDATE_POOL);
+    let rerank_used = match (rerank_enabled, reranker) {
+        (true, Some(rr)) => {
+            apply_rerank_to_thought_hits(rr, &request.query, &mut fused, candidate_pool).await
+        }
+        _ => false,
+    };
 
     let results: Vec<SearchHit> = fused
         .into_iter()
@@ -189,13 +243,69 @@ pub async fn search_thoughts(
             created_at: h.thought.created_at,
             metadata: h.thought.metadata,
             score: h.score,
+            vector_score: h.vector_score,
+            trigram_score: h.trigram_score,
+            rerank_score: h.rerank_score,
         })
         .collect();
 
     Ok(SearchResponse {
         results,
         vector_search_available,
+        rerank_used,
     })
+}
+
+/// Run the cross-encoder rerank stage over the top `candidate_pool` hits.
+/// Mutates `hits` in place: rerank scores are written to `rerank_score`
+/// AND mirrored into `score` so consumers sorting by `score` get the
+/// rerank-ordered list. Hits outside the candidate pool retain their
+/// pre-rerank `score` and `rerank_score: None`.
+///
+/// Returns `true` if rerank actually ran; `false` on transient failure
+/// (logged + soft-fall-through to the RRF order). Non-transient errors
+/// are also treated as soft failures here — the search request should
+/// not 500 because the reranker is misconfigured.
+async fn apply_rerank_to_thought_hits(
+    reranker: &dyn Reranker,
+    query: &str,
+    hits: &mut [engram_core::Hit],
+    candidate_pool: usize,
+) -> bool {
+    if hits.is_empty() {
+        return false;
+    }
+    let pool_len = candidate_pool.min(hits.len());
+    let candidates: Vec<&str> = hits[..pool_len].iter().map(|h| h.thought.content.as_str()).collect();
+    let scores = match reranker.rerank(query, &candidates).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                transient = e.is_transient(),
+                "reranker failed; falling back to RRF + recency order",
+            );
+            return false;
+        }
+    };
+    // Map back to hits via RerankScore.index, set rerank_score + score.
+    for s in scores {
+        if let Some(hit) = hits.get_mut(s.index) {
+            hit.rerank_score = Some(s.score);
+            hit.score = s.score;
+        }
+    }
+    // Re-sort the (mutated) candidate-pool prefix by rerank score desc;
+    // tail (hits outside the pool) keeps its post-recency order. Stable
+    // sort over the full slice handles this correctly because un-reranked
+    // hits keep their original `score` and naturally fall behind any
+    // reranked hit whose rerank score exceeds the original RRF score.
+    hits.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    true
 }
 
 pub async fn recent_thoughts(
@@ -242,6 +352,7 @@ pub async fn get_thought(
 pub async fn search_facts(
     pool: &PgPool,
     embedder: &dyn Embedder,
+    reranker: Option<&dyn Reranker>,
     request: SearchFactsRequest,
 ) -> Result<SearchFactsResponse, ReadError> {
     if request.query.is_empty() {
@@ -322,6 +433,20 @@ pub async fn search_facts(
         });
     }
 
+    // Optional rerank stage over the top `candidate_pool` post-recency
+    // hits. Cross-encoder feeds on the fact's statement (the canonical
+    // natural-language form of the claim); SPO triple isn't passed.
+    let rerank_enabled = request.rerank.unwrap_or(true);
+    let candidate_pool = request
+        .candidate_pool
+        .unwrap_or(DEFAULT_RERANK_CANDIDATE_POOL);
+    let rerank_used = match (rerank_enabled, reranker) {
+        (true, Some(rr)) => {
+            apply_rerank_to_fact_hits(rr, &request.query, &mut fused, candidate_pool).await
+        }
+        _ => false,
+    };
+
     let results: Vec<SearchFactHit> = fused
         .into_iter()
         .take(limit)
@@ -337,46 +462,97 @@ pub async fn search_facts(
             source_thought_scope: h.source_thought_scope,
             source_thought_created_at: h.source_thought_created_at,
             score: h.score,
+            vector_score: h.vector_score,
+            trigram_score: h.trigram_score,
+            rerank_score: h.rerank_score,
         })
         .collect();
 
     Ok(SearchFactsResponse {
         results,
         vector_search_available,
+        rerank_used,
     })
+}
+
+/// Fact-side counterpart of `apply_rerank_to_thought_hits`. Cross-encoder
+/// scores each fact's `statement` against the query, mutates the hits in
+/// place (writes `rerank_score` + mirrors into `score`), re-sorts.
+async fn apply_rerank_to_fact_hits(
+    reranker: &dyn Reranker,
+    query: &str,
+    hits: &mut [engram_storage::FactHit],
+    candidate_pool: usize,
+) -> bool {
+    if hits.is_empty() {
+        return false;
+    }
+    let pool_len = candidate_pool.min(hits.len());
+    let candidates: Vec<&str> = hits[..pool_len]
+        .iter()
+        .map(|h| h.fact.statement.as_str())
+        .collect();
+    let scores = match reranker.rerank(query, &candidates).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                transient = e.is_transient(),
+                "reranker failed; falling back to RRF + recency order",
+            );
+            return false;
+        }
+    };
+    for s in scores {
+        if let Some(hit) = hits.get_mut(s.index) {
+            hit.rerank_score = Some(s.score);
+            hit.score = s.score;
+        }
+    }
+    hits.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    true
 }
 
 /// Fact-side analogue of `engram_core::search::rrf_fuse`, keyed on
 /// `fact.id` instead of `thought.id`. Same reciprocal-rank-fusion algorithm
-/// (`score = Σ 1 / (k + rank_i)`). Inline because `rrf_fuse` in engram-core
-/// is `Hit`-specific and Phase B step 1 is the only place that needs
-/// fact-aware fusion right now.
+/// (`score = Σ 1 / (k + rank_i)`); same per-leg score preservation rule
+/// (an input's `Some(_)` always wins over an existing `None`). Inline
+/// because `rrf_fuse` in engram-core is `Hit`-specific and the fact side
+/// has its own `FactHit` shape.
 fn rrf_fuse_facts(
     rankings: Vec<Vec<engram_storage::FactHit>>,
     k: f32,
 ) -> Vec<engram_storage::FactHit> {
     use std::collections::HashMap;
-    let mut acc: HashMap<uuid::Uuid, (engram_storage::FactHit, f32)> = HashMap::new();
+    let mut acc: HashMap<uuid::Uuid, engram_storage::FactHit> = HashMap::new();
     for ranking in rankings {
         for (i, hit) in ranking.into_iter().enumerate() {
             let rank = (i + 1) as f32;
             let contribution = 1.0 / (k + rank);
             let id = hit.fact.id;
             match acc.get_mut(&id) {
-                Some((_, s)) => *s += contribution,
+                Some(existing) => {
+                    existing.score += contribution;
+                    if existing.vector_score.is_none() {
+                        existing.vector_score = hit.vector_score;
+                    }
+                    if existing.trigram_score.is_none() {
+                        existing.trigram_score = hit.trigram_score;
+                    }
+                }
                 None => {
-                    acc.insert(id, (hit, contribution));
+                    let mut merged = hit;
+                    merged.score = contribution;
+                    acc.insert(id, merged);
                 }
             }
         }
     }
-    let mut fused: Vec<engram_storage::FactHit> = acc
-        .into_values()
-        .map(|(mut hit, score)| {
-            hit.score = score;
-            hit
-        })
-        .collect();
+    let mut fused: Vec<engram_storage::FactHit> = acc.into_values().collect();
     fused.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
@@ -433,12 +609,14 @@ mod tests {
 
         let resp = search_thoughts(
             &pool,
-            &embedder,
+            &embedder, None,
             SearchRequest {
                 query: "alpha".to_string(),
                 scope: None,
                 limit: Some(10),
                 recency_half_life_days: None,
+                rerank: None,
+                candidate_pool: None,
             },
         )
         .await
@@ -458,12 +636,14 @@ mod tests {
         let bad = FakeEmbedder::always_failing(EmbeddingModel::bge_m3(), FakeBehavior::Unreachable);
         let resp = search_thoughts(
             &pool,
-            &bad,
+            &bad, None,
             SearchRequest {
                 query: "tcgplayer".to_string(),
                 scope: None,
                 limit: Some(10),
                 recency_half_life_days: None,
+                rerank: None,
+                candidate_pool: None,
             },
         )
         .await
@@ -479,12 +659,14 @@ mod tests {
         let embedder = FakeEmbedder::new();
         let err = search_thoughts(
             &pool,
-            &embedder,
+            &embedder, None,
             SearchRequest {
                 query: String::new(),
                 scope: None,
                 limit: None,
                 recency_half_life_days: None,
+                rerank: None,
+                candidate_pool: None,
             },
         )
         .await
@@ -497,12 +679,14 @@ mod tests {
         let embedder = FakeEmbedder::new();
         let err = search_thoughts(
             &pool,
-            &embedder,
+            &embedder, None,
             SearchRequest {
                 query: "x".to_string(),
                 scope: None,
                 limit: Some(1000),
                 recency_half_life_days: None,
+                rerank: None,
+                candidate_pool: None,
             },
         )
         .await
@@ -518,12 +702,14 @@ mod tests {
 
         let resp = search_thoughts(
             &pool,
-            &embedder,
+            &embedder, None,
             SearchRequest {
                 query: "tcgplayer".to_string(),
                 scope: Some(Scope::new("work").unwrap()),
                 limit: Some(10),
                 recency_half_life_days: None,
+                rerank: None,
+                candidate_pool: None,
             },
         )
         .await
@@ -626,12 +812,14 @@ mod tests {
 
         let resp = search_facts(
             &pool,
-            &FakeEmbedder::new(),
+            &FakeEmbedder::new(), None,
             SearchFactsRequest {
                 query: "pgvector".to_string(),
                 scope: None,
                 limit: None,
                 recency_half_life_days: Some(0.0), // disable boost for deterministic ordering
+                rerank: None,
+                candidate_pool: None,
             },
         )
         .await
@@ -656,12 +844,14 @@ mod tests {
         // Visible before supersede.
         let before = search_facts(
             &pool,
-            &FakeEmbedder::new(),
+            &FakeEmbedder::new(), None,
             SearchFactsRequest {
                 query: "widgets".to_string(),
                 scope: None,
                 limit: None,
                 recency_half_life_days: Some(0.0),
+                rerank: None,
+                candidate_pool: None,
             },
         )
         .await
@@ -672,12 +862,14 @@ mod tests {
 
         let after = search_facts(
             &pool,
-            &FakeEmbedder::new(),
+            &FakeEmbedder::new(), None,
             SearchFactsRequest {
                 query: "widgets".to_string(),
                 scope: None,
                 limit: None,
                 recency_half_life_days: Some(0.0),
+                rerank: None,
+                candidate_pool: None,
             },
         )
         .await
@@ -689,12 +881,14 @@ mod tests {
     async fn search_facts_empty_query_errors(pool: PgPool) {
         let err = search_facts(
             &pool,
-            &FakeEmbedder::new(),
+            &FakeEmbedder::new(), None,
             SearchFactsRequest {
                 query: String::new(),
                 scope: None,
                 limit: None,
                 recency_half_life_days: None,
+                rerank: None,
+                candidate_pool: None,
             },
         )
         .await
@@ -706,12 +900,14 @@ mod tests {
     async fn search_facts_limit_out_of_bounds_errors(pool: PgPool) {
         let err = search_facts(
             &pool,
-            &FakeEmbedder::new(),
+            &FakeEmbedder::new(), None,
             SearchFactsRequest {
                 query: "x".to_string(),
                 scope: None,
                 limit: Some(1000),
                 recency_half_life_days: None,
+                rerank: None,
+                candidate_pool: None,
             },
         )
         .await
@@ -728,12 +924,14 @@ mod tests {
 
         let resp = search_facts(
             &pool,
-            &FakeEmbedder::new(),
+            &FakeEmbedder::new(), None,
             SearchFactsRequest {
                 query: "widget".to_string(),
                 scope: Some(Scope::new("work").unwrap()),
                 limit: None,
                 recency_half_life_days: Some(0.0),
+                rerank: None,
+                candidate_pool: None,
             },
         )
         .await
@@ -828,12 +1026,14 @@ mod tests {
         // vector and fact vector live in the same space — the kNN finds it.
         let resp = search_facts(
             &pool,
-            &embedder,
+            &embedder, None,
             SearchFactsRequest {
                 query: "completely unrelated lexically".to_string(),
                 scope: None,
                 limit: None,
                 recency_half_life_days: Some(0.0),
+                rerank: None,
+                candidate_pool: None,
             },
         )
         .await
@@ -851,12 +1051,14 @@ mod tests {
         cap(&pool, "a thought", "global").await;
         let ok_resp = search_facts(
             &pool,
-            &healthy,
+            &healthy, None,
             SearchFactsRequest {
                 query: "anything".to_string(),
                 scope: None,
                 limit: None,
                 recency_half_life_days: Some(0.0),
+                rerank: None,
+                candidate_pool: None,
             },
         )
         .await
@@ -866,16 +1068,259 @@ mod tests {
         let broken = FakeEmbedder::always_failing(EmbeddingModel::bge_m3(), FakeBehavior::Unreachable);
         let degraded_resp = search_facts(
             &pool,
-            &broken,
+            &broken, None,
             SearchFactsRequest {
                 query: "anything".to_string(),
                 scope: None,
                 limit: None,
                 recency_half_life_days: Some(0.0),
+                rerank: None,
+                candidate_pool: None,
             },
         )
         .await
         .unwrap();
         assert!(!degraded_resp.vector_search_available);
+    }
+
+    // -- M3 Phase B step 2: rerank stage integration -------------------------
+
+    use engram_embed::{FakeReranker, FakeRerankerBehavior, FakeRerankerScoring};
+
+    /// When a reranker is provided and rerank is enabled (default Some(true)),
+    /// the search response carries `rerank_used: true` and every result has
+    /// a populated `rerank_score`.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_facts_reranks_when_enabled(pool: PgPool) {
+        let embedder = FakeEmbedder::new();
+        let id = cap(&pool, "anchor", "global").await;
+        insert_test_fact(&pool, id, "global", "fact one", (None, None, None), 0.9).await;
+        insert_test_fact(&pool, id, "global", "fact two", (None, None, None), 0.9).await;
+        // Position-descending scoring: fact at index 0 wins. The exact
+        // ordering doesn't matter for this test; we're verifying rerank
+        // ran at all.
+        let reranker = FakeReranker::new();
+
+        let resp = search_facts(
+            &pool,
+            &embedder,
+            Some(&reranker),
+            SearchFactsRequest {
+                query: "fact".to_string(),
+                scope: None,
+                limit: None,
+                recency_half_life_days: Some(0.0),
+                rerank: None,
+                candidate_pool: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(resp.rerank_used);
+        assert!(!resp.results.is_empty());
+        for hit in &resp.results {
+            assert!(hit.rerank_score.is_some(), "every result should carry a rerank score");
+        }
+        // FakeReranker recorded the call → fact statements were passed as candidates.
+        let call = reranker.last_call().unwrap();
+        assert_eq!(call.query, "fact");
+        assert!(!call.candidates.is_empty());
+    }
+
+    /// Explicit opt-out: `rerank: Some(false)` skips the stage even when a
+    /// reranker is available. Response carries `rerank_used: false` and no
+    /// hit carries a `rerank_score`.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_facts_skips_rerank_when_disabled_per_request(pool: PgPool) {
+        let embedder = FakeEmbedder::new();
+        let id = cap(&pool, "anchor", "global").await;
+        insert_test_fact(&pool, id, "global", "fact one", (None, None, None), 0.9).await;
+        let reranker = FakeReranker::new();
+
+        let resp = search_facts(
+            &pool,
+            &embedder,
+            Some(&reranker),
+            SearchFactsRequest {
+                query: "fact".to_string(),
+                scope: None,
+                limit: None,
+                recency_half_life_days: Some(0.0),
+                rerank: Some(false),
+                candidate_pool: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!resp.rerank_used);
+        for hit in &resp.results {
+            assert!(hit.rerank_score.is_none());
+        }
+        // Reranker was NOT called.
+        assert!(reranker.last_call().is_none());
+    }
+
+    /// No reranker configured (None passed): search still works, response
+    /// carries `rerank_used: false`, no error. This is the silent-disable
+    /// path for `engram.toml` without a `[reranker]` section.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_facts_falls_through_when_no_reranker_configured(pool: PgPool) {
+        let embedder = FakeEmbedder::new();
+        let id = cap(&pool, "anchor", "global").await;
+        insert_test_fact(&pool, id, "global", "fact one", (None, None, None), 0.9).await;
+
+        let resp = search_facts(
+            &pool,
+            &embedder,
+            None, // no reranker configured
+            SearchFactsRequest {
+                query: "fact".to_string(),
+                scope: None,
+                limit: None,
+                recency_half_life_days: Some(0.0),
+                rerank: None,
+                candidate_pool: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!resp.rerank_used);
+        for hit in &resp.results {
+            assert!(hit.rerank_score.is_none());
+        }
+    }
+
+    /// Reranker failure soft-fails to the RRF + recency order rather than
+    /// returning an error. Response carries `rerank_used: false`.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_facts_soft_fails_when_reranker_errors(pool: PgPool) {
+        let embedder = FakeEmbedder::new();
+        let id = cap(&pool, "anchor", "global").await;
+        insert_test_fact(&pool, id, "global", "fact one", (None, None, None), 0.9).await;
+        let broken = FakeReranker::always_failing(FakeRerankerBehavior::Unreachable);
+
+        let resp = search_facts(
+            &pool,
+            &embedder,
+            Some(&broken),
+            SearchFactsRequest {
+                query: "fact".to_string(),
+                scope: None,
+                limit: None,
+                recency_half_life_days: Some(0.0),
+                rerank: None,
+                candidate_pool: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!resp.rerank_used);
+        assert!(!resp.results.is_empty(), "RRF results should still come back");
+    }
+
+    /// Phase B step 2's regression target shape: when the reranker boosts
+    /// a specific candidate by substring, that candidate should land at
+    /// the top of the response even when RRF + trigram alone wouldn't put
+    /// it there. All three facts are embedded so they all reach the
+    /// vector-leg candidate pool regardless of trigram overlap with the
+    /// query.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_facts_rerank_reorders_candidate_pool(pool: PgPool) {
+        let embedder = FakeEmbedder::new();
+        let id = cap(&pool, "anchor", "global").await;
+        // Three facts; trigram favors the one matching "keyword".
+        let f_lex = insert_test_fact(&pool, id, "global", "lexical match keyword", (None, None, None), 0.9).await;
+        let f_alpha = insert_test_fact(&pool, id, "global", "alpha fact", (None, None, None), 0.9).await;
+        let f_nix = insert_test_fact(&pool, id, "global", "Nix is reproducible", (None, None, None), 0.9).await;
+        // Embed all three so they reach the vector-leg candidate pool.
+        for fact_id in [f_lex, f_alpha, f_nix] {
+            engram_storage::enqueue_embedding(
+                &pool,
+                engram_storage::target::FACT,
+                fact_id,
+                &embedder.model().id,
+            )
+            .await
+            .unwrap();
+        }
+        drain_pending_embeddings(&pool, &embedder, 16).await.unwrap();
+
+        // Reranker boosts whichever candidate contains "Nix".
+        let reranker = FakeReranker::with_scoring(FakeRerankerScoring::SubstringBoost {
+            needle: "Nix".to_string(),
+        });
+
+        let resp = search_facts(
+            &pool,
+            &embedder,
+            Some(&reranker),
+            SearchFactsRequest {
+                query: "keyword".to_string(),
+                scope: None,
+                limit: None,
+                recency_half_life_days: Some(0.0),
+                rerank: None,
+                candidate_pool: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(resp.rerank_used);
+        // After rerank, the Nix fact (boosted to 1.0) wins.
+        assert_eq!(resp.results[0].statement, "Nix is reproducible");
+        assert_eq!(resp.results[0].rerank_score, Some(1.0));
+    }
+
+    /// Per-leg scores are populated on the response: a hit that matched
+    /// via vector should have `vector_score: Some(_)`; a hit that matched
+    /// via trigram should have `trigram_score: Some(_)`.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_facts_response_carries_per_leg_scores(pool: PgPool) {
+        let embedder = FakeEmbedder::new();
+        let id = cap(&pool, "anchor", "global").await;
+        // Embed a fact so the vector leg has something to match.
+        let fact_id = insert_test_fact(
+            &pool,
+            id,
+            "global",
+            "the lexical keyword query",
+            (None, None, None),
+            0.9,
+        )
+        .await;
+        engram_storage::enqueue_embedding(
+            &pool,
+            engram_storage::target::FACT,
+            fact_id,
+            &embedder.model().id,
+        )
+        .await
+        .unwrap();
+        drain_pending_embeddings(&pool, &embedder, 16).await.unwrap();
+
+        let resp = search_facts(
+            &pool,
+            &embedder,
+            None, // disable rerank so we see the raw vector + trigram fields
+            SearchFactsRequest {
+                query: "lexical keyword query".to_string(),
+                scope: None,
+                limit: None,
+                recency_half_life_days: Some(0.0),
+                rerank: Some(false),
+                candidate_pool: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!resp.results.is_empty());
+        let hit = &resp.results[0];
+        // Either vector_score or trigram_score (or both) must be present.
+        assert!(
+            hit.vector_score.is_some() || hit.trigram_score.is_some(),
+            "every hit must carry at least one leg's score"
+        );
+        // rerank_score must be None (rerank disabled).
+        assert!(hit.rerank_score.is_none());
     }
 }

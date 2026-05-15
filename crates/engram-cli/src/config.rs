@@ -22,6 +22,7 @@ pub struct Config {
     pub worker: WorkerConfig,
     pub extractor: ExtractorConfig,
     pub reflector: engram_mcp::ReflectorOptions,
+    pub reranker: RerankerConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,6 +86,37 @@ impl Default for EmbedderConfig {
             dimensions: 1024,
             api_key: None,
             timeout_seconds: 5,
+        }
+    }
+}
+
+/// Reranker configuration (M3 Phase B step 2). Empty `provider` disables
+/// the rerank stage silently — the search pipeline falls through to the
+/// Phase B step 1 RRF + recency pipeline. Currently the only supported
+/// provider is `"tei"` (Hugging Face text-embeddings-inference in rerank
+/// mode, default deployment is the `tei` service in docker-compose.yml).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RerankerConfig {
+    /// `""` (default) = no reranker, `"tei"` = TEI sidecar.
+    pub provider: String,
+    /// Service root (no `/v1` suffix). Default: `"http://localhost:8080"`.
+    pub endpoint: String,
+    /// Engram-side stable identity. Conventionally `<vendor>/<model>`.
+    pub model_id: String,
+    pub timeout_seconds: u64,
+}
+
+impl Default for RerankerConfig {
+    fn default() -> Self {
+        Self {
+            // Empty by default — opt-in. Phase B step 2 ships rerank-on-by-
+            // default behavior *when configured*; not having a `[reranker]`
+            // section in the TOML keeps the M1/M2/Phase-B-step-1 behavior.
+            provider: String::new(),
+            endpoint: "http://localhost:8080".to_string(),
+            model_id: "BAAI/bge-reranker-v2-m3".to_string(),
+            timeout_seconds: 30,
         }
     }
 }

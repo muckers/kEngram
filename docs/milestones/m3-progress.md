@@ -79,11 +79,29 @@ End state: facts have embeddings flowing through the same async-embedding seam a
 
 ### Step 2 — Cross-encoder reranker + rerank stage
 
-Not yet planned.
+End state: TEI Docker container serves BGE-reranker-v2-m3; `search_thoughts` / `search_facts` retrieve top-`candidate_pool` via RRF + recency, rerank to top-`limit` via the cross-encoder; per-leg + rerank scores surface on every result; rerank is on by default with explicit per-call opt-out.
 
-- [ ] Cross-encoder reranker + TEI rerank-task deployment (L)
-- [ ] Rerank stage in `search_thoughts` / `search_facts`
-- [ ] Per-call rerank parameters (`rerank?: bool`, `candidate_pool?: int`)
+- [x] `docker-compose.yml`: new `tei` service (cpu-arm64 image, BAAI/bge-reranker-v2-m3, 60s start_period for the first-boot model download).
+- [x] `engram-embed`: `Reranker` trait + `RerankerError` (with `is_transient()`) + `RerankScore`.
+- [x] `engram-embed`: `TeiReranker` HTTP impl (POSTs `/rerank`; validates response shape; stores `timeout_seconds` so error reports the actual configured value per the Phase A lesson).
+- [x] `engram-embed`: `FakeReranker` with `Deterministic` / `Timeout` / `Unreachable` / `Misconfigured` behaviors + `PositionDescending` / `PositionAscending` / `SubstringBoost` scoring strategies + `RecordedRerank` last-call inspection.
+- [x] `engram-core`: `Hit` gains `vector_score`, `trigram_score`, `rerank_score` optional fields + `Hit::from_vector_leg` / `Hit::from_trigram_leg` constructors. `rrf_fuse` preserves per-leg scores across the fusion (Some wins over None).
+- [x] `engram-storage`: `FactHit` gains the same three optional fields. `search_vector_knn` / `search_trigram` / `search_facts_vector_knn` / `search_facts_trigram` populate the right per-leg field at construction.
+- [x] `engram-mcp/search`: `search_thoughts` and `search_facts` gain `reranker: Option<&dyn Reranker>` parameter + `rerank` / `candidate_pool` request fields + `rerank_used` on response. Inline `apply_rerank_to_thought_hits` / `apply_rerank_to_fact_hits` helpers feed the candidate pool into the cross-encoder, write `rerank_score` + mirror into `score`, re-sort. Soft-fail to RRF + recency order on reranker errors.
+- [x] `engram-mcp/server`: `EngramServer` gains `reranker: Option<Arc<dyn Reranker>>` field. `SearchThoughtsArgs` / `SearchFactsArgs` gain `rerank` / `candidate_pool` schemars-documented optional fields. JSON serializers carry per-leg + rerank scores + `rerank_used`.
+- [x] `engram-cli`: `RerankerConfig` (empty `provider` = silent disable sentinel). `build_reranker` returns `Option<Arc<dyn Reranker>>`. Startup log mirrors the extractor's Phase A pattern.
+- [x] `DEVELOPMENT.md`: TEI section (first-time setup + smoke test) + `[reranker]` config example.
+- [x] `cargo test --workspace`: 273 passing (244 → 273; +29 across reranker trait, integration, RRF per-leg preservation).
+- [x] `cargo clippy --all-targets -- -D warnings`: clean.
+
+**Operator-driven (post-merge):**
+
+- [ ] `docker compose up -d tei` → confirm healthy.
+- [ ] Add `[reranker] provider = "tei"` (etc.) to `~/.config/engram/engram.toml`.
+- [ ] `engram serve` → startup log shows `reranker: resolved config`.
+- [ ] MCP `search_facts` with rerank-on returns `rerank_used: true` and every hit carries a `rerank_score`.
+- [ ] MCP `search_facts` with `rerank: false` returns the Phase B step 1 RRF + recency order; `rerank_used: false`; `rerank_score: null` on every hit.
+- [ ] Regression-target probe: `tooling for compiling codebases reproducibly` → does the live BGE-reranker rank Nix-reproducibility facts above Redis? (Phase B step 3's A/B harness will measure this systematically; for now an eyeball check.)
 
 ### Step 3 — A/B benchmarking harness
 
@@ -117,6 +135,8 @@ Not yet planned. Items:
 Dated notes appended as items land. Format: `YYYY-MM-DD — <one-line summary>`. Multi-line entries fine for decisions that need explanation.
 
 <!-- Most recent entry first. -->
+
+- **2026-05-15** — **M3 Phase B step 2 landed: cross-encoder reranker + per-leg scores.** TEI Docker container serves `BAAI/bge-reranker-v2-m3`; `search_thoughts` and `search_facts` retrieve top-50 (configurable `candidate_pool`) via RRF + recency, rerank to top-`limit` via the cross-encoder. Per-leg `vector_score` / `trigram_score` and `rerank_score` surface as optional fields on every result so consumers building threshold logic can reach the raw signals (the previous "score is opaque RRF rank-sum" feedback from the step 1 dogfood drove this bundling decision). Wire shape additive: `SearchRequest` / `SearchFactsRequest` gain `rerank?: bool` (default `true`) + `candidate_pool?: usize`; responses gain `rerank_used: bool`. New `[reranker]` config section with empty-provider sentinel for silent disable (Phase B step 1 dogfood deployments without a `[reranker]` block keep working unchanged). 17 new tests in engram-embed (TeiReranker via wiremock + FakeReranker variants + RerankerError classification), 6 new integration tests in engram-mcp/search (rerank on/off/no-reranker/soft-fail/reorder/per-leg-scores), 2 new RRF preservation tests in engram-core. Test count 244 → 273 (+29). TEI service confirmed healthy locally; live `/rerank` smoke returns the expected response shape. Operator-driven verification (rerank-on dogfood, regression-target probe) remains the next checkpoint.
 
 - **2026-05-15** — **Phase B step 1 dogfood verification.** Claude Desktop ran qualitative probes against the live corpus (97 facts, freshly backfilled). Probe 1 verified the vector leg is doing real work: a statement-token-disjoint query returned the semantically-related fact — impossible via trigram. **Step 1 success criterion met; signing off.** Two observations folded into the M3 forward-looking backlog (`m3-search-quality.md`): (a) RRF score compression at 0.015–0.016 — design-correct, not a bug; added a new "surface per-leg scores in search response shape" backlog item for consumer thresholding; (b) probe 2 ranked Redis above Bazel for "tooling for compiling codebases reproducibly", with Nix-reproducibility missing entirely — annotated step 2 (cross-encoder reranker) with this as a concrete regression target.
 

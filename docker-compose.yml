@@ -1,10 +1,14 @@
-# Dev-only Postgres for Engram. Production deployment uses systemd-managed
-# Postgres (see docs/engram-design-v0.md §11), not this file.
+# Dev-only Postgres + TEI reranker for Engram. Production deployment uses
+# systemd-managed services (see docs/engram-design-v0.md §11), not this file.
 #
 # The pgvector/pgvector:pg16 image bundles the `vector`, `pg_trgm`, and
 # `pgcrypto` extensions — i.e. everything the M1 migration's CREATE EXTENSION
 # lines need. The image is the official one published by the pgvector
 # maintainers.
+#
+# The TEI service serves BGE-reranker-v2-m3 as a cross-encoder reranker over
+# HTTP. Added M3 Phase B step 2. Embeddings stay on Ollama in dev — TEI runs
+# rerank-task only.
 #
 # Defaults are dev-friendly (engram/engram on localhost:5432). The container
 # only accepts connections from localhost; a real password is unnecessary
@@ -30,5 +34,28 @@ services:
       retries: 5
       start_period: 10s
 
+  tei:
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-arm64-latest
+    container_name: engram-tei
+    restart: unless-stopped
+    environment:
+      # TEI honors $HF_HOME for the model cache.
+      HF_HOME: /data
+    ports:
+      - "8080:80"
+    volumes:
+      - engram-tei-models:/data
+    command:
+      - --model-id=BAAI/bge-reranker-v2-m3
+    healthcheck:
+      # TEI's /health endpoint returns 200 once the model is loaded. First
+      # boot downloads ~600 MB so the first health check may take a minute.
+      test: ["CMD", "curl", "-fsS", "http://localhost/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+
 volumes:
   engram-pg-data:
+  engram-tei-models:

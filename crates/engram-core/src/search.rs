@@ -21,35 +21,107 @@ pub const DEFAULT_RRF_K: f32 = 60.0;
 pub const DEFAULT_RECENCY_HALF_LIFE_DAYS: f32 = 30.0;
 
 /// A single retrieval hit. Storage layers return these from each leg; the
-/// fusion layer accumulates and re-orders them. `score` is the raw score
-/// from the producing leg (cosine similarity, trigram similarity, etc.) for
-/// pre-fusion; after fusion, it's the RRF or boosted-RRF score.
+/// fusion layer accumulates and re-orders them.
+///
+/// `score` evolves through the search pipeline:
+///   1. **Pre-fusion** (set by storage-layer leg fn): the raw score from
+///      the producing leg — cosine similarity for the vector leg, trigram
+///      word_similarity for the trigram leg.
+///   2. **Post-fusion** ([`rrf_fuse`]): the RRF aggregate
+///      `Σ 1/(k + rank_i)` over the legs that contributed.
+///   3. **Post-recency** ([`recency_boost`]): the RRF aggregate multiplied
+///      by a half-life decay factor.
+///   4. **Post-rerank** (search orchestrator, when reranker is configured):
+///      replaced with the cross-encoder's calibrated absolute score.
+///
+/// The optional per-leg fields preserve the **pre-fusion** signals so
+/// consumers building thresholding logic (e.g. "only show hits where
+/// `vector_score > 0.6`") can reach the raw signal even after the
+/// pipeline has overwritten `score`. M3 Phase B step 2.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Hit {
     pub thought: Thought,
     pub score: f32,
+    /// Raw cosine similarity from the vector kNN leg. `None` when the hit
+    /// did not appear in the vector leg (trigram-only match or vector leg
+    /// unavailable).
+    pub vector_score: Option<f32>,
+    /// Raw `word_similarity` from the trigram leg. `None` when the hit did
+    /// not appear in the trigram leg.
+    pub trigram_score: Option<f32>,
+    /// Calibrated absolute relevance score from the cross-encoder
+    /// reranker. `None` when rerank was off, no reranker was configured,
+    /// or the hit fell outside the reranked candidate pool.
+    pub rerank_score: Option<f32>,
+}
+
+impl Hit {
+    /// Construct a hit produced by the vector kNN leg — `score` is the raw
+    /// cosine similarity, mirrored into the typed `vector_score` field.
+    /// Trigram + rerank fields default to `None`.
+    pub fn from_vector_leg(thought: Thought, cosine_similarity: f32) -> Self {
+        Self {
+            thought,
+            score: cosine_similarity,
+            vector_score: Some(cosine_similarity),
+            trigram_score: None,
+            rerank_score: None,
+        }
+    }
+
+    /// Construct a hit produced by the trigram leg — `score` is the raw
+    /// `word_similarity`, mirrored into `trigram_score`. Vector + rerank
+    /// fields default to `None`.
+    pub fn from_trigram_leg(thought: Thought, word_similarity: f32) -> Self {
+        Self {
+            thought,
+            score: word_similarity,
+            vector_score: None,
+            trigram_score: Some(word_similarity),
+            rerank_score: None,
+        }
+    }
 }
 
 /// Reciprocal Rank Fusion. Each ranking is taken in the order given.
-/// Output is sorted by descending fused score.
+/// Output is sorted by descending fused score. Per-leg score fields
+/// (`vector_score`, `trigram_score`) are preserved across the fusion:
+/// when both rankings carry the same thought, the leg-specific scores
+/// from each input merge into the accumulator (an input's `Some(_)`
+/// always wins over an existing `None`).
 pub fn rrf_fuse(rankings: Vec<Vec<Hit>>, k: f32) -> Vec<Hit> {
-    let mut acc: HashMap<crate::ThoughtId, (Thought, f32)> = HashMap::new();
+    let mut acc: HashMap<crate::ThoughtId, Hit> = HashMap::new();
 
     for ranking in rankings {
         for (i, hit) in ranking.into_iter().enumerate() {
             let rank = (i + 1) as f32;
             let contribution = 1.0 / (k + rank);
-            acc.entry(hit.thought.id)
-                .and_modify(|(_, s)| *s += contribution)
-                .or_insert((hit.thought, contribution));
+            match acc.get_mut(&hit.thought.id) {
+                Some(existing) => {
+                    existing.score += contribution;
+                    if existing.vector_score.is_none() {
+                        existing.vector_score = hit.vector_score;
+                    }
+                    if existing.trigram_score.is_none() {
+                        existing.trigram_score = hit.trigram_score;
+                    }
+                }
+                None => {
+                    let id = hit.thought.id;
+                    let merged = Hit {
+                        thought: hit.thought,
+                        score: contribution,
+                        vector_score: hit.vector_score,
+                        trigram_score: hit.trigram_score,
+                        rerank_score: None,
+                    };
+                    acc.insert(id, merged);
+                }
+            }
         }
     }
 
-    let mut fused: Vec<Hit> = acc
-        .into_values()
-        .map(|(thought, score)| Hit { thought, score })
-        .collect();
-
+    let mut fused: Vec<Hit> = acc.into_values().collect();
     fused.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
@@ -96,7 +168,13 @@ mod tests {
     }
 
     fn hit(t: Thought, score: f32) -> Hit {
-        Hit { thought: t, score }
+        Hit {
+            thought: t,
+            score,
+            vector_score: None,
+            trigram_score: None,
+            rerank_score: None,
+        }
     }
 
     #[test]
@@ -134,6 +212,38 @@ mod tests {
         assert!((out[0].score - 2.0 / 61.0).abs() < 1e-6);
         assert_eq!(out[1].thought.content, "b");
         assert!((out[1].score - 1.0 / 62.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rrf_preserves_per_leg_scores_when_present() {
+        // Build a vector-leg hit and a trigram-leg hit for two different
+        // thoughts. After fusion, each hit should carry the per-leg score
+        // from its origin (and None for the other leg).
+        let v_hit = Hit::from_vector_leg(thought(1, "vec only", 0), 0.85);
+        let t_hit = Hit::from_trigram_leg(thought(2, "tri only", 0), 0.42);
+        let out = rrf_fuse(vec![vec![v_hit], vec![t_hit]], 60.0);
+        let by_content: std::collections::HashMap<String, Hit> = out
+            .into_iter()
+            .map(|h| (h.thought.content.clone(), h))
+            .collect();
+        let v = &by_content["vec only"];
+        assert_eq!(v.vector_score, Some(0.85));
+        assert_eq!(v.trigram_score, None);
+        let t = &by_content["tri only"];
+        assert_eq!(t.vector_score, None);
+        assert_eq!(t.trigram_score, Some(0.42));
+    }
+
+    #[test]
+    fn rrf_merges_per_leg_scores_when_both_legs_match() {
+        // Same thought appears in both legs — vector_score AND trigram_score
+        // should survive the fusion.
+        let v_hit = Hit::from_vector_leg(thought(1, "both", 0), 0.91);
+        let t_hit = Hit::from_trigram_leg(thought(1, "both", 0), 0.33);
+        let out = rrf_fuse(vec![vec![v_hit], vec![t_hit]], 60.0);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].vector_score, Some(0.91));
+        assert_eq!(out[0].trigram_score, Some(0.33));
     }
 
     #[test]

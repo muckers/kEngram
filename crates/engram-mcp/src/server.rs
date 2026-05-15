@@ -4,6 +4,7 @@
 //! and [`crate::search`].
 
 use engram_core::{Embedder, Metadata, Scope, Source, ThoughtId};
+use engram_embed::Reranker;
 use rmcp::{
     ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -51,6 +52,12 @@ pub struct SearchThoughtsArgs {
 
     #[schemars(description = "Recency boost half-life in days. Optional; defaults to 30. Set to 0 to disable recency boost.")]
     pub recency_half_life_days: Option<f32>,
+
+    #[schemars(description = "Apply the cross-encoder rerank stage. Defaults to true when a reranker is configured. Set false for A/B comparison against the RRF + recency pipeline.")]
+    pub rerank: Option<bool>,
+
+    #[schemars(description = "Number of post-RRF candidates fed into the reranker. Ignored when rerank is off. Defaults to 50.")]
+    pub candidate_pool: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -81,6 +88,12 @@ pub struct SearchFactsArgs {
 
     #[schemars(description = "Recency boost half-life in days, keyed on the source thought's created_at. Optional; defaults to 30. Set to 0 to disable.")]
     pub recency_half_life_days: Option<f32>,
+
+    #[schemars(description = "Apply the cross-encoder rerank stage. Defaults to true when a reranker is configured.")]
+    pub rerank: Option<bool>,
+
+    #[schemars(description = "Number of post-RRF candidates fed into the reranker. Ignored when rerank is off. Defaults to 50.")]
+    pub candidate_pool: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -117,16 +130,32 @@ pub struct CorrectFactReplacementArgs {
 pub struct EngramServer {
     pool: PgPool,
     embedder: Arc<dyn Embedder>,
+    /// `None` when no `[reranker]` config is provided; the search pipeline
+    /// silently falls through to the M3 Phase B step 1 RRF + recency
+    /// pipeline. `Some(_)` enables the rerank stage on calls that don't
+    /// opt out via `rerank: false`.
+    reranker: Option<Arc<dyn Reranker>>,
     tool_router: ToolRouter<Self>,
 }
 
 impl EngramServer {
-    pub fn new(pool: PgPool, embedder: Arc<dyn Embedder>) -> Self {
+    pub fn new(
+        pool: PgPool,
+        embedder: Arc<dyn Embedder>,
+        reranker: Option<Arc<dyn Reranker>>,
+    ) -> Self {
         Self {
             pool,
             embedder,
+            reranker,
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// Convenience for tests that don't exercise the rerank stage.
+    #[cfg(test)]
+    pub fn new_without_reranker(pool: PgPool, embedder: Arc<dyn Embedder>) -> Self {
+        Self::new(pool, embedder, None)
     }
 }
 
@@ -190,11 +219,18 @@ impl EngramServer {
             scope,
             limit: args.limit,
             recency_half_life_days: args.recency_half_life_days,
+            rerank: args.rerank,
+            candidate_pool: args.candidate_pool,
         };
 
-        let resp = search::search_thoughts(&self.pool, self.embedder.as_ref(), request)
-            .await
-            .map_err(map_read_error)?;
+        let resp = search::search_thoughts(
+            &self.pool,
+            self.embedder.as_ref(),
+            self.reranker.as_deref(),
+            request,
+        )
+        .await
+        .map_err(map_read_error)?;
 
         serde_json::to_string(&search_response_json(&resp))
             .map_err(|e| format!("response serialization error: {e}"))
@@ -254,11 +290,18 @@ impl EngramServer {
             scope,
             limit: args.limit,
             recency_half_life_days: args.recency_half_life_days,
+            rerank: args.rerank,
+            candidate_pool: args.candidate_pool,
         };
 
-        let resp = search::search_facts(&self.pool, self.embedder.as_ref(), request)
-            .await
-            .map_err(map_read_error)?;
+        let resp = search::search_facts(
+            &self.pool,
+            self.embedder.as_ref(),
+            self.reranker.as_deref(),
+            request,
+        )
+        .await
+        .map_err(map_read_error)?;
 
         serde_json::to_string(&search_facts_response_json(&resp))
             .map_err(|e| format!("response serialization error: {e}"))
@@ -381,12 +424,16 @@ fn search_response_json(resp: &SearchResponse) -> serde_json::Value {
                 "created_at": h.created_at.format(&time::format_description::well_known::Rfc3339).unwrap_or_default(),
                 "metadata": h.metadata.as_value(),
                 "score": h.score,
+                "vector_score": h.vector_score,
+                "trigram_score": h.trigram_score,
+                "rerank_score": h.rerank_score,
             })
         })
         .collect();
     serde_json::json!({
         "results": results,
         "vector_search_available": resp.vector_search_available,
+        "rerank_used": resp.rerank_used,
     })
 }
 
@@ -462,12 +509,16 @@ fn search_facts_response_json(resp: &SearchFactsResponse) -> serde_json::Value {
                 "source_thought_scope": h.source_thought_scope.as_str(),
                 "source_thought_created_at": h.source_thought_created_at.format(&time::format_description::well_known::Rfc3339).unwrap_or_default(),
                 "score": h.score,
+                "vector_score": h.vector_score,
+                "trigram_score": h.trigram_score,
+                "rerank_score": h.rerank_score,
             })
         })
         .collect();
     serde_json::json!({
         "results": results,
         "vector_search_available": resp.vector_search_available,
+        "rerank_used": resp.rerank_used,
     })
 }
 
@@ -490,7 +541,7 @@ mod tests {
     use engram_embed::FakeEmbedder;
 
     fn server(pool: PgPool) -> EngramServer {
-        EngramServer::new(pool, Arc::new(FakeEmbedder::new()))
+        EngramServer::new(pool, Arc::new(FakeEmbedder::new()), None)
     }
 
     #[sqlx::test(migrations = "../../migrations")]
@@ -543,7 +594,7 @@ mod tests {
                 query: "tcgplayer".into(),
                 scope: None,
                 limit: None,
-                recency_half_life_days: None,
+                recency_half_life_days: None, rerank: None, candidate_pool: None,
             }))
             .await
             .unwrap();
@@ -682,7 +733,7 @@ mod tests {
                 query: "pgvector".to_string(),
                 scope: None,
                 limit: None,
-                recency_half_life_days: Some(0.0),
+                recency_half_life_days: Some(0.0), rerank: None, candidate_pool: None,
             }))
             .await
             .unwrap();

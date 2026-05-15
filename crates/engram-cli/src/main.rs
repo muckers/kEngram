@@ -8,7 +8,9 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
 use engram_core::{Embedder, EmbeddingModel, Extractor};
-use engram_embed::{OpenAICompatibleConfig, OpenAICompatibleEmbedder};
+use engram_embed::{
+    OpenAICompatibleConfig, OpenAICompatibleEmbedder, Reranker, TeiReranker, TeiRerankerConfig,
+};
 use engram_extract::{
     OpenAICompatibleConfig as ExtractorConfigBuilder, OpenAICompatibleExtractor,
 };
@@ -20,7 +22,7 @@ use sqlx::postgres::PgPoolOptions;
 use tokio_cron_scheduler::{Job, JobScheduler};
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{Config, EmbedderConfig, ExtractorConfig, WorkerConfig};
+use crate::config::{Config, EmbedderConfig, ExtractorConfig, RerankerConfig, WorkerConfig};
 
 #[derive(Parser, Debug)]
 #[command(name = "engram", version, about = "Self-hosted MCP-native memory service")]
@@ -107,6 +109,37 @@ fn build_embedder(c: &EmbedderConfig) -> anyhow::Result<Arc<dyn Embedder>> {
     }
 }
 
+/// Build the reranker per `[reranker]` config. Returns `None` when the
+/// provider is empty (the silent-disable sentinel), so the search pipeline
+/// falls through to the Phase B step 1 RRF + recency pipeline without
+/// erroring. Logs the resolved config at INFO level — startup-config
+/// observability convention from Phase A (commit 1d627e4).
+fn build_reranker(c: &RerankerConfig) -> anyhow::Result<Option<Arc<dyn Reranker>>> {
+    if c.provider.is_empty() {
+        tracing::info!("reranker: not configured (rerank stage disabled)");
+        return Ok(None);
+    }
+    match c.provider.as_str() {
+        "tei" => {
+            let reranker = TeiReranker::new(TeiRerankerConfig {
+                endpoint: c.endpoint.clone(),
+                model_id: c.model_id.clone(),
+                timeout: Duration::from_secs(c.timeout_seconds),
+            })
+            .with_context(|| format!("constructing reranker for endpoint {}", c.endpoint))?;
+            tracing::info!(
+                provider = %c.provider,
+                endpoint = %c.endpoint,
+                model_id = %c.model_id,
+                timeout_seconds = c.timeout_seconds,
+                "reranker: resolved config",
+            );
+            Ok(Some(Arc::new(reranker)))
+        }
+        other => anyhow::bail!("unknown reranker provider: {other:?} (valid: 'tei' or empty)"),
+    }
+}
+
 fn build_extractor(c: &ExtractorConfig) -> anyhow::Result<Arc<dyn Extractor>> {
     // Resolve the system prompt: bundled by default; load from a file when
     // `system_prompt_file` is set. The path is anyhow-context'd so errors
@@ -158,6 +191,7 @@ async fn run_serve(config: Config) -> anyhow::Result<()> {
         .with_context(|| format!("connecting to {}", config.database.url))?;
 
     let embedder = build_embedder(&config.embedder)?;
+    let reranker = build_reranker(&config.reranker)?;
 
     let bind: SocketAddr = config
         .server
@@ -167,7 +201,14 @@ async fn run_serve(config: Config) -> anyhow::Result<()> {
 
     let pool_for_factory = pool.clone();
     let embedder_for_factory = embedder.clone();
-    let factory = move || Ok(EngramServer::new(pool_for_factory.clone(), embedder_for_factory.clone()));
+    let reranker_for_factory = reranker.clone();
+    let factory = move || {
+        Ok(EngramServer::new(
+            pool_for_factory.clone(),
+            embedder_for_factory.clone(),
+            reranker_for_factory.clone(),
+        ))
+    };
 
     let cancel = CancellationToken::new();
     // Stateless mode (allowed by MCP Streamable HTTP spec 2025-06-18 for

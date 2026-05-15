@@ -44,6 +44,36 @@ curl http://localhost:11434/v1/embeddings \
 # expect: 1024
 ```
 
+### 3b. (Optional) Start TEI for the rerank stage
+
+The M3 Phase B step 2 cross-encoder reranker runs in a TEI Docker container alongside Postgres. It's optional — `engram serve` works without it (the search pipeline silently skips the rerank stage when no `[reranker]` section is configured).
+
+```bash
+docker compose up -d tei
+# First boot downloads ~600 MB (BAAI/bge-reranker-v2-m3); subsequent boots
+# are warm. The healthcheck has a 60s start_period to accommodate.
+
+docker compose ps tei
+# STATUS should reach "healthy"
+```
+
+Smoke:
+
+```bash
+curl -s http://localhost:8080/health | jq .
+# expect: {"status": "ok"} or similar
+
+curl -s http://localhost:8080/rerank \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"reproducibility","texts":["Nix is reproducible","Redis is fast","Bazel is powerful"]}' \
+  | jq .
+# expect: array of {"index": i, "score": s} sorted by score desc
+```
+
+Then add a `[reranker]` section to your `engram.toml` (see Configuration below) and `engram serve`'s startup log will show `reranker: resolved config`.
+
+The Apple Silicon variant of the image (`cpu-arm64-latest`) is what's pinned in `docker-compose.yml`. Production deployments use TEI as a systemd-managed sidecar, not Docker — same HTTP interface either way.
+
 ### 4. Run migrations
 
 ```bash
@@ -174,6 +204,12 @@ scope_filter = ""                        # leave blank for all scopes
 max_thoughts_per_run = 1000
 max_facts_per_thought = 8
 review_queue_below = 0.7                 # confidence below → facts_review_queue; ≥ → facts
+
+[reranker]                               # M3 Phase B step 2; opt-in
+provider = "tei"                         # "" = disabled (default); "tei" = TEI sidecar
+endpoint = "http://localhost:8080"       # no /v1 suffix; reranker appends /rerank
+model_id = "BAAI/bge-reranker-v2-m3"
+timeout_seconds = 30
 ```
 
 Env override examples: `ENGRAM_WORKER__TICK_INTERVAL_SECONDS=2 cargo run --bin engram -- worker` (snappier ticks for development), `ENGRAM_REFLECTOR__ENABLED=true ENGRAM_REFLECTOR__SCHEDULE="*/30 * * * * *"` (every 30 seconds — useful for live dogfood), `ENGRAM_EXTRACTOR__API_KEY=sk-...` (OpenRouter key without checking it into config).

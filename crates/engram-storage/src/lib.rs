@@ -332,17 +332,15 @@ pub async fn search_trigram(
 
     rows.into_iter()
         .map(|r| {
-            Ok(Hit {
-                thought: Thought {
-                    id: ThoughtId::from(r.id),
-                    scope: Scope::new(r.scope)?,
-                    content: r.content,
-                    source: Source::new(r.source)?,
-                    created_at: r.created_at,
-                    metadata: Metadata::from(r.metadata),
-                },
-                score: r.sim,
-            })
+            let thought = Thought {
+                id: ThoughtId::from(r.id),
+                scope: Scope::new(r.scope)?,
+                content: r.content,
+                source: Source::new(r.source)?,
+                created_at: r.created_at,
+                metadata: Metadata::from(r.metadata),
+            };
+            Ok(Hit::from_trigram_leg(thought, r.sim))
         })
         .collect()
 }
@@ -812,16 +810,32 @@ pub async fn insert_review_queue_row(
 
 // -- M2 Phase D: facts read surface (search, fetch, supersede, rerun) -------
 
-/// A trigram-search hit on `facts`, enriched with source-thought fields per
+/// A search hit on `facts`, enriched with source-thought fields per
 /// m2-facts-pipeline.md Q12 (the agent should be able to make sense of a
-/// fact without a follow-up `get_thought` call).
+/// fact without a follow-up `get_thought` call). Per-leg score fields
+/// added M3 Phase B step 2 — see `engram_core::search::Hit` for the same
+/// semantics on the thought-side hit.
 #[derive(Debug, Clone)]
 pub struct FactHit {
     pub fact: Fact,
     pub source_thought_content: String,
     pub source_thought_scope: Scope,
     pub source_thought_created_at: OffsetDateTime,
+    /// Final score after the pipeline (RRF aggregate → optional recency
+    /// boost → optional rerank). Consumers sorting by `score` get the
+    /// final-stage ordering.
     pub score: f32,
+    /// Raw cosine similarity from the vector leg. `None` when the hit did
+    /// not match in the vector leg (trigram-only match or vector
+    /// unavailable).
+    pub vector_score: Option<f32>,
+    /// Raw `word_similarity` from the trigram leg. `None` when the hit did
+    /// not match in the trigram leg.
+    pub trigram_score: Option<f32>,
+    /// Calibrated absolute score from the cross-encoder reranker. `None`
+    /// when rerank was off, no reranker was configured, or the hit fell
+    /// outside the reranked candidate pool.
+    pub rerank_score: Option<f32>,
 }
 
 // Column unpacking helper shared across the read-side facts queries. The
@@ -937,6 +951,9 @@ pub async fn search_facts_trigram(
                 source_thought_scope: Scope::new(r.source_thought_scope)?,
                 source_thought_created_at: r.source_thought_created_at,
                 score: r.sim,
+                vector_score: None,
+                trigram_score: Some(r.sim),
+                rerank_score: None,
             })
         })
         .collect()
@@ -1285,17 +1302,15 @@ pub async fn search_vector_knn(
         .map(|r| {
             // cosine distance ∈ [0, 2]; convert to similarity ∈ [-1, 1] (typically [0, 1]).
             let score = (1.0 - r.distance) as f32;
-            Ok(Hit {
-                thought: Thought {
-                    id: ThoughtId::from(r.id),
-                    scope: Scope::new(r.scope)?,
-                    content: r.content,
-                    source: Source::new(r.source)?,
-                    created_at: r.created_at,
-                    metadata: Metadata::from(r.metadata),
-                },
-                score,
-            })
+            let thought = Thought {
+                id: ThoughtId::from(r.id),
+                scope: Scope::new(r.scope)?,
+                content: r.content,
+                source: Source::new(r.source)?,
+                created_at: r.created_at,
+                metadata: Metadata::from(r.metadata),
+            };
+            Ok(Hit::from_vector_leg(thought, score))
         })
         .collect()
 }
@@ -1386,6 +1401,9 @@ pub async fn search_facts_vector_knn(
                 source_thought_scope: Scope::new(r.source_thought_scope)?,
                 source_thought_created_at: r.source_thought_created_at,
                 score,
+                vector_score: Some(score),
+                trigram_score: None,
+                rerank_score: None,
             })
         })
         .collect()
