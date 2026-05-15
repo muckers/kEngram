@@ -69,11 +69,13 @@ End state: facts have embeddings flowing through the same async-embedding seam a
 - [x] `cargo test --workspace`: 244 passing (235 today + 9 new).
 - [x] `cargo clippy --all-targets -- -D warnings`: clean.
 
-**Operator-driven (post-merge):**
+**Operator-driven (post-merge, verified 2026-05-15):**
 
-- [ ] `engram embed-backfill --target facts --limit 1000` once against the live DB to backfill pre-Phase-B facts.
-- [ ] Capture a thought; wait for reflector tick; verify via psql that `embeddings WHERE target_kind = 'fact'` grew by the right amount.
-- [ ] MCP `search_facts` with a query that has zero token overlap with any fact's statement but is semantically related — confirm hits come back from the vector leg.
+- [x] `engram embed-backfill --target facts --limit 1000` against the live DB: **97 healed / 97 embedded / 0 failed**. Post-backfill DB state: `embeddings` table holds 97 fact rows + 13 thought rows; `facts WHERE superseded_at IS NULL` count = 97 (perfect 1:1 match).
+- [x] MCP `search_facts` with a query that has zero token overlap with any fact's statement but is semantically related (probe 1, Claude Desktop): vector leg returned the semantically-related fact. **Step 1 success criterion met.**
+- 🔬 Two quality-of-results observations from Claude Desktop's dogfood (*not step-1 blockers*; folded into M3 backlog):
+  - **RRF score compression.** Top-of-list scores hover at 0.015–0.016 across both highly-relevant and weakly-related facts. This is design-correct RRF behavior: `score = Σ 1/(60 + rank_i)` discards absolute leg scores, so the *maximum possible* RRF score is `2/61 ≈ 0.033` for a doc top-1 in both legs. Consumer-facing implication captured as a new "surface per-leg scores in search response shape" backlog item in `m3-search-quality.md`.
+  - **Probe 2 ranking anomaly.** Query "tooling for compiling codebases reproducibly" ranked Redis above Bazel; the Nix-reproducibility fact didn't surface. *Direct motivation* for Phase B step 2's cross-encoder reranker, which produces calibrated absolute relevance scores. Noted as a concrete regression target on step 2.
 
 ### Step 2 — Cross-encoder reranker + rerank stage
 
@@ -115,6 +117,8 @@ Not yet planned. Items:
 Dated notes appended as items land. Format: `YYYY-MM-DD — <one-line summary>`. Multi-line entries fine for decisions that need explanation.
 
 <!-- Most recent entry first. -->
+
+- **2026-05-15** — **Phase B step 1 dogfood verification.** Claude Desktop ran qualitative probes against the live corpus (97 facts, freshly backfilled). Probe 1 verified the vector leg is doing real work: a statement-token-disjoint query returned the semantically-related fact — impossible via trigram. **Step 1 success criterion met; signing off.** Two observations folded into the M3 forward-looking backlog (`m3-search-quality.md`): (a) RRF score compression at 0.015–0.016 — design-correct, not a bug; added a new "surface per-leg scores in search response shape" backlog item for consumer thresholding; (b) probe 2 ranked Redis above Bazel for "tooling for compiling codebases reproducibly", with Nix-reproducibility missing entirely — annotated step 2 (cross-encoder reranker) with this as a concrete regression target.
 
 - **2026-05-14** — **M3 Phase B step 1 landed: fact embeddings.** Closes M2 Phase D's deferred simplification — `search_facts` now runs as real hybrid retrieval (vector + trigram fused via RRF) instead of trigram-only. Three new storage primitives (`insert_fact_embedding`, `search_facts_vector_knn`, `enqueue_unembedded_facts`), drain-side fact dispatch in `process_job` (clean match on `target_kind` between thoughts and facts; `artifact_chunk` future-proofing preserved), reflector enqueues fact embeddings via the same `enqueue_embedding(target::FACT, ...)` pattern that `capture` uses for thoughts, `search_facts` gains an `embedder` parameter + `vector_search_available` response field + an inline fact-aware RRF fuse (kept `engram-core::rrf_fuse` Hit-specific since Phase B step 1 is the only fact-fusion site so far), and `embed-backfill --target {thoughts,facts,all}` lets operators heal pre-Phase-B facts on-demand. Test count 235 → 244 (+9 new: storage +3, drain +2, reflect +1, search +2, backfill +1). Build, test, clippy all green. No migration. Next: Phase B step 2 (cross-encoder reranker + TEI Docker + rerank stage in both search tools) — its own planning conversation.
 

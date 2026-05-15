@@ -11,6 +11,8 @@ M3 absorbs those alongside the reranker. The milestone is now "everything that m
 ### Retrieval quality (the original M3)
 
 - **[L] Cross-encoder reranker** (default: BGE-reranker-v2-m3 or comparable) running in TEI's rerank-task mode — either as a second TEI instance or as a multi-task TEI deployment (TBD). The next three bullets fold into this same work increment.
+
+  **Regression target (from Phase B step 1 dogfood, 2026-05-15):** query `tooling for compiling codebases reproducibly` against the operator's live fact corpus currently ranks Redis above Bazel and misses the Nix-reproducibility facts entirely. After step 2 ships, this query should rank the Nix-reproducibility facts ("Nix is more reproducible than Bazel" / "Nix is more reproducible than Make") above Redis. The cross-encoder produces calibrated absolute relevance scores against the candidate pool — re-evaluating "compiling reproducibly" → "Nix is more reproducible…" semantically is exactly what it's designed for.
 - **Rerank stage in the search pipeline:** retrieve top-K (default 50) via RRF fusion, rerank with the cross-encoder to top-N (default 10).
 - **Configurable per-call:** `rerank: bool` (default `true`), `candidate_pool: int` (default 50).
 - **Both `search_thoughts` and `search_facts` (from M2) gain rerank support.**
@@ -72,6 +74,18 @@ M3 absorbs those alongside the reranker. The milestone is now "everything that m
   `search_facts` and `get_thought` surface `flagged` so agents can downweight or filter. **Done means**: dogfood evidence shows the middle band (`flagged = true`) is a meaningfully different population from both the review queue and the auto-commit set. If not, collapse back to two-band; the migration stays but `flagged` defaults false forever (kill-switch built in from the start).
 
 - **[S] Persist `n_extractor_failures` on `reflector_runs`.** Observability gap noted during M2 dogfood: `ReflectorReport` carries the per-thought-failure count but the persisted `reflector_runs` row only stores n_thoughts_processed / n_facts_committed / n_review_queue / error. Result: operator can't tell from the runs table alone whether "0 facts" means "no facts to find" or "extractor unreachable for every call." One-column migration; trivial reflector.rs update. **Done means**: after a run with mixed successes and failures, `SELECT n_thoughts_processed, n_facts_committed, n_extractor_failures FROM reflector_runs ORDER BY started_at DESC LIMIT 1;` shows the split, and the operator can distinguish "no facts found" (0 failures) from "extractor was unreachable" (N failures, N processed) without reading the log.
+
+- **[S] Surface per-leg scores in search response shape** *(surfaced 2026-05-15 during Phase B step 1 dogfood)*. The current `score` field on `SearchHit` / `SearchFactHit` is the RRF-fused score, which is rank-based by construction (`Σ 1/(60 + rank_i)`) — top-of-both-legs caps at `2/61 ≈ 0.033`. Consumers building thresholding logic ("only show hits above similarity X") find this score uninformative because it's calibrated against rank order, not semantic distance. Raw per-leg scores would be more actionable.
+
+  **Proposed shape** (additive; existing `score` stays for back-compat):
+  ```json
+  {
+    "score": 0.0164,           // RRF fused (unchanged)
+    "vector_score": 0.78,      // raw cosine similarity, or null when vector leg unavailable
+    "trigram_score": 0.42      // raw word_similarity, or null when not matched
+  }
+  ```
+  Implementation surface: thread per-leg scores through `Hit` / `FactHit` (engram-storage) → `SearchHit` / `SearchFactHit` (engram-mcp/search) → JSON serializer (engram-mcp/server). The data already exists pre-fusion in the storage layer's per-leg `score` field; we just stop discarding it during RRF. Phase B step 2 will later add `rerank_score: Option<f32>` (calibrated absolute, from the cross-encoder) alongside these; consumers get the full picture across all three signals.
 
 - **[M] Quality-aware dedup for within-call duplicates** *(surfaced 2026-05-14 during Phase A close-out)*. The Phase A `commit_or_supersede` work correctly folds same-statement-different-triple emissions via supersession, but does so by **emission order** — the last-emitted fact wins as canonical regardless of correctness. Concrete failure case: thought `fe07320f` (Bazel/Make/Nix), the LLM emitted **two** facts with byte-identical statements "For build systems, Bazel is more powerful than Make but has a steeper learning curve":
   - fact `2472dc0c` — S=Bazel, P="is more powerful than", O=Make (**CORRECT comparative SPO**)
