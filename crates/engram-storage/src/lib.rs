@@ -6,8 +6,8 @@
 //! the way of the macro (currently: only `insert_embedding`).
 
 use engram_core::{
-    Embedding, EmbeddingModel, EmbeddingStatus, Fact, Hit, Metadata, Scope, ScopeError, Source,
-    SourceError, Thought, ThoughtId,
+    Embedding, EmbeddingModel, EmbeddingStatus, Hit, Metadata, Scope, ScopeError, Source,
+    SourceError, Tags, Thought, ThoughtId,
 };
 use sqlx::PgPool;
 use time::OffsetDateTime;
@@ -15,7 +15,10 @@ use uuid::Uuid;
 
 pub mod target {
     //! `embeddings.target_kind` enum-as-string. Matches the CHECK constraint
-    //! on the column.
+    //! on the column. The `FACT` value is preserved for migration
+    //! reversibility (Path B-OB1 dropped the facts table but left the enum
+    //! value in place so we could re-add facts without another schema
+    //! migration).
     pub const THOUGHT: &str = "thought";
     pub const ARTIFACT_CHUNK: &str = "artifact_chunk";
     pub const FACT: &str = "fact";
@@ -31,15 +34,42 @@ pub enum StorageError {
 
     #[error("invalid source decoded from database: {0}")]
     InvalidSource(#[from] SourceError),
+
+    #[error("content_fingerprint length mismatch: expected 32 bytes, got {0}")]
+    InvalidFingerprintLength(usize),
+
+    #[error("invalid tags JSON decoded from database: {0}")]
+    InvalidTags(#[from] serde_json::Error),
+}
+
+/// Convert a BYTEA `content_fingerprint` blob from the database into the
+/// 32-byte SHA-256 array on `Thought`. Returns `StorageError::InvalidFingerprintLength`
+/// if the column somehow held something other than 32 bytes (the migration
+/// backfills via `digest(content, 'sha256')` which always produces 32, but
+/// the column itself is just BYTEA NOT NULL — no DB-level length check).
+fn fingerprint_from_bytes(bytes: Vec<u8>) -> Result<[u8; 32], StorageError> {
+    let len = bytes.len();
+    bytes
+        .try_into()
+        .map_err(|_| StorageError::InvalidFingerprintLength(len))
+}
+
+/// Decode the `tags` JSONB column into the typed `Tags` struct.
+fn tags_from_value(value: serde_json::Value) -> Result<Tags, StorageError> {
+    Ok(serde_json::from_value(value)?)
 }
 
 /// Inputs for inserting a new thought. Borrowing keeps the call cheap.
+/// `content_fingerprint` is the SHA-256 of `content`; callers compute it
+/// (the MCP capture layer does this so it can also dedup before round-tripping
+/// to the DB).
 #[derive(Debug, Clone, Copy)]
 pub struct NewThought<'a> {
     pub scope: &'a Scope,
     pub content: &'a str,
     pub source: &'a Source,
     pub metadata: &'a Metadata,
+    pub content_fingerprint: [u8; 32],
 }
 
 /// What the DB tells us after a thought is inserted.
@@ -49,32 +79,70 @@ pub struct InsertedThought {
     pub created_at: OffsetDateTime,
 }
 
-/// Insert a thought. The database generates `id` and `created_at`.
+/// Insert a thought. The database generates `id` and `created_at`. Returns
+/// `(InsertedThought, is_new)`:
+/// - `is_new = true`: a fresh row was inserted; caller should enqueue
+///   embedding + tag jobs.
+/// - `is_new = false`: a row with the same `content_fingerprint` already
+///   exists; the returned `id` + `created_at` belong to that existing row;
+///   no new jobs should be enqueued.
+///
+/// Implementation: `INSERT ... ON CONFLICT (content_fingerprint) DO NOTHING
+/// RETURNING ...`. On conflict no row is returned, so we fall through to a
+/// SELECT by fingerprint to fetch the existing row.
 pub async fn insert_thought(
     pool: &PgPool,
     t: NewThought<'_>,
-) -> Result<InsertedThought, StorageError> {
-    let row = sqlx::query!(
+) -> Result<(InsertedThought, bool), StorageError> {
+    let fingerprint: &[u8] = &t.content_fingerprint;
+    let inserted = sqlx::query!(
         r#"
-        INSERT INTO thoughts (scope, content, source, metadata)
-        VALUES ($1, $2, $3, $4)
+        INSERT INTO thoughts (scope, content, source, metadata, content_fingerprint)
+        VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (content_fingerprint) DO NOTHING
         RETURNING id, created_at
         "#,
         t.scope.as_str(),
         t.content,
         t.source.as_str(),
         t.metadata.as_value(),
+        fingerprint,
+    )
+    .fetch_optional(pool)
+    .await?;
+
+    if let Some(row) = inserted {
+        return Ok((
+            InsertedThought {
+                id: ThoughtId::from(row.id),
+                created_at: row.created_at,
+            },
+            true,
+        ));
+    }
+
+    // Fingerprint collision: fetch the existing row.
+    let existing = sqlx::query!(
+        r#"
+        SELECT id, created_at
+        FROM thoughts
+        WHERE content_fingerprint = $1
+        "#,
+        fingerprint,
     )
     .fetch_one(pool)
     .await?;
 
-    Ok(InsertedThought {
-        id: ThoughtId::from(row.id),
-        created_at: row.created_at,
-    })
+    Ok((
+        InsertedThought {
+            id: ThoughtId::from(existing.id),
+            created_at: existing.created_at,
+        },
+        false,
+    ))
 }
 
-/// Insert an embedding row tied to some target (thought / artifact_chunk / fact).
+/// Insert an embedding row tied to some target (thought / artifact_chunk).
 ///
 /// Uses `sqlx::query` (runtime-checked) rather than the macro because pgvector's
 /// `Vector` type is awkward to bind through `query!` — the macro can't infer
@@ -88,10 +156,6 @@ pub async fn insert_embedding(
     vector: Vec<f32>,
 ) -> Result<(), StorageError> {
     let pgv = pgvector::Vector::from(vector);
-    // ON CONFLICT DO NOTHING: makes the insert idempotent under M2-style worker
-    // replay (worker crashes after this insert but before `mark_embedded` →
-    // next tick re-claims, re-embeds, and re-inserts; the UNIQUE constraint
-    // would otherwise reject the duplicate).
     sqlx::query(
         r#"
         INSERT INTO embeddings (target_kind, target_id, model_id, model_version, vector)
@@ -102,7 +166,7 @@ pub async fn insert_embedding(
     .bind(target_kind)
     .bind(target_id)
     .bind(&model.id)
-    .bind(1_i32) // model_version: bumped only when the same model_id changes its meaning
+    .bind(1_i32)
     .bind(pgv)
     .execute(pool)
     .await?;
@@ -126,24 +190,6 @@ pub async fn insert_thought_embedding(
     .await
 }
 
-/// Convenience: insert an embedding tied to a fact. Facts have no newtype
-/// id (unlike thoughts), so this takes a raw `Uuid`. Same ON CONFLICT DO
-/// NOTHING idempotency under M2-style worker replay.
-pub async fn insert_fact_embedding(
-    pool: &PgPool,
-    fact_id: Uuid,
-    embedding: &Embedding,
-) -> Result<(), StorageError> {
-    insert_embedding(
-        pool,
-        target::FACT,
-        fact_id,
-        &embedding.model,
-        embedding.vector.clone(),
-    )
-    .await
-}
-
 /// Look up a thought by id. Returns `None` if not found.
 pub async fn fetch_thought(
     pool: &PgPool,
@@ -151,7 +197,9 @@ pub async fn fetch_thought(
 ) -> Result<Option<Thought>, StorageError> {
     let row = sqlx::query!(
         r#"
-        SELECT id, scope, content, source, created_at, metadata
+        SELECT id, scope, content, source, created_at, metadata,
+               content_fingerprint, tags,
+               tags_extractor_model, tags_extractor_version, tags_extracted_at
         FROM thoughts
         WHERE id = $1
         "#,
@@ -171,6 +219,11 @@ pub async fn fetch_thought(
         source: Source::new(r.source)?,
         created_at: r.created_at,
         metadata: Metadata::from(r.metadata),
+        content_fingerprint: fingerprint_from_bytes(r.content_fingerprint)?,
+        tags: tags_from_value(r.tags)?,
+        tags_extractor_model: r.tags_extractor_model,
+        tags_extractor_version: r.tags_extractor_version,
+        tags_extracted_at: r.tags_extracted_at,
     }))
 }
 
@@ -204,10 +257,8 @@ pub struct ThoughtWithProvenance {
     pub embedded_at: Option<OffsetDateTime>,
     /// `Some(_)` when the operator has marked this thought as untrusted via
     /// `retract_thought`. Retracted thoughts are excluded from retrieval
-    /// (`search_thoughts`, `recent_thoughts`, `search_facts`) and from the
-    /// reflector's extraction set (`find_unfacted_thoughts`,
-    /// `find_facted_thoughts`); their derived facts are auto-superseded as
-    /// part of the retraction tx.
+    /// (`search_thoughts`, `recent_thoughts`); `get_thought` is the audit
+    /// path and continues to return the row regardless of retraction state.
     pub retracted_at: Option<OffsetDateTime>,
     pub retracted_reason: Option<String>,
 }
@@ -221,6 +272,8 @@ pub async fn fetch_thought_with_provenance(
     let row = sqlx::query!(
         r#"
         SELECT t.id, t.scope, t.content, t.source, t.created_at, t.metadata,
+               t.content_fingerprint, t.tags,
+               t.tags_extractor_model, t.tags_extractor_version, t.tags_extracted_at,
                t.retracted_at, t.retracted_reason,
                e.created_at AS "embedded_at?"
         FROM thoughts t
@@ -247,6 +300,11 @@ pub async fn fetch_thought_with_provenance(
         source: Source::new(r.source)?,
         created_at: r.created_at,
         metadata: Metadata::from(r.metadata),
+        content_fingerprint: fingerprint_from_bytes(r.content_fingerprint)?,
+        tags: tags_from_value(r.tags)?,
+        tags_extractor_model: r.tags_extractor_model,
+        tags_extractor_version: r.tags_extractor_version,
+        tags_extracted_at: r.tags_extracted_at,
     };
 
     let embedding_status = if r.embedded_at.is_some() {
@@ -272,7 +330,9 @@ pub async fn recent_thoughts(
 ) -> Result<Vec<Thought>, StorageError> {
     let rows = sqlx::query!(
         r#"
-        SELECT id, scope, content, source, created_at, metadata
+        SELECT id, scope, content, source, created_at, metadata,
+               content_fingerprint, tags,
+               tags_extractor_model, tags_extractor_version, tags_extracted_at
         FROM thoughts
         WHERE ($1::text IS NULL OR scope = $1)
           AND retracted_at IS NULL
@@ -294,18 +354,19 @@ pub async fn recent_thoughts(
                 source: Source::new(r.source)?,
                 created_at: r.created_at,
                 metadata: Metadata::from(r.metadata),
+                content_fingerprint: fingerprint_from_bytes(r.content_fingerprint)?,
+                tags: tags_from_value(r.tags)?,
+                tags_extractor_model: r.tags_extractor_model,
+                tags_extractor_version: r.tags_extractor_version,
+                tags_extracted_at: r.tags_extracted_at,
             })
         })
         .collect()
 }
 
 /// Trigram-similarity search over `thoughts.content`. Hits are returned in
-/// descending order of `similarity(content, query)` and filtered to a
-/// minimum similarity of 0.1 — much lower than the default `pg_trgm.%`
-/// threshold of 0.3, which is too strict for "user typed a short word
-/// hoping to find it inside a long thought." At M1 volumes (low hundreds
-/// of thoughts) the sequential scan is fast; once data grows we can switch
-/// to an index-friendly `ORDER BY content <-> $1 LIMIT N` shape.
+/// descending order of `similarity(content, query)` and filtered to a minimum
+/// similarity of 0.1.
 pub async fn search_trigram(
     pool: &PgPool,
     query: &str,
@@ -315,6 +376,8 @@ pub async fn search_trigram(
     let rows = sqlx::query!(
         r#"
         SELECT id, scope, content, source, created_at, metadata,
+               content_fingerprint, tags,
+               tags_extractor_model, tags_extractor_version, tags_extracted_at,
                similarity(content, $1) AS "sim!: f32"
         FROM thoughts
         WHERE similarity(content, $1) > 0.1
@@ -339,6 +402,11 @@ pub async fn search_trigram(
                 source: Source::new(r.source)?,
                 created_at: r.created_at,
                 metadata: Metadata::from(r.metadata),
+                content_fingerprint: fingerprint_from_bytes(r.content_fingerprint)?,
+                tags: tags_from_value(r.tags)?,
+                tags_extractor_model: r.tags_extractor_model,
+                tags_extractor_version: r.tags_extractor_version,
+                tags_extracted_at: r.tags_extracted_at,
             };
             Ok(Hit::from_trigram_leg(thought, r.sim))
         })
@@ -355,7 +423,9 @@ pub async fn find_unembedded_thoughts(
 ) -> Result<Vec<Thought>, StorageError> {
     let rows = sqlx::query!(
         r#"
-        SELECT t.id, t.scope, t.content, t.source, t.created_at, t.metadata
+        SELECT t.id, t.scope, t.content, t.source, t.created_at, t.metadata,
+               t.content_fingerprint, t.tags,
+               t.tags_extractor_model, t.tags_extractor_version, t.tags_extracted_at
         FROM thoughts t
         LEFT JOIN embeddings e
             ON e.target_kind = 'thought'
@@ -383,14 +453,17 @@ pub async fn find_unembedded_thoughts(
                 source: Source::new(r.source)?,
                 created_at: r.created_at,
                 metadata: Metadata::from(r.metadata),
+                content_fingerprint: fingerprint_from_bytes(r.content_fingerprint)?,
+                tags: tags_from_value(r.tags)?,
+                tags_extractor_model: r.tags_extractor_model,
+                tags_extractor_version: r.tags_extractor_version,
+                tags_extracted_at: r.tags_extracted_at,
             })
         })
         .collect()
 }
 
 /// A row pulled off the `pending_embeddings` queue by `claim_pending`.
-/// `attempts` is the *new* attempt count (post-bump): a job freshly claimed
-/// for its first attempt returns `attempts = 1`.
 #[derive(Debug, Clone)]
 pub struct PendingJob {
     pub id: Uuid,
@@ -401,10 +474,6 @@ pub struct PendingJob {
 }
 
 /// Enqueue a target for embedding by the worker.
-///
-/// Idempotent: the UNIQUE `(target_kind, target_id, model_id)` constraint on
-/// `pending_embeddings` (migration 0002) means a duplicate enqueue is a no-op.
-/// Returns `true` if a new row was inserted, `false` if the row already existed.
 pub async fn enqueue_embedding(
     pool: &PgPool,
     target_kind: &str,
@@ -426,13 +495,7 @@ pub async fn enqueue_embedding(
     Ok(result.rows_affected() > 0)
 }
 
-/// Atomically claim up to `batch_size` pending jobs, oldest first, bumping
-/// `attempts` and `last_attempt_at` on each.
-///
-/// The inner `SELECT ... FOR UPDATE SKIP LOCKED` is the canonical Postgres
-/// pattern for a competing-consumers queue: rows already locked by another
-/// transaction are skipped, so concurrent workers see disjoint claims. Locks
-/// release at statement commit; no long-held transaction is required.
+/// Atomically claim up to `batch_size` pending embedding jobs.
 pub async fn claim_pending(
     pool: &PgPool,
     batch_size: i64,
@@ -478,9 +541,7 @@ pub async fn mark_embedded(pool: &PgPool, pending_id: Uuid) -> Result<(), Storag
     Ok(())
 }
 
-/// Record a failure for a claimed job. The row stays in the queue (so the
-/// next tick re-claims it); `last_error` captures why this attempt failed.
-/// `attempts` is *not* bumped here — `claim_pending` already bumped it.
+/// Record a failure for a claimed job.
 pub async fn mark_failed(
     pool: &PgPool,
     pending_id: Uuid,
@@ -496,14 +557,7 @@ pub async fn mark_failed(
     Ok(())
 }
 
-/// Heal-step companion to the worker: enqueue every unembedded thought (for
-/// the given model and optional scope) that doesn't already have a queue row.
-/// Used by `engram embed-backfill` to catch pre-M2 thoughts (captured before
-/// the queue existed) and any thought that slipped through a server crash
-/// between `insert_thought` and `enqueue_embedding`.
-///
-/// `ON CONFLICT DO NOTHING` keeps it idempotent even when the queue already
-/// has entries for some of the thoughts in the LEFT-JOIN set.
+/// Heal-step companion to the worker: enqueue every unembedded thought.
 pub async fn enqueue_unembedded_thoughts(
     pool: &PgPool,
     model_id: &str,
@@ -535,50 +589,8 @@ pub async fn enqueue_unembedded_thoughts(
     Ok(result.rows_affected() as usize)
 }
 
-/// Heal-side companion to `enqueue_unembedded_thoughts`: enqueues any
-/// `facts` row that lacks an `embeddings` entry for `model_id`. Skips
-/// superseded facts and facts whose source thought has been retracted —
-/// the same active-row invariants that govern retrieval.
-///
-/// Used by `engram embed-backfill --target facts` to catch pre-M3-Phase-B
-/// facts (committed before the fact-embedding seam existed) and any fact
-/// that slipped through a crash between `insert_fact` and `enqueue_embedding`.
-pub async fn enqueue_unembedded_facts(
-    pool: &PgPool,
-    model_id: &str,
-    scope: Option<&str>,
-    limit: i64,
-) -> Result<usize, StorageError> {
-    let result = sqlx::query!(
-        r#"
-        INSERT INTO pending_embeddings (target_kind, target_id, model_id)
-        SELECT 'fact', f.id, $1
-        FROM facts f
-        JOIN thoughts t ON t.id = f.source_thought_id
-        LEFT JOIN embeddings e
-            ON e.target_kind = 'fact'
-           AND e.target_id = f.id
-           AND e.model_id = $1
-        WHERE e.id IS NULL
-          AND f.superseded_at IS NULL
-          AND t.retracted_at IS NULL
-          AND ($2::text IS NULL OR f.scope = $2)
-        ORDER BY f.created_at ASC
-        LIMIT $3
-        ON CONFLICT (target_kind, target_id, model_id) DO NOTHING
-        "#,
-        model_id,
-        scope,
-        limit,
-    )
-    .execute(pool)
-    .await?;
-    Ok(result.rows_affected() as usize)
-}
-
-/// Total rows currently in `pending_embeddings`. Cheap (no index scan
-/// required for the small queue sizes this is meant for); intended for
-/// tests and operator-driven observability.
+/// Total rows currently in `pending_embeddings`. Cheap; intended for tests
+/// and operator-driven observability.
 pub async fn count_pending(pool: &PgPool) -> Result<i64, StorageError> {
     let row = sqlx::query!(
         r#"SELECT COUNT(*) AS "count!" FROM pending_embeddings"#
@@ -588,154 +600,196 @@ pub async fn count_pending(pool: &PgPool) -> Result<i64, StorageError> {
     Ok(row.count)
 }
 
-// -- M2 Phase C: facts pipeline (reflector_runs, facts, facts_review_queue) -
+// -- M4 Path B-OB1: thought tagging sidecar --------------------------------
 
-/// Strongly-typed wrapper around `reflector_runs.id`. Returned by
-/// `start_run`, consumed by `finish_run`, embedded in `NewFact.source_run_id`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct RunId(pub Uuid);
-
-impl RunId {
-    pub fn as_uuid(&self) -> &Uuid {
-        &self.0
-    }
-
-    pub fn into_uuid(self) -> Uuid {
-        self.0
-    }
+/// Tag-side read shape for `get_thought` — pairs the JSONB `tags` blob with
+/// its provenance columns. `tagger_model_id`/`version`/`tagged_at` are all
+/// `None` until the tag drainer has run on the thought.
+#[derive(Debug, Clone)]
+pub struct ThoughtTags {
+    pub tags: Tags,
+    pub tagger_model_id: Option<String>,
+    pub tagger_version: Option<i32>,
+    pub tagged_at: Option<OffsetDateTime>,
 }
 
-impl std::fmt::Display for RunId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
-    }
+/// A row claimed off the `pending_tags` queue. `attempts` is post-bump
+/// (a freshly claimed job returns `attempts = 1`).
+#[derive(Debug, Clone)]
+pub struct PendingTagJob {
+    pub thought_id: ThoughtId,
+    pub tagger_model_id: String,
+    pub attempts: i32,
 }
 
-/// Inputs for `insert_fact`. Borrowing keeps the call cheap; the reflector
-/// loops over many thoughts and produces many facts per run.
-#[derive(Debug, Clone, Copy)]
-pub struct NewFact<'a> {
-    pub scope: &'a Scope,
-    pub statement: &'a str,
-    pub subject: Option<&'a str>,
-    pub predicate: Option<&'a str>,
-    pub object: Option<&'a str>,
-    pub source_thought_id: ThoughtId,
-    pub extractor_model: &'a str,
-    pub extractor_version: i32,
-    pub source_run_id: Option<RunId>,
-    pub confidence: f32,
-    /// Three-band routing flag (M3 Phase C). True when
-    /// `review_queue_below ≤ confidence < min_confidence_to_store` — the
-    /// row is stored but downstream consumers may filter or de-emphasize.
-    /// False for the high-confidence band; false also for the M1/M2 default
-    /// when the caller doesn't opt into three-band routing.
-    pub flagged: bool,
-}
-
-/// Inputs for `insert_review_queue_row`. Note: review-queue rows don't carry
-/// scope — they reference the source thought, which has the scope. The
-/// `decision` column defaults to `'pending'` via the schema; this struct
-/// doesn't expose it (callers always insert pending rows; reviewers update
-/// them later via a separate path that lands in Phase D).
-#[derive(Debug, Clone, Copy)]
-pub struct NewReviewRow<'a> {
-    pub statement: &'a str,
-    pub subject: Option<&'a str>,
-    pub predicate: Option<&'a str>,
-    pub object: Option<&'a str>,
-    pub source_thought_id: ThoughtId,
-    pub extractor_model: &'a str,
-    pub extractor_version: i32,
-    pub source_run_id: Option<RunId>,
-    pub confidence: f32,
-}
-
-/// Open a reflector run. Returns the new `RunId`. `started_at` defaults to
-/// NOW(); the counts default to 0 and are bumped by `finish_run`.
-pub async fn start_run(
+/// Overwrite a thought's tags + tag provenance. Called by the tag drainer
+/// after a successful `tagger.tag()` call. Updates `tags_extracted_at` to
+/// NOW(); no supersede semantics — tags are advisory and re-derivable.
+pub async fn update_thought_tags(
     pool: &PgPool,
-    extractor_model: &str,
-    extractor_version: i32,
-    scope_filter: Option<&str>,
-) -> Result<RunId, StorageError> {
-    let row = sqlx::query!(
-        r#"
-        INSERT INTO reflector_runs (extractor_model, extractor_version, scope_filter)
-        VALUES ($1, $2, $3)
-        RETURNING id
-        "#,
-        extractor_model,
-        extractor_version,
-        scope_filter,
-    )
-    .fetch_one(pool)
-    .await?;
-    Ok(RunId(row.id))
-}
-
-/// Close out a reflector run with final counts. `error` is `Some(_)` only
-/// when the run itself errored at the orchestrator level (per-thought
-/// extractor failures are counted via `n_thoughts_processed` minus committed
-/// + review, and don't populate `error`).
-pub async fn finish_run(
-    pool: &PgPool,
-    run_id: RunId,
-    n_processed: i32,
-    n_committed: i32,
-    n_review: i32,
-    n_failures: i32,
-    error: Option<&str>,
+    thought_id: ThoughtId,
+    tags: &Tags,
+    tagger_model_id: &str,
+    tagger_version: i32,
 ) -> Result<(), StorageError> {
+    let tags_value = serde_json::to_value(tags)?;
     sqlx::query!(
         r#"
-        UPDATE reflector_runs
-        SET finished_at = NOW(),
-            n_thoughts_processed = $2,
-            n_facts_committed = $3,
-            n_review_queue = $4,
-            n_extractor_failures = $5,
-            error = $6
+        UPDATE thoughts
+        SET tags = $2,
+            tags_extractor_model = $3,
+            tags_extractor_version = $4,
+            tags_extracted_at = NOW()
         WHERE id = $1
         "#,
-        run_id.0,
-        n_processed,
-        n_committed,
-        n_review,
-        n_failures,
-        error,
+        thought_id.into_uuid(),
+        tags_value,
+        tagger_model_id,
+        tagger_version,
     )
     .execute(pool)
     .await?;
     Ok(())
 }
 
-/// Find thoughts that don't yet have any row in `facts` pointing at them.
-/// Oldest first — reflector should drain the backlog FIFO.
-///
-/// A thought whose facts have all been *superseded* still has rows in
-/// `facts` (with `superseded_at` set), so it's correctly excluded by this
-/// query — re-extracting a corrected thought would defeat the operator's
-/// correction. Phase D's `engram reflect --rerun` will use a different
-/// query for the explicit-rerun case.
-pub async fn find_unfacted_thoughts(
+/// Enqueue a thought for the tag drainer. Idempotent on `thought_id`
+/// conflict — re-enqueuing the same thought is a no-op.
+pub async fn enqueue_tag_job(
     pool: &PgPool,
+    thought_id: ThoughtId,
+    tagger_model_id: &str,
+) -> Result<bool, StorageError> {
+    let result = sqlx::query!(
+        r#"
+        INSERT INTO pending_tags (thought_id, tagger_model_id)
+        VALUES ($1, $2)
+        ON CONFLICT (thought_id) DO NOTHING
+        "#,
+        thought_id.into_uuid(),
+        tagger_model_id,
+    )
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// Read just the tag block for a thought. Returns `None` if the thought
+/// doesn't exist. Used by `get_thought` to enrich its provenance section.
+pub async fn fetch_thought_tags(
+    pool: &PgPool,
+    thought_id: ThoughtId,
+) -> Result<Option<ThoughtTags>, StorageError> {
+    let row = sqlx::query!(
+        r#"
+        SELECT tags, tags_extractor_model, tags_extractor_version, tags_extracted_at
+        FROM thoughts
+        WHERE id = $1
+        "#,
+        thought_id.into_uuid(),
+    )
+    .fetch_optional(pool)
+    .await?;
+    let Some(r) = row else {
+        return Ok(None);
+    };
+    Ok(Some(ThoughtTags {
+        tags: tags_from_value(r.tags)?,
+        tagger_model_id: r.tags_extractor_model,
+        tagger_version: r.tags_extractor_version,
+        tagged_at: r.tags_extracted_at,
+    }))
+}
+
+/// Fetch up to `batch_size` pending tag jobs, oldest first. Does NOT
+/// claim/lock — the drainer is single-process at v1 and pops one batch at
+/// a time, calling `complete_tag_job` or `increment_tag_job_attempts` per
+/// job. If/when we want competing-consumers semantics for tags, replicate
+/// `claim_pending`'s `FOR UPDATE SKIP LOCKED` shape here.
+pub async fn fetch_pending_tag_jobs(
+    pool: &PgPool,
+    batch_size: i64,
+) -> Result<Vec<PendingTagJob>, StorageError> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT thought_id, tagger_model_id, attempts
+        FROM pending_tags
+        ORDER BY enqueued_at ASC
+        LIMIT $1
+        "#,
+        batch_size,
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| PendingTagJob {
+            thought_id: ThoughtId::from(r.thought_id),
+            tagger_model_id: r.tagger_model_id,
+            attempts: r.attempts,
+        })
+        .collect())
+}
+
+/// Remove a tag job from the queue after a successful tagger.tag() call.
+pub async fn complete_tag_job(
+    pool: &PgPool,
+    thought_id: ThoughtId,
+) -> Result<(), StorageError> {
+    sqlx::query!(
+        r#"DELETE FROM pending_tags WHERE thought_id = $1"#,
+        thought_id.into_uuid(),
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Bump the `attempts` counter on a pending tag job after a soft failure.
+/// The job stays in the queue; the next drainer tick re-attempts.
+pub async fn increment_tag_job_attempts(
+    pool: &PgPool,
+    thought_id: ThoughtId,
+) -> Result<(), StorageError> {
+    sqlx::query!(
+        r#"UPDATE pending_tags SET attempts = attempts + 1 WHERE thought_id = $1"#,
+        thought_id.into_uuid(),
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Walk thoughts that need tagging — either never-tagged (`tags_extractor_version
+/// IS NULL`) or stale (`tags_extractor_version < target_tagger_version`, only
+/// when `rerun = true`). Oldest first. Used by `engram tag [--rerun]`.
+pub async fn find_untagged_or_stale_thoughts(
+    pool: &PgPool,
+    target_tagger_version: i32,
+    rerun: bool,
     scope: Option<&str>,
+    since: Option<OffsetDateTime>,
     limit: i64,
 ) -> Result<Vec<Thought>, StorageError> {
     let rows = sqlx::query!(
         r#"
-        SELECT t.id, t.scope, t.content, t.source, t.created_at, t.metadata
-        FROM thoughts t
-        LEFT JOIN facts f
-            ON f.source_thought_id = t.id
-        WHERE f.id IS NULL
-          AND ($1::text IS NULL OR t.scope = $1)
-          AND t.retracted_at IS NULL
-        ORDER BY t.created_at ASC
-        LIMIT $2
+        SELECT id, scope, content, source, created_at, metadata,
+               content_fingerprint, tags,
+               tags_extractor_model, tags_extractor_version, tags_extracted_at
+        FROM thoughts
+        WHERE retracted_at IS NULL
+          AND ($1::text IS NULL OR scope = $1)
+          AND ($2::timestamptz IS NULL OR created_at >= $2)
+          AND (
+              tags_extractor_version IS NULL
+              OR ($3::boolean AND tags_extractor_version < $4)
+          )
+        ORDER BY created_at ASC
+        LIMIT $5
         "#,
         scope,
+        since,
+        rerun,
+        target_tagger_version,
         limit,
     )
     .fetch_all(pool)
@@ -750,377 +804,38 @@ pub async fn find_unfacted_thoughts(
                 source: Source::new(r.source)?,
                 created_at: r.created_at,
                 metadata: Metadata::from(r.metadata),
+                content_fingerprint: fingerprint_from_bytes(r.content_fingerprint)?,
+                tags: tags_from_value(r.tags)?,
+                tags_extractor_model: r.tags_extractor_model,
+                tags_extractor_version: r.tags_extractor_version,
+                tags_extracted_at: r.tags_extracted_at,
             })
         })
         .collect()
 }
 
-/// Insert a committed fact. Returns the new row id.
-pub async fn insert_fact(pool: &PgPool, f: NewFact<'_>) -> Result<Uuid, StorageError> {
-    let row = sqlx::query!(
-        r#"
-        INSERT INTO facts (
-            scope, statement, subject, predicate, object,
-            source_thought_id, extractor_model, extractor_version,
-            source_run_id, confidence, flagged
-        )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-        RETURNING id
-        "#,
-        f.scope.as_str(),
-        f.statement,
-        f.subject,
-        f.predicate,
-        f.object,
-        f.source_thought_id.into_uuid(),
-        f.extractor_model,
-        f.extractor_version,
-        f.source_run_id.map(|r| r.0),
-        f.confidence,
-        f.flagged,
-    )
-    .fetch_one(pool)
-    .await?;
-    Ok(row.id)
-}
-
-/// Insert a low-confidence extraction into `facts_review_queue` for operator
-/// review. The `decision` column defaults to `'pending'` via the schema.
-pub async fn insert_review_queue_row(
-    pool: &PgPool,
-    r: NewReviewRow<'_>,
-) -> Result<Uuid, StorageError> {
-    let row = sqlx::query!(
-        r#"
-        INSERT INTO facts_review_queue (
-            statement, subject, predicate, object,
-            source_thought_id, extractor_model, extractor_version,
-            source_run_id, confidence
-        )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-        RETURNING id
-        "#,
-        r.statement,
-        r.subject,
-        r.predicate,
-        r.object,
-        r.source_thought_id.into_uuid(),
-        r.extractor_model,
-        r.extractor_version,
-        r.source_run_id.map(|x| x.0),
-        r.confidence,
-    )
-    .fetch_one(pool)
-    .await?;
-    Ok(row.id)
-}
-
-// -- M2 Phase D: facts read surface (search, fetch, supersede, rerun) -------
-
-/// A search hit on `facts`, enriched with source-thought fields per
-/// m2-facts-pipeline.md Q12 (the agent should be able to make sense of a
-/// fact without a follow-up `get_thought` call). Per-leg score fields
-/// added M3 Phase B step 2; unified `score` dropped M3 Phase C — see
-/// `engram_core::search::Hit` for the same shape on the thought-side hit.
-/// Consumers sort or threshold via the per-leg fields: typically
-/// `rerank_score ?? rrf_score`.
-#[derive(Debug, Clone)]
-pub struct FactHit {
-    pub fact: Fact,
-    pub source_thought_content: String,
-    pub source_thought_scope: Scope,
-    pub source_thought_created_at: OffsetDateTime,
-    /// Raw cosine similarity from the vector leg. `None` when the hit did
-    /// not match in the vector leg (trigram-only match or vector
-    /// unavailable).
-    pub vector_score: Option<f32>,
-    /// Raw `word_similarity` from the trigram leg. `None` when the hit did
-    /// not match in the trigram leg.
-    pub trigram_score: Option<f32>,
-    /// Reciprocal Rank Fusion aggregate, optionally adjusted by the
-    /// recency boost. Preserved across the rerank stage so consumers can
-    /// compare RRF-only ordering against rerank ordering without
-    /// re-running search.
-    pub rrf_score: Option<f32>,
-    /// Calibrated absolute score from the cross-encoder reranker. `None`
-    /// when rerank was off, no reranker was configured, or the hit fell
-    /// outside the reranked candidate pool.
-    pub rerank_score: Option<f32>,
-}
-
-// Column unpacking helper shared across the read-side facts queries. The
-// argument list mirrors the SELECT order; clippy's "too_many_arguments"
-// lint fires here, but adding a row struct would be net-negative ceremony.
-#[allow(clippy::too_many_arguments)]
-fn fact_from_columns(
-    id: Uuid,
-    scope: String,
-    statement: String,
-    subject: Option<String>,
-    predicate: Option<String>,
-    object: Option<String>,
-    source_thought_id: Uuid,
-    extractor_model: String,
-    extractor_version: i32,
-    source_run_id: Option<Uuid>,
-    confidence: f32,
-    flagged: bool,
-    created_at: OffsetDateTime,
-) -> Result<Fact, StorageError> {
-    Ok(Fact {
-        id,
-        scope: Scope::new(scope)?,
-        statement,
-        subject,
-        predicate,
-        object,
-        source_thought_id: ThoughtId::from(source_thought_id),
-        extractor_model,
-        extractor_version,
-        source_run_id,
-        confidence,
-        flagged,
-        created_at,
-    })
-}
-
-/// Trigram-similarity search over `facts.statement`, joined to `thoughts`
-/// for source-thought enrichment. Filters `superseded_at IS NULL` (matches
-/// the `facts_active_idx` partial index). Same min-similarity threshold
-/// (0.1) as `search_trigram` — facts are short, recall matters more than
-/// precision at the leg level (RRF fusion handles precision in the
-/// orchestrator).
-pub async fn search_facts_trigram(
-    pool: &PgPool,
-    query: &str,
-    scope: Option<&str>,
-    limit: i64,
-) -> Result<Vec<FactHit>, StorageError> {
-    // Lexical scoring concatenates statement + (subject, predicate, object)
-    // so a query whose terms only appear in the triple (e.g. `subject="Ron"`
-    // on a fact whose statement starts with "When Rust is unavailable…")
-    // still matches via the trigram leg. Empty/null triple components fall
-    // back to an empty string and contribute nothing to the score.
-    //
-    // Uses `word_similarity(query, target)` rather than the symmetric
-    // `similarity(...)` because `word_similarity` finds the best matching
-    // window of trigrams within the target — so a short query like
-    // "Ron Go" against a long concatenated text scores by the best window,
-    // not by the global trigram-set ratio (which dilutes with target length).
-    let rows = sqlx::query!(
-        r#"
-        WITH searchable AS (
-            SELECT f.*,
-                   f.statement
-                   || ' ' || COALESCE(f.subject, '')
-                   || ' ' || COALESCE(f.predicate, '')
-                   || ' ' || COALESCE(f.object, '') AS searchable_text
-            FROM facts f
-            WHERE f.superseded_at IS NULL
-              AND ($2::text IS NULL OR f.scope = $2)
-        )
-        SELECT s.id, s.scope, s.statement, s.subject, s.predicate, s.object,
-               s.source_thought_id AS "source_thought_id!",
-               s.extractor_model, s.extractor_version, s.source_run_id,
-               s.confidence, s.flagged, s.created_at,
-               t.content        AS source_thought_content,
-               t.scope          AS source_thought_scope,
-               t.created_at     AS source_thought_created_at,
-               word_similarity($1, s.searchable_text) AS "sim!: f32"
-        FROM searchable s
-        JOIN thoughts t ON t.id = s.source_thought_id
-        WHERE word_similarity($1, s.searchable_text) > 0.3
-          AND t.retracted_at IS NULL
-        ORDER BY word_similarity($1, s.searchable_text) DESC
-        LIMIT $3
-        "#,
-        query,
-        scope,
-        limit,
-    )
-    .fetch_all(pool)
-    .await?;
-
-    rows.into_iter()
-        .map(|r| {
-            let fact = fact_from_columns(
-                r.id,
-                r.scope,
-                r.statement,
-                r.subject,
-                r.predicate,
-                r.object,
-                r.source_thought_id,
-                r.extractor_model,
-                r.extractor_version,
-                r.source_run_id,
-                r.confidence,
-                r.flagged,
-                r.created_at,
-            )?;
-            Ok(FactHit {
-                fact,
-                source_thought_content: r.source_thought_content,
-                source_thought_scope: Scope::new(r.source_thought_scope)?,
-                source_thought_created_at: r.source_thought_created_at,
-                vector_score: None,
-                trigram_score: Some(r.sim),
-                rrf_score: None,
-                rerank_score: None,
-            })
-        })
-        .collect()
-}
-
-/// All active (non-superseded) facts for a thought, oldest first. Powers
-/// `get_thought`'s `linked_facts` field.
-pub async fn list_active_facts_for_thought(
-    pool: &PgPool,
-    thought_id: ThoughtId,
-) -> Result<Vec<Fact>, StorageError> {
-    let rows = sqlx::query!(
-        r#"
-        SELECT id, scope, statement, subject, predicate, object,
-               source_thought_id AS "source_thought_id!",
-               extractor_model, extractor_version, source_run_id,
-               confidence, flagged, created_at
-        FROM facts
-        WHERE source_thought_id = $1
-          AND superseded_at IS NULL
-        ORDER BY created_at ASC
-        "#,
-        thought_id.into_uuid(),
-    )
-    .fetch_all(pool)
-    .await?;
-
-    rows.into_iter()
-        .map(|r| {
-            fact_from_columns(
-                r.id,
-                r.scope,
-                r.statement,
-                r.subject,
-                r.predicate,
-                r.object,
-                r.source_thought_id,
-                r.extractor_model,
-                r.extractor_version,
-                r.source_run_id,
-                r.confidence,
-                r.flagged,
-                r.created_at,
-            )
-        })
-        .collect()
-}
-
-/// Look up a single fact by id. Returns the full row regardless of
-/// supersession state — callers (`correct_fact`) decide what to do with a
-/// superseded row.
-pub async fn fetch_fact(
-    pool: &PgPool,
-    fact_id: Uuid,
-) -> Result<Option<Fact>, StorageError> {
-    let row = sqlx::query!(
-        r#"
-        SELECT id, scope, statement, subject, predicate, object,
-               source_thought_id AS "source_thought_id!",
-               extractor_model, extractor_version, source_run_id,
-               confidence, flagged, created_at, superseded_at
-        FROM facts
-        WHERE id = $1
-        "#,
-        fact_id,
-    )
-    .fetch_optional(pool)
-    .await?;
-
-    let Some(r) = row else {
-        return Ok(None);
-    };
-    // Note: we return the row even if superseded; callers inspect their own
-    // copy of the fact for state. The `superseded_at` column itself isn't on
-    // `Fact` (Phase D doesn't surface it through the read shape) — it's an
-    // internal supersession marker.
-    let _ = r.superseded_at;
-    let fact = fact_from_columns(
-        r.id,
-        r.scope,
-        r.statement,
-        r.subject,
-        r.predicate,
-        r.object,
-        r.source_thought_id,
-        r.extractor_model,
-        r.extractor_version,
-        r.source_run_id,
-        r.confidence,
-        r.flagged,
-        r.created_at,
-    )?;
-    Ok(Some(fact))
-}
-
-/// Mark a fact as superseded. Atomic: the UPDATE only fires when the row
-/// is still active (`superseded_at IS NULL`), so a concurrent supersede
-/// loses cleanly. Returns `true` if the row was actually superseded;
-/// `false` if it was already superseded or doesn't exist.
-///
-/// `new_fact_id = None` is the "delete-by-supersede" path from
-/// m2-facts-pipeline.md — the row stays in `facts` with `superseded_at`
-/// set but no replacement pointer.
-pub async fn supersede_fact(
-    pool: &PgPool,
-    old_fact_id: Uuid,
-    new_fact_id: Option<Uuid>,
-) -> Result<bool, StorageError> {
-    let result = sqlx::query!(
-        r#"
-        UPDATE facts
-        SET superseded_by = $2, superseded_at = NOW()
-        WHERE id = $1 AND superseded_at IS NULL
-        "#,
-        old_fact_id,
-        new_fact_id,
-    )
-    .execute(pool)
-    .await?;
-    Ok(result.rows_affected() == 1)
-}
+// -- thought retraction (simplified post-M4; no fact cascade) --------------
 
 /// Result of `retract_thought`. Distinguishes "actually retracted this row"
-/// from "row didn't exist or was already retracted." The `facts_superseded`
-/// count is for operator-facing observability ("you retracted N facts as a
-/// side effect").
+/// from "row didn't exist or was already retracted." Post-M4: no more
+/// `facts_superseded` field since the facts table is gone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetractThoughtOutcome {
     pub retracted: bool,
-    pub facts_superseded: i64,
 }
 
-/// Mark a thought as retracted and auto-supersede every active fact derived
-/// from it. Atomic: both operations run in a single transaction so a crash
-/// between the UPDATEs can't leave the thought retracted with facts still
-/// live (or vice versa).
+/// Mark a thought as retracted. Retracted thoughts are excluded from
+/// retrieval (`recent_thoughts`, `search_trigram`, `search_vector_knn`);
+/// `get_thought` is the audit path and continues to return the row.
 ///
-/// Idempotent on a row that's already retracted (`retracted: false,
-/// facts_superseded: 0`); idempotent on a missing row (same shape). The
-/// caller maps that to an operator-facing error string if it wants — the
-/// storage layer just reports what it did.
-///
-/// The auto-supersede side-effect is the dogfood-driven decision: without
-/// it, the operator has to retract every derived fact one at a time, and a
-/// single missed fact keeps the source thought in the reflector's
-/// `find_facted_thoughts` set, which re-extracts under the next rerun.
-/// Tying the two together at the storage tx level closes that gap.
+/// Idempotent on a row that's already retracted (`retracted: false`);
+/// idempotent on a missing row (same shape). The caller maps that to an
+/// operator-facing error string if it wants.
 pub async fn retract_thought(
     pool: &PgPool,
     thought_id: ThoughtId,
     reason: Option<&str>,
 ) -> Result<RetractThoughtOutcome, StorageError> {
-    let mut tx = pool.begin().await?;
-
     let updated = sqlx::query!(
         r#"
         UPDATE thoughts
@@ -1130,289 +845,17 @@ pub async fn retract_thought(
         thought_id.into_uuid(),
         reason,
     )
-    .execute(&mut *tx)
+    .execute(pool)
     .await?;
 
-    if updated.rows_affected() == 0 {
-        // Either missing or already retracted; either way nothing to do.
-        tx.rollback().await?;
-        return Ok(RetractThoughtOutcome {
-            retracted: false,
-            facts_superseded: 0,
-        });
-    }
-
-    let facts = sqlx::query!(
-        r#"
-        UPDATE facts
-        SET superseded_at = NOW(), superseded_by = NULL
-        WHERE source_thought_id = $1 AND superseded_at IS NULL
-        "#,
-        thought_id.into_uuid(),
-    )
-    .execute(&mut *tx)
-    .await?;
-
-    tx.commit().await?;
     Ok(RetractThoughtOutcome {
-        retracted: true,
-        facts_superseded: facts.rows_affected() as i64,
+        retracted: updated.rows_affected() == 1,
     })
-}
-
-/// Thoughts that have at least one active (non-superseded) fact. Inverse of
-/// `find_unfacted_thoughts`. Used by `engram reflect --rerun` to re-evaluate
-/// already-facted thoughts. `since` filters by `thoughts.created_at` if
-/// provided.
-pub async fn find_facted_thoughts(
-    pool: &PgPool,
-    scope: Option<&str>,
-    since: Option<OffsetDateTime>,
-    limit: i64,
-) -> Result<Vec<Thought>, StorageError> {
-    let rows = sqlx::query!(
-        r#"
-        SELECT DISTINCT t.id, t.scope, t.content, t.source, t.created_at, t.metadata
-        FROM thoughts t
-        INNER JOIN facts f
-            ON f.source_thought_id = t.id
-           AND f.superseded_at IS NULL
-        WHERE ($1::text IS NULL OR t.scope = $1)
-          AND ($2::timestamptz IS NULL OR t.created_at >= $2)
-          AND t.retracted_at IS NULL
-        ORDER BY t.created_at ASC
-        LIMIT $3
-        "#,
-        scope,
-        since,
-        limit,
-    )
-    .fetch_all(pool)
-    .await?;
-
-    rows.into_iter()
-        .map(|r| {
-            Ok(Thought {
-                id: ThoughtId::from(r.id),
-                scope: Scope::new(r.scope)?,
-                content: r.content,
-                source: Source::new(r.source)?,
-                created_at: r.created_at,
-                metadata: Metadata::from(r.metadata),
-            })
-        })
-        .collect()
-}
-
-/// Find the active fact (if any) on this thought whose (subject, predicate,
-/// object) triple matches the given values. Uses `IS NOT DISTINCT FROM` so
-/// `NULL` vs `NULL` counts as a match (Postgres `=` returns NULL for that
-/// case). Used by `--rerun` to decide merge-vs-supersede.
-/// Returns the active facts on `thought_id` that match the proposed new fact
-/// on either of two predicates:
-///
-///   1. Exact statement match (`facts.statement = $2`), or
-///   2. Triple match via `IS NOT DISTINCT FROM` (NULL-aware) on
-///      `(subject, predicate, object)`.
-///
-/// The reflector rerun loop uses this to fold drift duplicates into a single
-/// canonical row: an LLM may produce the same statement with a different
-/// (S, P, O) decomposition on a different sampling, and either signal is
-/// enough to recognize "the same claim." Multiple rows may match if the
-/// audit table is already in a pre-existing duplicated state — callers
-/// supersede all of them.
-///
-/// Ordered by `created_at ASC` so audit consumers see the oldest match first.
-pub async fn find_matching_active_facts(
-    pool: &PgPool,
-    thought_id: ThoughtId,
-    statement: &str,
-    subject: Option<&str>,
-    predicate: Option<&str>,
-    object: Option<&str>,
-) -> Result<Vec<Fact>, StorageError> {
-    let rows = sqlx::query!(
-        r#"
-        SELECT id, scope, statement, subject, predicate, object,
-               source_thought_id AS "source_thought_id!",
-               extractor_model, extractor_version, source_run_id,
-               confidence, flagged, created_at
-        FROM facts
-        WHERE source_thought_id = $1
-          AND superseded_at IS NULL
-          AND (
-              statement = $2
-              OR (subject   IS NOT DISTINCT FROM $3
-              AND predicate IS NOT DISTINCT FROM $4
-              AND object    IS NOT DISTINCT FROM $5)
-          )
-        ORDER BY created_at ASC
-        "#,
-        thought_id.into_uuid(),
-        statement,
-        subject,
-        predicate,
-        object,
-    )
-    .fetch_all(pool)
-    .await?;
-
-    let mut facts = Vec::with_capacity(rows.len());
-    for r in rows {
-        facts.push(fact_from_columns(
-            r.id,
-            r.scope,
-            r.statement,
-            r.subject,
-            r.predicate,
-            r.object,
-            r.source_thought_id,
-            r.extractor_model,
-            r.extractor_version,
-            r.source_run_id,
-            r.confidence,
-            r.flagged,
-            r.created_at,
-        )?);
-    }
-    Ok(facts)
-}
-
-/// Mirror of [`find_matching_active_facts`] over *superseded* rows. Powers
-/// M3 Phase C's per-claim retraction durability: if the same claim
-/// (statement match OR (S, P, O) match) was previously retracted on this
-/// thought, the caller can inherit that retraction state when the
-/// extractor re-emits the claim. Each row's `superseded_by` is returned
-/// alongside the fact so the caller can either copy the canonical pointer
-/// (a normal supersession) or carry `None` (a retraction-without-replacement,
-/// e.g. from `correct_fact` retract or `retract_thought`).
-///
-/// Ordered by `superseded_at DESC` so the most-recent retraction shape wins
-/// when multiple superseded rows match — the operator's latest curation
-/// decision should dominate.
-pub async fn find_matching_superseded_facts(
-    pool: &PgPool,
-    thought_id: ThoughtId,
-    statement: &str,
-    subject: Option<&str>,
-    predicate: Option<&str>,
-    object: Option<&str>,
-) -> Result<Vec<(Fact, Option<Uuid>)>, StorageError> {
-    let rows = sqlx::query!(
-        r#"
-        SELECT id, scope, statement, subject, predicate, object,
-               source_thought_id AS "source_thought_id!",
-               extractor_model, extractor_version, source_run_id,
-               confidence, flagged, created_at,
-               superseded_by
-        FROM facts
-        WHERE source_thought_id = $1
-          AND superseded_at IS NOT NULL
-          AND (
-              statement = $2
-              OR (subject   IS NOT DISTINCT FROM $3
-              AND predicate IS NOT DISTINCT FROM $4
-              AND object    IS NOT DISTINCT FROM $5)
-          )
-        ORDER BY superseded_at DESC NULLS LAST
-        "#,
-        thought_id.into_uuid(),
-        statement,
-        subject,
-        predicate,
-        object,
-    )
-    .fetch_all(pool)
-    .await?;
-
-    let mut out = Vec::with_capacity(rows.len());
-    for r in rows {
-        let fact = fact_from_columns(
-            r.id,
-            r.scope,
-            r.statement,
-            r.subject,
-            r.predicate,
-            r.object,
-            r.source_thought_id,
-            r.extractor_model,
-            r.extractor_version,
-            r.source_run_id,
-            r.confidence,
-            r.flagged,
-            r.created_at,
-        )?;
-        out.push((fact, r.superseded_by));
-    }
-    Ok(out)
-}
-
-/// Active facts on `thought_id` sharing `(subject, predicate)` with the
-/// caller's proposed insert. Used by M3 Phase C's subsumption-aware dedup
-/// pass to detect refinement cases where the same predicate has been
-/// expressed with progressively more (or less) specific objects —
-/// e.g. "Ron does not like Python" and "Ron does not like Python for
-/// enterprise software." Caller compares `object` substrings to apply the
-/// configured `subsumption_keep` policy.
-///
-/// Only fires for fully-populated `(subject, predicate)`; NULL on either
-/// side returns the empty vector (the substring-relation question is not
-/// well-defined without both sides of the predicate).
-pub async fn find_subsuming_active_facts(
-    pool: &PgPool,
-    thought_id: ThoughtId,
-    subject: &str,
-    predicate: &str,
-) -> Result<Vec<Fact>, StorageError> {
-    let rows = sqlx::query!(
-        r#"
-        SELECT id, scope, statement, subject, predicate, object,
-               source_thought_id AS "source_thought_id!",
-               extractor_model, extractor_version, source_run_id,
-               confidence, flagged, created_at
-        FROM facts
-        WHERE source_thought_id = $1
-          AND superseded_at IS NULL
-          AND subject = $2
-          AND predicate = $3
-          AND object IS NOT NULL
-        ORDER BY created_at ASC
-        "#,
-        thought_id.into_uuid(),
-        subject,
-        predicate,
-    )
-    .fetch_all(pool)
-    .await?;
-
-    let mut out = Vec::with_capacity(rows.len());
-    for r in rows {
-        out.push(fact_from_columns(
-            r.id,
-            r.scope,
-            r.statement,
-            r.subject,
-            r.predicate,
-            r.object,
-            r.source_thought_id,
-            r.extractor_model,
-            r.extractor_version,
-            r.source_run_id,
-            r.confidence,
-            r.flagged,
-            r.created_at,
-        )?);
-    }
-    Ok(out)
 }
 
 /// Vector-similarity kNN over `embeddings` for the given model. Hits are
 /// returned in descending order of cosine similarity (`1 - cosine_distance`).
 /// Uses the per-model HNSW partial index (`embeddings_<model>_hnsw`).
-///
-/// Uses `sqlx::query_as` rather than `sqlx::query!` because pgvector's
-/// `Vector` binding is awkward through the macro. The query is still fully
-/// parameterised.
 pub async fn search_vector_knn(
     pool: &PgPool,
     query_vector: Vec<f32>,
@@ -1425,6 +868,8 @@ pub async fn search_vector_knn(
     let rows: Vec<VectorSearchRow> = sqlx::query_as(
         r#"
         SELECT t.id, t.scope, t.content, t.source, t.created_at, t.metadata,
+               t.content_fingerprint, t.tags,
+               t.tags_extractor_model, t.tags_extractor_version, t.tags_extracted_at,
                (e.vector <=> $1) AS distance
         FROM thoughts t
         JOIN embeddings e ON e.target_kind = 'thought' AND e.target_id = t.id
@@ -1444,7 +889,6 @@ pub async fn search_vector_knn(
 
     rows.into_iter()
         .map(|r| {
-            // cosine distance ∈ [0, 2]; convert to similarity ∈ [-1, 1] (typically [0, 1]).
             let score = (1.0 - r.distance) as f32;
             let thought = Thought {
                 id: ThoughtId::from(r.id),
@@ -1453,6 +897,11 @@ pub async fn search_vector_knn(
                 source: Source::new(r.source)?,
                 created_at: r.created_at,
                 metadata: Metadata::from(r.metadata),
+                content_fingerprint: fingerprint_from_bytes(r.content_fingerprint)?,
+                tags: tags_from_value(r.tags)?,
+                tags_extractor_model: r.tags_extractor_model,
+                tags_extractor_version: r.tags_extractor_version,
+                tags_extracted_at: r.tags_extracted_at,
             };
             Ok(Hit::from_vector_leg(thought, score))
         })
@@ -1467,127 +916,43 @@ struct VectorSearchRow {
     source: String,
     created_at: OffsetDateTime,
     metadata: serde_json::Value,
+    content_fingerprint: Vec<u8>,
+    tags: serde_json::Value,
+    tags_extractor_model: Option<String>,
+    tags_extractor_version: Option<i32>,
+    tags_extracted_at: Option<OffsetDateTime>,
     distance: f64,
 }
 
-/// kNN over `embeddings` joined with `facts` (and `thoughts` for source-thought
-/// enrichment matching `search_facts_trigram`'s response shape). Mirrors
-/// `search_vector_knn` for thoughts: per-model HNSW partial index, cosine
-/// distance ordering, scope filter, active-only via `superseded_at IS NULL`
-/// and `retracted_at IS NULL`.
-pub async fn search_facts_vector_knn(
-    pool: &PgPool,
-    query_vector: Vec<f32>,
-    model: &EmbeddingModel,
-    scope: Option<&str>,
-    limit: i64,
-) -> Result<Vec<FactHit>, StorageError> {
-    let pgv = pgvector::Vector::from(query_vector);
-
-    let rows: Vec<FactVectorSearchRow> = sqlx::query_as(
-        r#"
-        SELECT f.id            AS fact_id,
-               f.scope         AS fact_scope,
-               f.statement,
-               f.subject,
-               f.predicate,
-               f.object,
-               f.source_thought_id,
-               f.extractor_model,
-               f.extractor_version,
-               f.source_run_id,
-               f.confidence,
-               f.flagged,
-               f.created_at    AS fact_created_at,
-               t.content       AS source_thought_content,
-               t.scope         AS source_thought_scope,
-               t.created_at    AS source_thought_created_at,
-               (e.vector <=> $1) AS distance
-        FROM facts f
-        JOIN embeddings e ON e.target_kind = 'fact' AND e.target_id = f.id
-        JOIN thoughts t ON t.id = f.source_thought_id
-        WHERE e.model_id = $2
-          AND f.superseded_at IS NULL
-          AND t.retracted_at IS NULL
-          AND ($3::text IS NULL OR f.scope = $3)
-        ORDER BY e.vector <=> $1
-        LIMIT $4
-        "#,
-    )
-    .bind(pgv)
-    .bind(&model.id)
-    .bind(scope)
-    .bind(limit)
-    .fetch_all(pool)
-    .await?;
-
-    rows.into_iter()
-        .map(|r| {
-            // cosine distance ∈ [0, 2]; convert to similarity ∈ [-1, 1]
-            // (typically [0, 1]). Matches `search_vector_knn`'s convention.
-            let score = (1.0 - r.distance) as f32;
-            let fact = fact_from_columns(
-                r.fact_id,
-                r.fact_scope,
-                r.statement,
-                r.subject,
-                r.predicate,
-                r.object,
-                r.source_thought_id,
-                r.extractor_model,
-                r.extractor_version,
-                r.source_run_id,
-                r.confidence,
-                r.flagged,
-                r.fact_created_at,
-            )?;
-            Ok(FactHit {
-                fact,
-                source_thought_content: r.source_thought_content,
-                source_thought_scope: Scope::new(r.source_thought_scope)?,
-                source_thought_created_at: r.source_thought_created_at,
-                vector_score: Some(score),
-                trigram_score: None,
-                rrf_score: None,
-                rerank_score: None,
-            })
-        })
-        .collect()
-}
-
-#[derive(sqlx::FromRow)]
-struct FactVectorSearchRow {
-    fact_id: Uuid,
-    fact_scope: String,
-    statement: String,
-    subject: Option<String>,
-    predicate: Option<String>,
-    object: Option<String>,
-    source_thought_id: Uuid,
-    extractor_model: String,
-    extractor_version: i32,
-    source_run_id: Option<Uuid>,
-    confidence: f32,
-    flagged: bool,
-    fact_created_at: OffsetDateTime,
-    source_thought_content: String,
-    source_thought_scope: String,
-    source_thought_created_at: OffsetDateTime,
-    distance: f64,
-}
+// -- tests -------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use engram_core::{EmbeddingModel, Metadata, Scope, Source};
+    use engram_core::{EmbeddingModel, Metadata, Scope, Source, TagKind};
     use serde_json::json;
+    use sha2::{Digest, Sha256};
 
-    fn new_thought<'a>(scope: &'a Scope, source: &'a Source, metadata: &'a Metadata) -> NewThought<'a> {
+    /// Compute SHA-256 of `content` and return the 32-byte array. Mirrors
+    /// what the MCP capture layer will do before calling insert_thought.
+    fn sha256_of(content: &str) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(content.as_bytes());
+        hasher.finalize().into()
+    }
+
+    fn new_thought<'a>(
+        scope: &'a Scope,
+        source: &'a Source,
+        metadata: &'a Metadata,
+        content: &'a str,
+    ) -> NewThought<'a> {
         NewThought {
             scope,
-            content: "remember this",
+            content,
             source,
             metadata,
+            content_fingerprint: sha256_of(content),
         }
     }
 
@@ -1597,15 +962,61 @@ mod tests {
         let source = Source::new("manual").unwrap();
         let metadata = Metadata::from(json!({"client_name": "test"}));
 
-        let inserted = insert_thought(&pool, new_thought(&scope, &source, &metadata))
-            .await
-            .unwrap();
+        let (inserted, is_new) =
+            insert_thought(&pool, new_thought(&scope, &source, &metadata, "remember this"))
+                .await
+                .unwrap();
 
-        // ID is non-nil, created_at is recent
+        assert!(is_new);
         assert_ne!(*inserted.id.as_uuid(), Uuid::nil());
         let now = OffsetDateTime::now_utc();
         let drift = (now - inserted.created_at).whole_seconds().abs();
         assert!(drift < 10, "created_at not within 10s of now: drift={drift}s");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn insert_thought_returns_existing_id_on_duplicate_content_fingerprint(pool: PgPool) {
+        let scope = Scope::default();
+        let source = Source::new("manual").unwrap();
+        let metadata = Metadata::empty();
+
+        let (first, first_is_new) =
+            insert_thought(&pool, new_thought(&scope, &source, &metadata, "same content"))
+                .await
+                .unwrap();
+        assert!(first_is_new);
+
+        // Different metadata is fine — fingerprint is over content only.
+        let other_metadata = Metadata::from(json!({"client_name": "different"}));
+        let (second, second_is_new) = insert_thought(
+            &pool,
+            new_thought(&scope, &source, &other_metadata, "same content"),
+        )
+        .await
+        .unwrap();
+
+        assert!(!second_is_new, "duplicate fingerprint must return is_new=false");
+        assert_eq!(first.id, second.id, "duplicate must return the existing id");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn insert_thought_with_distinct_content_returns_distinct_ids(pool: PgPool) {
+        let scope = Scope::default();
+        let source = Source::new("manual").unwrap();
+        let metadata = Metadata::empty();
+
+        let (a, a_is_new) =
+            insert_thought(&pool, new_thought(&scope, &source, &metadata, "alpha"))
+                .await
+                .unwrap();
+        let (b, b_is_new) =
+            insert_thought(&pool, new_thought(&scope, &source, &metadata, "beta"))
+                .await
+                .unwrap();
+
+        assert!(a_is_new);
+        assert!(b_is_new);
+        assert_ne!(a.id, b.id);
     }
 
     #[sqlx::test(migrations = "../../migrations")]
@@ -1614,9 +1025,12 @@ mod tests {
         let source = Source::new("agent:claude-code").unwrap();
         let metadata = Metadata::from(json!({"session_id": "abc"}));
 
-        let inserted = insert_thought(&pool, new_thought(&scope, &source, &metadata))
-            .await
-            .unwrap();
+        let (inserted, _) = insert_thought(
+            &pool,
+            new_thought(&scope, &source, &metadata, "remember this"),
+        )
+        .await
+        .unwrap();
 
         let fetched = fetch_thought(&pool, inserted.id).await.unwrap().unwrap();
 
@@ -1626,6 +1040,12 @@ mod tests {
         assert_eq!(fetched.source, source);
         assert_eq!(fetched.metadata, metadata);
         assert_eq!(fetched.created_at, inserted.created_at);
+        // M4 defaults: empty tags + no provenance until the tag drainer runs.
+        assert_eq!(fetched.tags, Tags::default());
+        assert!(fetched.tags_extractor_model.is_none());
+        assert!(fetched.tags_extractor_version.is_none());
+        assert!(fetched.tags_extracted_at.is_none());
+        assert_eq!(fetched.content_fingerprint, sha256_of("remember this"));
     }
 
     #[sqlx::test(migrations = "../../migrations")]
@@ -1640,9 +1060,12 @@ mod tests {
         let scope = Scope::default();
         let source = Source::new("manual").unwrap();
         let metadata = Metadata::empty();
-        let inserted = insert_thought(&pool, new_thought(&scope, &source, &metadata))
-            .await
-            .unwrap();
+        let (inserted, _) = insert_thought(
+            &pool,
+            new_thought(&scope, &source, &metadata, "remember this"),
+        )
+        .await
+        .unwrap();
 
         let model = EmbeddingModel::bge_m3();
         let vector = vec![0.0_f32; 1024];
@@ -1664,10 +1087,12 @@ mod tests {
         let scope = Scope::default();
         let source = Source::new("manual").unwrap();
         let metadata = Metadata::empty();
-        let inserted = insert_thought(&pool, new_thought(&scope, &source, &metadata))
-            .await
-            .unwrap();
-
+        let (inserted, _) = insert_thought(
+            &pool,
+            new_thought(&scope, &source, &metadata, "unembedded thought"),
+        )
+        .await
+        .unwrap();
         let model = EmbeddingModel::bge_m3();
         assert!(!thought_has_embedding(&pool, inserted.id, &model).await.unwrap());
     }
@@ -1677,41 +1102,36 @@ mod tests {
         let scope = Scope::default();
         let source = Source::new("manual").unwrap();
         let metadata = Metadata::empty();
-        let inserted = insert_thought(&pool, new_thought(&scope, &source, &metadata))
-            .await
-            .unwrap();
+        let (inserted, _) = insert_thought(
+            &pool,
+            new_thought(&scope, &source, &metadata, "convenience test"),
+        )
+        .await
+        .unwrap();
 
         let model = EmbeddingModel::bge_m3();
         let embedding = Embedding::new(model.clone(), vec![0.5_f32; 1024]).unwrap();
         insert_thought_embedding(&pool, inserted.id, &embedding)
             .await
             .unwrap();
-
         assert!(thought_has_embedding(&pool, inserted.id, &model).await.unwrap());
     }
 
+    /// Helper: insert a thought with the given content + scope, return its id.
     async fn insert_test_thought(pool: &PgPool, content: &str, scope: &str) -> ThoughtId {
         let scope = Scope::new(scope).unwrap();
         let source = Source::new("test").unwrap();
         let metadata = Metadata::empty();
-        let inserted = insert_thought(
-            pool,
-            NewThought {
-                scope: &scope,
-                content,
-                source: &source,
-                metadata: &metadata,
-            },
-        )
-        .await
-        .unwrap();
+        let (inserted, _) =
+            insert_thought(pool, new_thought(&scope, &source, &metadata, content))
+                .await
+                .unwrap();
         inserted.id
     }
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn recent_thoughts_newest_first(pool: PgPool) {
         let _a = insert_test_thought(&pool, "first", "global").await;
-        // Tiny sleep so the timestamps differ.
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         let _b = insert_test_thought(&pool, "second", "global").await;
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -1733,10 +1153,6 @@ mod tests {
         let work = recent_thoughts(&pool, Some("work"), 10).await.unwrap();
         assert_eq!(work.len(), 2);
         assert!(work.iter().all(|t| t.scope.as_str() == "work"));
-
-        let personal = recent_thoughts(&pool, Some("personal"), 10).await.unwrap();
-        assert_eq!(personal.len(), 1);
-        assert_eq!(personal[0].content, "personal-1");
     }
 
     #[sqlx::test(migrations = "../../migrations")]
@@ -1762,7 +1178,7 @@ mod tests {
     #[sqlx::test(migrations = "../../migrations")]
     async fn search_trigram_respects_scope(pool: PgPool) {
         insert_test_thought(&pool, "tcgplayer info", "work").await;
-        insert_test_thought(&pool, "tcgplayer info", "personal").await;
+        insert_test_thought(&pool, "tcgplayer info two", "personal").await;
 
         let hits = search_trigram(&pool, "tcgplayer", Some("work"), 10).await.unwrap();
         assert_eq!(hits.len(), 1);
@@ -1776,9 +1192,6 @@ mod tests {
         assert!(hits.is_empty());
     }
 
-    /// Helper: returns a 1024-dim unit vector with `1.0` at the given index.
-    /// The `embeddings.vector` column is `vector(1024)` (matches BGE-M3 dims),
-    /// so all test vectors must be that size.
     fn unit_vector_1024(pos: usize) -> Vec<f32> {
         let mut v = vec![0.0_f32; 1024];
         v[pos] = 1.0;
@@ -1802,11 +1215,9 @@ mod tests {
             .await
             .unwrap();
 
-        // Query with the exact vector for 'a' → 'a' should rank first.
         let hits = search_vector_knn(&pool, va, &model, None, 10).await.unwrap();
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].thought.id, id_a);
-        // Cosine similarity with itself = 1, so vector_score ≈ 1.
         assert!((hits[0].vector_score.unwrap() - 1.0).abs() < 1e-4);
     }
 
@@ -1815,1531 +1226,325 @@ mod tests {
         let model_a = EmbeddingModel::new("test-a:1024", 1024);
         let model_b = EmbeddingModel::new("test-b:1024", 1024);
 
-        let id_a = insert_test_thought(&pool, "a", "global").await;
-        let id_b = insert_test_thought(&pool, "b", "global").await;
-
-        let v = unit_vector_1024(0);
-        insert_thought_embedding(&pool, id_a, &Embedding::new(model_a.clone(), v.clone()).unwrap())
-            .await
-            .unwrap();
-        insert_thought_embedding(&pool, id_b, &Embedding::new(model_b.clone(), v.clone()).unwrap())
+        let id = insert_test_thought(&pool, "thought", "global").await;
+        let va = unit_vector_1024(0);
+        insert_thought_embedding(&pool, id, &Embedding::new(model_a.clone(), va.clone()).unwrap())
             .await
             .unwrap();
 
-        // Query with model_a should only return id_a (not id_b, embedded under model_b).
-        let hits = search_vector_knn(&pool, v, &model_a, None, 10).await.unwrap();
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].thought.id, id_a);
-    }
-
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn fetch_thought_with_provenance_indexed_when_embedded(pool: PgPool) {
-        let id = insert_test_thought(&pool, "hello", "global").await;
-        let model = EmbeddingModel::bge_m3();
-        insert_thought_embedding(&pool, id, &Embedding::new(model.clone(), vec![0.0_f32; 1024]).unwrap())
-            .await
-            .unwrap();
-
-        let prov = fetch_thought_with_provenance(&pool, id, &model)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(prov.embedding_status, EmbeddingStatus::Indexed);
-        assert!(prov.embedded_at.is_some());
-        assert_eq!(prov.thought.id, id);
-    }
-
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn fetch_thought_with_provenance_pending_when_unembedded(pool: PgPool) {
-        let id = insert_test_thought(&pool, "hello", "global").await;
-        let model = EmbeddingModel::bge_m3();
-        let prov = fetch_thought_with_provenance(&pool, id, &model)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(prov.embedding_status, EmbeddingStatus::Pending);
-        assert!(prov.embedded_at.is_none());
-    }
-
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn fetch_thought_with_provenance_returns_none_for_missing(pool: PgPool) {
-        let model = EmbeddingModel::bge_m3();
-        let id = ThoughtId::new();
-        let prov = fetch_thought_with_provenance(&pool, id, &model).await.unwrap();
-        assert!(prov.is_none());
+        // Query with model_b — no embeddings → no hits.
+        let hits = search_vector_knn(&pool, va, &model_b, None, 10).await.unwrap();
+        assert!(hits.is_empty());
     }
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn find_unembedded_thoughts_returns_thoughts_without_embedding(pool: PgPool) {
-        let model = EmbeddingModel::bge_m3();
-        let embedded = insert_test_thought(&pool, "embedded", "global").await;
-        let unembedded = insert_test_thought(&pool, "unembedded", "global").await;
+        let model = EmbeddingModel::new("test:1024", 1024);
 
-        insert_thought_embedding(
-            &pool,
-            embedded,
-            &Embedding::new(model.clone(), vec![0.0_f32; 1024]).unwrap(),
-        )
-        .await
-        .unwrap();
+        let id_a = insert_test_thought(&pool, "a", "global").await;
+        let _id_b = insert_test_thought(&pool, "b", "global").await;
 
-        let pending = find_unembedded_thoughts(&pool, &model, None, 100).await.unwrap();
-        let ids: Vec<ThoughtId> = pending.iter().map(|t| t.id).collect();
-        assert!(ids.contains(&unembedded));
-        assert!(!ids.contains(&embedded));
-    }
-
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn find_unembedded_thoughts_respects_scope_and_limit(pool: PgPool) {
-        let model = EmbeddingModel::bge_m3();
-        for i in 0..5 {
-            insert_test_thought(&pool, &format!("work-{i}"), "work").await;
-        }
-        for i in 0..3 {
-            insert_test_thought(&pool, &format!("personal-{i}"), "personal").await;
-        }
-
-        let work = find_unembedded_thoughts(&pool, &model, Some("work"), 100).await.unwrap();
-        assert_eq!(work.len(), 5);
-        assert!(work.iter().all(|t| t.scope.as_str() == "work"));
-
-        let limited = find_unembedded_thoughts(&pool, &model, None, 4).await.unwrap();
-        assert_eq!(limited.len(), 4);
-    }
-
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn find_unembedded_thoughts_is_per_model(pool: PgPool) {
-        let model_a = EmbeddingModel::new("a:1024", 1024);
-        let model_b = EmbeddingModel::new("b:1024", 1024);
-
-        let t = insert_test_thought(&pool, "hi", "global").await;
-        insert_thought_embedding(
-            &pool,
-            t,
-            &Embedding::new(model_a.clone(), vec![0.0_f32; 1024]).unwrap(),
-        )
-        .await
-        .unwrap();
-
-        // Under model_a it's embedded; under model_b it's still pending.
-        let pending_a = find_unembedded_thoughts(&pool, &model_a, None, 10).await.unwrap();
-        let pending_b = find_unembedded_thoughts(&pool, &model_b, None, 10).await.unwrap();
-        assert!(pending_a.iter().all(|x| x.id != t));
-        assert!(pending_b.iter().any(|x| x.id == t));
-    }
-
-    // -- M2 Phase B: pending_embeddings queue --------------------------------
-
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn enqueue_embedding_inserts_row(pool: PgPool) {
-        let id = insert_test_thought(&pool, "queue me", "global").await;
-        let inserted = enqueue_embedding(&pool, target::THOUGHT, id.into_uuid(), "bge-m3:1024")
+        // Embed only `a`.
+        let va = unit_vector_1024(0);
+        insert_thought_embedding(&pool, id_a, &Embedding::new(model.clone(), va).unwrap())
             .await
             .unwrap();
-        assert!(inserted);
-        assert_eq!(count_pending(&pool).await.unwrap(), 1);
+
+        let unembedded = find_unembedded_thoughts(&pool, &model, None, 100).await.unwrap();
+        assert_eq!(unembedded.len(), 1);
+        assert_eq!(unembedded[0].content, "b");
     }
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn enqueue_embedding_is_idempotent(pool: PgPool) {
-        let id = insert_test_thought(&pool, "queue me", "global").await;
-        let first = enqueue_embedding(&pool, target::THOUGHT, id.into_uuid(), "bge-m3:1024")
-            .await
-            .unwrap();
-        let second = enqueue_embedding(&pool, target::THOUGHT, id.into_uuid(), "bge-m3:1024")
+        let id = insert_test_thought(&pool, "to embed", "global").await;
+        let model_id = "bge-m3:1024";
+
+        let first = enqueue_embedding(&pool, target::THOUGHT, id.into_uuid(), model_id)
             .await
             .unwrap();
         assert!(first);
-        assert!(!second, "second enqueue must be a no-op");
+
+        let second = enqueue_embedding(&pool, target::THOUGHT, id.into_uuid(), model_id)
+            .await
+            .unwrap();
+        assert!(!second, "duplicate enqueue should be a no-op");
+
         assert_eq!(count_pending(&pool).await.unwrap(), 1);
     }
 
     #[sqlx::test(migrations = "../../migrations")]
-    async fn claim_pending_returns_oldest_first_and_bumps_attempts(pool: PgPool) {
+    async fn claim_pending_bumps_attempts_and_returns_jobs(pool: PgPool) {
         let id_a = insert_test_thought(&pool, "a", "global").await;
-        enqueue_embedding(&pool, target::THOUGHT, id_a.into_uuid(), "bge-m3:1024")
-            .await
-            .unwrap();
-        // Sleep so `enqueued_at` is comfortably different across the two
-        // auto-commit transactions; 50ms is well above any timer-resolution
-        // surprises on the dev machine.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let id_b = insert_test_thought(&pool, "b", "global").await;
-        enqueue_embedding(&pool, target::THOUGHT, id_b.into_uuid(), "bge-m3:1024")
+        let model_id = "bge-m3:1024";
+
+        enqueue_embedding(&pool, target::THOUGHT, id_a.into_uuid(), model_id)
             .await
             .unwrap();
-
-        let first_batch = claim_pending(&pool, 1).await.unwrap();
-        assert_eq!(first_batch.len(), 1);
-        assert_eq!(first_batch[0].target_id, id_a.into_uuid());
-        assert_eq!(first_batch[0].attempts, 1, "first claim bumps attempts 0→1");
-
-        // Worker finishes the first job before claiming the next batch.
-        // Otherwise the still-present row a (oldest) would be re-claimed.
-        mark_embedded(&pool, first_batch[0].id).await.unwrap();
-
-        let second_batch = claim_pending(&pool, 1).await.unwrap();
-        assert_eq!(second_batch.len(), 1);
-        assert_eq!(second_batch[0].target_id, id_b.into_uuid());
-    }
-
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn claim_pending_skips_locked_rows(pool: PgPool) {
-        let id_a = insert_test_thought(&pool, "a", "global").await;
-        enqueue_embedding(&pool, target::THOUGHT, id_a.into_uuid(), "bge-m3:1024")
+        enqueue_embedding(&pool, target::THOUGHT, id_b.into_uuid(), model_id)
             .await
             .unwrap();
-        let id_b = insert_test_thought(&pool, "b", "global").await;
-        enqueue_embedding(&pool, target::THOUGHT, id_b.into_uuid(), "bge-m3:1024")
-            .await
-            .unwrap();
-
-        // Hold a row-level lock on whichever row enqueued first (a) from a
-        // separate transaction. From another connection, claim_pending must
-        // skip past it and return b.
-        let mut tx = pool.begin().await.unwrap();
-        let _ = sqlx::query!(
-            r#"
-            SELECT id FROM pending_embeddings
-            WHERE target_id = $1
-            FOR UPDATE
-            "#,
-            id_a.into_uuid(),
-        )
-        .fetch_one(&mut *tx)
-        .await
-        .unwrap();
 
         let claimed = claim_pending(&pool, 10).await.unwrap();
-        assert_eq!(claimed.len(), 1, "must skip the locked row");
-        assert_eq!(claimed[0].target_id, id_b.into_uuid());
-
-        // Releasing the tx lets future claims see row a again.
-        drop(tx);
+        assert_eq!(claimed.len(), 2);
+        assert!(claimed.iter().all(|j| j.attempts == 1));
     }
 
     #[sqlx::test(migrations = "../../migrations")]
-    async fn mark_embedded_removes_row(pool: PgPool) {
-        let id = insert_test_thought(&pool, "x", "global").await;
+    async fn mark_embedded_removes_from_queue(pool: PgPool) {
+        let id = insert_test_thought(&pool, "to embed", "global").await;
         enqueue_embedding(&pool, target::THOUGHT, id.into_uuid(), "bge-m3:1024")
             .await
             .unwrap();
-        let job = claim_pending(&pool, 10).await.unwrap().pop().unwrap();
-        mark_embedded(&pool, job.id).await.unwrap();
+
+        let claimed = claim_pending(&pool, 1).await.unwrap();
+        assert_eq!(claimed.len(), 1);
+
+        mark_embedded(&pool, claimed[0].id).await.unwrap();
         assert_eq!(count_pending(&pool).await.unwrap(), 0);
     }
 
     #[sqlx::test(migrations = "../../migrations")]
-    async fn mark_failed_records_error_but_keeps_row(pool: PgPool) {
-        let id = insert_test_thought(&pool, "x", "global").await;
+    async fn mark_failed_keeps_in_queue_and_sets_error(pool: PgPool) {
+        let id = insert_test_thought(&pool, "to embed", "global").await;
         enqueue_embedding(&pool, target::THOUGHT, id.into_uuid(), "bge-m3:1024")
             .await
             .unwrap();
-        let job = claim_pending(&pool, 10).await.unwrap().pop().unwrap();
-        mark_failed(&pool, job.id, "embedder unreachable").await.unwrap();
 
+        let claimed = claim_pending(&pool, 1).await.unwrap();
+        assert_eq!(claimed.len(), 1);
+
+        mark_failed(&pool, claimed[0].id, "timeout").await.unwrap();
         assert_eq!(count_pending(&pool).await.unwrap(), 1);
-        let row = sqlx::query!(
-            r#"SELECT attempts, last_error FROM pending_embeddings WHERE id = $1"#,
-            job.id,
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(row.attempts, 1, "claim already bumped to 1; mark_failed does not bump");
-        assert_eq!(row.last_error.as_deref(), Some("embedder unreachable"));
-    }
-
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn count_pending_returns_queue_depth(pool: PgPool) {
-        assert_eq!(count_pending(&pool).await.unwrap(), 0);
-        for i in 0..3 {
-            let id = insert_test_thought(&pool, &format!("t{i}"), "global").await;
-            enqueue_embedding(&pool, target::THOUGHT, id.into_uuid(), "bge-m3:1024")
-                .await
-                .unwrap();
-        }
-        assert_eq!(count_pending(&pool).await.unwrap(), 3);
-    }
-
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn enqueue_unembedded_thoughts_heals_gaps_and_skips_duplicates(pool: PgPool) {
-        let model = EmbeddingModel::bge_m3();
-        let already_embedded = insert_test_thought(&pool, "done", "global").await;
-        insert_thought_embedding(
-            &pool,
-            already_embedded,
-            &Embedding::new(model.clone(), vec![0.0_f32; 1024]).unwrap(),
-        )
-        .await
-        .unwrap();
-
-        let already_queued = insert_test_thought(&pool, "queued", "global").await;
-        enqueue_embedding(&pool, target::THOUGHT, already_queued.into_uuid(), &model.id)
-            .await
-            .unwrap();
-
-        let orphan = insert_test_thought(&pool, "orphan", "global").await;
-
-        // Heal: should enqueue only the orphan (skips embedded + already-queued).
-        let inserted = enqueue_unembedded_thoughts(&pool, &model.id, None, 100)
-            .await
-            .unwrap();
-        assert_eq!(inserted, 1);
-        assert_eq!(count_pending(&pool).await.unwrap(), 2);
-
-        // Verify it's the orphan that landed in the queue alongside `already_queued`.
-        let claimed = claim_pending(&pool, 10).await.unwrap();
-        let target_ids: Vec<Uuid> = claimed.iter().map(|j| j.target_id).collect();
-        assert!(target_ids.contains(&orphan.into_uuid()));
-        assert!(target_ids.contains(&already_queued.into_uuid()));
-        assert!(!target_ids.contains(&already_embedded.into_uuid()));
-    }
-
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn insert_thought_embedding_is_idempotent_under_replay(pool: PgPool) {
-        // Regression test: simulate the worker crashing between
-        // insert_thought_embedding and mark_embedded, then re-inserting on
-        // the next claim. The ON CONFLICT DO NOTHING means the duplicate is
-        // a no-op rather than a UNIQUE-violation error.
-        let id = insert_test_thought(&pool, "replay me", "global").await;
-        let model = EmbeddingModel::bge_m3();
-        let emb = Embedding::new(model.clone(), vec![0.5_f32; 1024]).unwrap();
-
-        insert_thought_embedding(&pool, id, &emb).await.unwrap();
-        insert_thought_embedding(&pool, id, &emb)
-            .await
-            .expect("second insert must be a no-op, not a UNIQUE violation");
-
-        assert!(thought_has_embedding(&pool, id, &model).await.unwrap());
-    }
-
-    // -- M2 Phase C: reflector_runs + facts + facts_review_queue ------------
-
-    fn new_fact<'a>(
-        scope: &'a Scope,
-        statement: &'a str,
-        thought_id: ThoughtId,
-        run_id: RunId,
-        confidence: f32,
-    ) -> NewFact<'a> {
-        NewFact {
-            scope,
-            statement,
-            subject: None,
-            predicate: None,
-            object: None,
-            source_thought_id: thought_id,
-            extractor_model: "fake/extractor",
-            extractor_version: 1,
-            source_run_id: Some(run_id),
-            confidence,
-            flagged: false,
-        }
-    }
-
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn start_run_inserts_row_with_started_at(pool: PgPool) {
-        let run_id = start_run(&pool, "fake/extractor", 1, None).await.unwrap();
-        let row = sqlx::query!(
-            r#"SELECT started_at, finished_at, extractor_model, extractor_version, scope_filter
-               FROM reflector_runs WHERE id = $1"#,
-            run_id.0,
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        // started_at must be recent; finished_at must still be NULL.
-        let drift = (OffsetDateTime::now_utc() - row.started_at).whole_seconds().abs();
-        assert!(drift < 10, "started_at drift {drift}s");
-        assert!(row.finished_at.is_none());
-        assert_eq!(row.extractor_model, "fake/extractor");
-        assert_eq!(row.extractor_version, 1);
-        assert!(row.scope_filter.is_none());
-    }
-
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn finish_run_sets_finished_at_and_counts_and_error(pool: PgPool) {
-        let run_id = start_run(&pool, "fake/extractor", 1, Some("work")).await.unwrap();
-        finish_run(&pool, run_id, 5, 3, 2, 1, Some("partial failure")).await.unwrap();
 
         let row = sqlx::query!(
-            r#"SELECT finished_at, n_thoughts_processed, n_facts_committed,
-                      n_review_queue, n_extractor_failures, error
-               FROM reflector_runs WHERE id = $1"#,
-            run_id.0,
+            r#"SELECT last_error FROM pending_embeddings WHERE id = $1"#,
+            claimed[0].id,
         )
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert!(row.finished_at.is_some());
-        assert_eq!(row.n_thoughts_processed, 5);
-        assert_eq!(row.n_facts_committed, 3);
-        assert_eq!(row.n_review_queue, 2);
-        assert_eq!(row.n_extractor_failures, 1);
-        assert_eq!(row.error.as_deref(), Some("partial failure"));
-    }
-
-    /// `n_extractor_failures` defaults to 0 (the migration's column default)
-    /// so existing reflector_runs rows from pre-0004 schema don't crash any
-    /// reader. New rows written by post-M3-Phase-A finish_run propagate the
-    /// reflector's observed failure count.
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn finish_run_persists_n_extractor_failures(pool: PgPool) {
-        let run_id = start_run(&pool, "fake/extractor", 1, None).await.unwrap();
-        finish_run(&pool, run_id, 10, 4, 1, 5, None).await.unwrap();
-
-        let n_failures = sqlx::query_scalar!(
-            r#"SELECT n_extractor_failures FROM reflector_runs WHERE id = $1"#,
-            run_id.0,
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(n_failures, 5);
+        assert_eq!(row.last_error.as_deref(), Some("timeout"));
     }
 
     #[sqlx::test(migrations = "../../migrations")]
-    async fn find_unfacted_thoughts_returns_thought_without_facts(pool: PgPool) {
-        let unfacted = insert_test_thought(&pool, "no facts yet", "global").await;
-        let unfacted_too = insert_test_thought(&pool, "also fresh", "global").await;
-
-        let pending = find_unfacted_thoughts(&pool, None, 100).await.unwrap();
-        let ids: Vec<ThoughtId> = pending.iter().map(|t| t.id).collect();
-        assert!(ids.contains(&unfacted));
-        assert!(ids.contains(&unfacted_too));
-    }
-
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn find_unfacted_thoughts_skips_thought_with_existing_fact(pool: PgPool) {
-        let facted = insert_test_thought(&pool, "already extracted", "global").await;
-        let scope = Scope::global();
-        let run_id = start_run(&pool, "fake/extractor", 1, None).await.unwrap();
-        insert_fact(&pool, new_fact(&scope, "a fact", facted, run_id, 0.9))
-            .await
-            .unwrap();
-        let unfacted = insert_test_thought(&pool, "still fresh", "global").await;
-
-        let pending = find_unfacted_thoughts(&pool, None, 100).await.unwrap();
-        let ids: Vec<ThoughtId> = pending.iter().map(|t| t.id).collect();
-        assert!(ids.contains(&unfacted));
-        assert!(!ids.contains(&facted));
-    }
-
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn find_unfacted_thoughts_orders_ascending_by_created_at(pool: PgPool) {
-        insert_test_thought(&pool, "first", "global").await;
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        insert_test_thought(&pool, "second", "global").await;
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        insert_test_thought(&pool, "third", "global").await;
-
-        let pending = find_unfacted_thoughts(&pool, None, 10).await.unwrap();
-        assert_eq!(pending.len(), 3);
-        assert_eq!(pending[0].content, "first");
-        assert_eq!(pending[1].content, "second");
-        assert_eq!(pending[2].content, "third");
-    }
-
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn find_unfacted_thoughts_respects_scope_and_limit(pool: PgPool) {
-        for i in 0..5 {
-            insert_test_thought(&pool, &format!("work-{i}"), "work").await;
-        }
-        for i in 0..3 {
-            insert_test_thought(&pool, &format!("personal-{i}"), "personal").await;
-        }
-
-        let work = find_unfacted_thoughts(&pool, Some("work"), 100).await.unwrap();
-        assert_eq!(work.len(), 5);
-        assert!(work.iter().all(|t| t.scope.as_str() == "work"));
-
-        let limited = find_unfacted_thoughts(&pool, None, 4).await.unwrap();
-        assert_eq!(limited.len(), 4);
-    }
-
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn insert_fact_persists_with_provenance(pool: PgPool) {
-        let thought_id = insert_test_thought(&pool, "source", "global").await;
-        let scope = Scope::global();
-        let run_id = start_run(&pool, "fake/extractor", 7, None).await.unwrap();
-
-        let fact_id = insert_fact(
-            &pool,
-            NewFact {
-                scope: &scope,
-                statement: "Engram uses pgvector",
-                subject: Some("Engram"),
-                predicate: Some("uses"),
-                object: Some("pgvector"),
-                source_thought_id: thought_id,
-                extractor_model: "fake/extractor",
-                extractor_version: 7,
-                source_run_id: Some(run_id),
-                confidence: 0.91,
-                flagged: false,
-            },
-        )
-        .await
-        .unwrap();
-
-        let row = sqlx::query!(
-            r#"SELECT statement, subject, predicate, object, source_thought_id,
-                      extractor_model, extractor_version, source_run_id,
-                      confidence, scope, superseded_at
-               FROM facts WHERE id = $1"#,
-            fact_id,
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(row.statement, "Engram uses pgvector");
-        assert_eq!(row.subject.as_deref(), Some("Engram"));
-        assert_eq!(row.predicate.as_deref(), Some("uses"));
-        assert_eq!(row.object.as_deref(), Some("pgvector"));
-        assert_eq!(row.source_thought_id, Some(thought_id.into_uuid()));
-        assert_eq!(row.extractor_model, "fake/extractor");
-        assert_eq!(row.extractor_version, 7);
-        assert_eq!(row.source_run_id, Some(run_id.0));
-        assert!((row.confidence - 0.91).abs() < 1e-5);
-        assert_eq!(row.scope, "global");
-        assert!(row.superseded_at.is_none());
-    }
-
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn insert_fact_persists_flagged(pool: PgPool) {
-        let thought_id = insert_test_thought(&pool, "source", "global").await;
-        let scope = Scope::global();
-        let run_id = start_run(&pool, "fake/extractor", 7, None).await.unwrap();
-
-        let flagged_id = insert_fact(
-            &pool,
-            NewFact {
-                scope: &scope,
-                statement: "Hedged claim",
-                subject: None,
-                predicate: None,
-                object: None,
-                source_thought_id: thought_id,
-                extractor_model: "fake/extractor",
-                extractor_version: 7,
-                source_run_id: Some(run_id),
-                confidence: 0.75,
-                flagged: true,
-            },
-        )
-        .await
-        .unwrap();
-
-        let unflagged_id = insert_fact(
-            &pool,
-            NewFact {
-                scope: &scope,
-                statement: "Declarative claim",
-                subject: None,
-                predicate: None,
-                object: None,
-                source_thought_id: thought_id,
-                extractor_model: "fake/extractor",
-                extractor_version: 7,
-                source_run_id: Some(run_id),
-                confidence: 0.92,
-                flagged: false,
-            },
-        )
-        .await
-        .unwrap();
-
-        let row_flagged = sqlx::query!(r#"SELECT flagged FROM facts WHERE id = $1"#, flagged_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        let row_unflagged = sqlx::query!(r#"SELECT flagged FROM facts WHERE id = $1"#, unflagged_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert!(row_flagged.flagged);
-        assert!(!row_unflagged.flagged);
-
-        // Round-trips through the read path too: `fetch_fact` carries the column.
-        let read_flagged = fetch_fact(&pool, flagged_id).await.unwrap().unwrap();
-        let read_unflagged = fetch_fact(&pool, unflagged_id).await.unwrap().unwrap();
-        assert!(read_flagged.flagged);
-        assert!(!read_unflagged.flagged);
-    }
-
-    // -- M2 Phase D: facts read surface --
-
-    async fn insert_active_fact(
-        pool: &PgPool,
-        thought_id: ThoughtId,
-        scope: &Scope,
-        statement: &str,
-        triple: (Option<&str>, Option<&str>, Option<&str>),
-        run_id: RunId,
-        confidence: f32,
-    ) -> Uuid {
-        insert_fact(
-            pool,
-            NewFact {
-                scope,
-                statement,
-                subject: triple.0,
-                predicate: triple.1,
-                object: triple.2,
-                source_thought_id: thought_id,
-                extractor_model: "fake/extractor",
-                extractor_version: 1,
-                source_run_id: Some(run_id),
-                confidence,
-                flagged: false,
-            },
-        )
-        .await
-        .unwrap()
-    }
-
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn search_facts_trigram_finds_match_and_returns_source_thought_content(pool: PgPool) {
-        let scope = Scope::global();
-        let thought_id = insert_test_thought(&pool, "Engram uses pgvector for storage", "global").await;
-        let run_id = start_run(&pool, "fake/extractor", 1, None).await.unwrap();
-        insert_active_fact(
-            &pool,
-            thought_id,
-            &scope,
-            "Engram uses pgvector",
-            (Some("Engram"), Some("uses"), Some("pgvector")),
-            run_id,
-            0.9,
-        )
-        .await;
-
-        let hits = search_facts_trigram(&pool, "pgvector", None, 10).await.unwrap();
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].fact.statement, "Engram uses pgvector");
-        assert_eq!(hits[0].source_thought_content, "Engram uses pgvector for storage");
-        assert_eq!(hits[0].source_thought_scope, scope);
-        assert!(hits[0].trigram_score.unwrap() > 0.0);
-    }
-
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn search_facts_trigram_filters_superseded(pool: PgPool) {
-        let scope = Scope::global();
-        let thought_id = insert_test_thought(&pool, "facts about widgets", "global").await;
-        let run_id = start_run(&pool, "fake/extractor", 1, None).await.unwrap();
-        let fact_id = insert_active_fact(
-            &pool,
-            thought_id,
-            &scope,
-            "widgets are useful",
-            (None, None, None),
-            run_id,
-            0.9,
-        )
-        .await;
-
-        // Visible before supersede.
-        let before = search_facts_trigram(&pool, "widgets", None, 10).await.unwrap();
-        assert_eq!(before.len(), 1);
-
-        // Supersede with no replacement.
-        let did = supersede_fact(&pool, fact_id, None).await.unwrap();
-        assert!(did);
-
-        // Filtered out after.
-        let after = search_facts_trigram(&pool, "widgets", None, 10).await.unwrap();
-        assert!(after.is_empty());
-    }
-
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn search_facts_trigram_respects_scope_and_limit(pool: PgPool) {
-        let work = Scope::new("work").unwrap();
-        let personal = Scope::new("personal").unwrap();
-        let t1 = insert_test_thought(&pool, "work thought one", "work").await;
-        let t2 = insert_test_thought(&pool, "work thought two", "work").await;
-        let t3 = insert_test_thought(&pool, "personal thought", "personal").await;
-        let run_id = start_run(&pool, "fake/extractor", 1, None).await.unwrap();
-        insert_active_fact(&pool, t1, &work, "widget alpha", (None, None, None), run_id, 0.9).await;
-        insert_active_fact(&pool, t2, &work, "widget beta", (None, None, None), run_id, 0.9).await;
-        insert_active_fact(&pool, t3, &personal, "widget gamma", (None, None, None), run_id, 0.9).await;
-
-        let work_only = search_facts_trigram(&pool, "widget", Some("work"), 10).await.unwrap();
-        assert_eq!(work_only.len(), 2);
-        assert!(work_only.iter().all(|h| h.fact.scope.as_str() == "work"));
-
-        let limited = search_facts_trigram(&pool, "widget", None, 2).await.unwrap();
-        assert_eq!(limited.len(), 2);
-    }
-
-    /// M3 Phase A: lexical scoring now consults `subject || predicate || object`
-    /// in addition to `statement`. A fact whose subject is "Ron" but whose
-    /// statement starts "When Rust is unavailable…" should match a search
-    /// for "Ron Go" via the trigram leg.
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn search_facts_trigram_matches_via_triple_when_statement_does_not_mention_query(
-        pool: PgPool,
-    ) {
-        let scope = Scope::global();
-        let thought_id = insert_test_thought(&pool, "language preferences", "global").await;
-        let run_id = start_run(&pool, "fake/extractor", 1, None).await.unwrap();
-        insert_active_fact(
-            &pool,
-            thought_id,
-            &scope,
-            "When Rust is not available or appropriate, Go is the next choice.",
-            (Some("Ron"), Some("prefers as fallback"), Some("Go")),
-            run_id,
-            0.9,
-        )
-        .await;
-        // A decoy fact with no Ron / Go content.
-        insert_active_fact(
-            &pool,
-            thought_id,
-            &scope,
-            "JavaScript is widely deployed in browsers.",
-            (Some("JavaScript"), Some("is deployed in"), Some("browsers")),
-            run_id,
-            0.9,
-        )
-        .await;
-
-        let hits = search_facts_trigram(&pool, "Ron Go", None, 10).await.unwrap();
-        assert!(!hits.is_empty(), "trigram leg should match via triple");
-        assert!(
-            hits[0]
-                .fact
-                .statement
-                .contains("Rust is not available"),
-            "expected Ron/Go fact to be the top hit, got: {}",
-            hits[0].fact.statement
-        );
-    }
-
-    // -- M3 Phase B step 1: fact embeddings -----------------------------------
-
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn insert_fact_embedding_persists_vector_for_model(pool: PgPool) {
+    async fn enqueue_unembedded_thoughts_skips_already_embedded(pool: PgPool) {
         let model = EmbeddingModel::new("test:1024", 1024);
-        let scope = Scope::global();
-        let thought_id = insert_test_thought(&pool, "anchor", "global").await;
-        let run_id = start_run(&pool, "fake/extractor", 1, None).await.unwrap();
-        let fact_id = insert_active_fact(
-            &pool,
-            thought_id,
-            &scope,
-            "fact statement",
-            (Some("S"), Some("P"), Some("O")),
-            run_id,
-            0.9,
-        )
-        .await;
+        let id_a = insert_test_thought(&pool, "a", "global").await;
+        let _id_b = insert_test_thought(&pool, "b", "global").await;
 
-        let v = unit_vector_1024(7);
-        insert_fact_embedding(&pool, fact_id, &Embedding::new(model.clone(), v).unwrap())
-            .await
-            .unwrap();
-
-        // Verify the row landed under target_kind='fact'.
-        let n = sqlx::query!(
-            r#"SELECT COUNT(*) AS "n!" FROM embeddings
-               WHERE target_kind = 'fact' AND target_id = $1 AND model_id = $2"#,
-            fact_id,
-            model.id,
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap()
-        .n;
-        assert_eq!(n, 1);
-    }
-
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn search_facts_vector_knn_finds_inserted_vector(pool: PgPool) {
-        let model = EmbeddingModel::new("test:1024", 1024);
-        let scope = Scope::global();
-        let thought_id = insert_test_thought(&pool, "anchor", "global").await;
-        let run_id = start_run(&pool, "fake/extractor", 1, None).await.unwrap();
-
-        let fact_a = insert_active_fact(
-            &pool,
-            thought_id,
-            &scope,
-            "alpha fact",
-            (Some("A"), None, None),
-            run_id,
-            0.9,
-        )
-        .await;
-        let fact_b = insert_active_fact(
-            &pool,
-            thought_id,
-            &scope,
-            "beta fact",
-            (Some("B"), None, None),
-            run_id,
-            0.9,
-        )
-        .await;
-
+        // Embed only `a`.
         let va = unit_vector_1024(0);
-        let vb = unit_vector_1024(1);
-        insert_fact_embedding(&pool, fact_a, &Embedding::new(model.clone(), va.clone()).unwrap())
-            .await
-            .unwrap();
-        insert_fact_embedding(&pool, fact_b, &Embedding::new(model.clone(), vb).unwrap())
+        insert_thought_embedding(&pool, id_a, &Embedding::new(model.clone(), va).unwrap())
             .await
             .unwrap();
 
-        // Query with the exact 'a' vector → fact_a ranks first with vector_score ≈ 1.
-        let hits = search_facts_vector_knn(&pool, va, &model, None, 10).await.unwrap();
-        assert_eq!(hits.len(), 2);
-        assert_eq!(hits[0].fact.id, fact_a);
-        assert!((hits[0].vector_score.unwrap() - 1.0).abs() < 1e-4);
-        // Source-thought enrichment fields populated.
-        assert_eq!(hits[0].source_thought_content, "anchor");
-        assert_eq!(hits[0].source_thought_scope.as_str(), "global");
+        let enqueued = enqueue_unembedded_thoughts(&pool, &model.id, None, 100).await.unwrap();
+        assert_eq!(enqueued, 1, "only `b` should be enqueued");
     }
 
+    // -- M4: tag-sidecar tests ------------------------------------------------
+
     #[sqlx::test(migrations = "../../migrations")]
-    async fn enqueue_unembedded_facts_skips_already_embedded(pool: PgPool) {
-        let model = EmbeddingModel::new("bge-m3:1024", 1024);
-        let scope = Scope::global();
-        let thought_id = insert_test_thought(&pool, "anchor", "global").await;
-        let run_id = start_run(&pool, "fake/extractor", 1, None).await.unwrap();
-        let fact_a = insert_active_fact(
-            &pool, thought_id, &scope, "fact-a", (None, None, None), run_id, 0.9,
-        )
-        .await;
-        let _fact_b = insert_active_fact(
-            &pool, thought_id, &scope, "fact-b", (None, None, None), run_id, 0.9,
-        )
-        .await;
+    async fn update_thought_tags_persists_jsonb_and_provenance(pool: PgPool) {
+        let id = insert_test_thought(&pool, "tagged thought", "global").await;
 
-        // Pre-embed fact_a only; it should be skipped by the heal.
-        insert_fact_embedding(
-            &pool,
-            fact_a,
-            &Embedding::new(model.clone(), unit_vector_1024(0)).unwrap(),
-        )
-        .await
-        .unwrap();
-
-        let healed = enqueue_unembedded_facts(&pool, &model.id, None, 100)
+        let tags = Tags {
+            people: vec!["Sarah".into()],
+            action_items: vec!["follow up".into()],
+            topics: vec!["meetings".into()],
+            dates_mentioned: vec!["Thursday".into()],
+            kind: Some(TagKind::Task),
+        };
+        update_thought_tags(&pool, id, &tags, "vllm/qwen2.5-7b-instruct", 1)
             .await
             .unwrap();
-        assert_eq!(healed, 1, "fact_a was already embedded; only fact_b enqueues");
 
-        let pending = sqlx::query!(
-            r#"SELECT COUNT(*) AS "n!" FROM pending_embeddings WHERE target_kind = 'fact'"#
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap()
-        .n;
-        assert_eq!(pending, 1);
+        let read = fetch_thought_tags(&pool, id).await.unwrap().unwrap();
+        assert_eq!(read.tags, tags);
+        assert_eq!(read.tagger_model_id.as_deref(), Some("vllm/qwen2.5-7b-instruct"));
+        assert_eq!(read.tagger_version, Some(1));
+        assert!(read.tagged_at.is_some());
     }
 
     #[sqlx::test(migrations = "../../migrations")]
-    async fn list_active_facts_for_thought_returns_only_active(pool: PgPool) {
-        let scope = Scope::global();
-        let thought_id = insert_test_thought(&pool, "anchor", "global").await;
-        let run_id = start_run(&pool, "fake/extractor", 1, None).await.unwrap();
-        let active = insert_active_fact(
-            &pool, thought_id, &scope, "still alive", (None, None, None), run_id, 0.9,
-        )
-        .await;
-        let _other = insert_active_fact(
-            &pool, thought_id, &scope, "also alive", (None, None, None), run_id, 0.9,
-        )
-        .await;
-        let gone = insert_active_fact(
-            &pool, thought_id, &scope, "to be superseded", (None, None, None), run_id, 0.9,
-        )
-        .await;
-        supersede_fact(&pool, gone, None).await.unwrap();
-
-        let facts = list_active_facts_for_thought(&pool, thought_id).await.unwrap();
-        assert_eq!(facts.len(), 2);
-        let ids: Vec<Uuid> = facts.iter().map(|f| f.id).collect();
-        assert!(ids.contains(&active));
-        assert!(!ids.contains(&gone));
-    }
-
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn fetch_fact_returns_none_for_missing(pool: PgPool) {
-        let id = Uuid::new_v4();
-        let result = fetch_fact(&pool, id).await.unwrap();
-        assert!(result.is_none());
-    }
-
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn fetch_fact_returns_row_with_provenance(pool: PgPool) {
-        let scope = Scope::new("work").unwrap();
-        let thought_id = insert_test_thought(&pool, "anchor", "work").await;
-        let run_id = start_run(&pool, "fake/extractor", 1, None).await.unwrap();
-        let fact_id = insert_active_fact(
-            &pool, thought_id, &scope, "fetched", (Some("S"), Some("P"), Some("O")), run_id, 0.91,
-        )
-        .await;
-
-        let fact = fetch_fact(&pool, fact_id).await.unwrap().expect("must exist");
-        assert_eq!(fact.id, fact_id);
-        assert_eq!(fact.statement, "fetched");
-        assert_eq!(fact.subject.as_deref(), Some("S"));
-        assert_eq!(fact.source_thought_id, thought_id);
-        assert_eq!(fact.source_run_id, Some(run_id.0));
-        assert!((fact.confidence - 0.91).abs() < 1e-5);
-    }
-
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn supersede_fact_with_replacement_sets_columns(pool: PgPool) {
-        let scope = Scope::global();
-        let thought_id = insert_test_thought(&pool, "anchor", "global").await;
-        let run_id = start_run(&pool, "fake/extractor", 1, None).await.unwrap();
-        let old = insert_active_fact(
-            &pool, thought_id, &scope, "old", (None, None, None), run_id, 0.9,
-        )
-        .await;
-        let new = insert_active_fact(
-            &pool, thought_id, &scope, "new", (None, None, None), run_id, 0.9,
-        )
-        .await;
-
-        let did = supersede_fact(&pool, old, Some(new)).await.unwrap();
-        assert!(did);
-
-        let row = sqlx::query!(
-            r#"SELECT superseded_by, superseded_at FROM facts WHERE id = $1"#,
-            old,
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(row.superseded_by, Some(new));
-        assert!(row.superseded_at.is_some());
-    }
-
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn supersede_fact_without_replacement_sets_only_timestamp(pool: PgPool) {
-        let scope = Scope::global();
-        let thought_id = insert_test_thought(&pool, "anchor", "global").await;
-        let run_id = start_run(&pool, "fake/extractor", 1, None).await.unwrap();
-        let fact_id = insert_active_fact(
-            &pool, thought_id, &scope, "doomed", (None, None, None), run_id, 0.9,
-        )
-        .await;
-
-        let did = supersede_fact(&pool, fact_id, None).await.unwrap();
-        assert!(did);
-
-        let row = sqlx::query!(
-            r#"SELECT superseded_by, superseded_at FROM facts WHERE id = $1"#,
-            fact_id,
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert!(row.superseded_by.is_none());
-        assert!(row.superseded_at.is_some());
-    }
-
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn supersede_fact_on_already_superseded_returns_false(pool: PgPool) {
-        let scope = Scope::global();
-        let thought_id = insert_test_thought(&pool, "anchor", "global").await;
-        let run_id = start_run(&pool, "fake/extractor", 1, None).await.unwrap();
-        let fact_id = insert_active_fact(
-            &pool, thought_id, &scope, "loser", (None, None, None), run_id, 0.9,
-        )
-        .await;
-
-        assert!(supersede_fact(&pool, fact_id, None).await.unwrap());
-        assert!(!supersede_fact(&pool, fact_id, None).await.unwrap(),
-                "second supersede must report no-change");
-    }
-
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn find_facted_thoughts_returns_only_thoughts_with_active_facts(pool: PgPool) {
-        let scope = Scope::global();
-        let with_fact = insert_test_thought(&pool, "with fact", "global").await;
-        let _no_fact = insert_test_thought(&pool, "no fact", "global").await;
-        let only_superseded = insert_test_thought(&pool, "only superseded", "global").await;
-
-        let run_id = start_run(&pool, "fake/extractor", 1, None).await.unwrap();
-        insert_active_fact(&pool, with_fact, &scope, "active", (None, None, None), run_id, 0.9).await;
-        let gone = insert_active_fact(
-            &pool, only_superseded, &scope, "gone", (None, None, None), run_id, 0.9,
-        )
-        .await;
-        supersede_fact(&pool, gone, None).await.unwrap();
-
-        let facted = find_facted_thoughts(&pool, None, None, 100).await.unwrap();
-        let ids: Vec<ThoughtId> = facted.iter().map(|t| t.id).collect();
-        assert!(ids.contains(&with_fact));
-        assert!(!ids.contains(&only_superseded), "thought with only superseded facts must not appear");
-    }
-
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn find_facted_thoughts_respects_since_scope_limit(pool: PgPool) {
-        let work = Scope::new("work").unwrap();
-        let personal = Scope::new("personal").unwrap();
-        let run_id = start_run(&pool, "fake/extractor", 1, None).await.unwrap();
-
-        let t_work = insert_test_thought(&pool, "work one", "work").await;
-        let t_personal = insert_test_thought(&pool, "personal one", "personal").await;
-        insert_active_fact(&pool, t_work, &work, "wf", (None, None, None), run_id, 0.9).await;
-        insert_active_fact(&pool, t_personal, &personal, "pf", (None, None, None), run_id, 0.9).await;
-
-        // Scope filter.
-        let work_only = find_facted_thoughts(&pool, Some("work"), None, 10).await.unwrap();
-        assert_eq!(work_only.len(), 1);
-        assert_eq!(work_only[0].id, t_work);
-
-        // Since-in-future filter eliminates everything.
-        let future = OffsetDateTime::now_utc() + time::Duration::days(1);
-        let empty = find_facted_thoughts(&pool, None, Some(future), 10).await.unwrap();
-        assert!(empty.is_empty());
-
-        // Since-in-past keeps both.
-        let past = OffsetDateTime::now_utc() - time::Duration::days(1);
-        let both = find_facted_thoughts(&pool, None, Some(past), 10).await.unwrap();
-        assert_eq!(both.len(), 2);
-    }
-
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn find_matching_active_facts_handles_null_via_is_not_distinct_from(pool: PgPool) {
-        let scope = Scope::global();
-        let thought_id = insert_test_thought(&pool, "anchor", "global").await;
-        let run_id = start_run(&pool, "fake/extractor", 1, None).await.unwrap();
-        // Insert a fact with all-null triple.
-        let null_fact = insert_active_fact(
-            &pool, thought_id, &scope, "no triple", (None, None, None), run_id, 0.9,
-        )
-        .await;
-        // And one with a triple.
-        insert_active_fact(
-            &pool, thought_id, &scope, "with triple", (Some("S"), Some("P"), Some("O")), run_id, 0.9,
-        )
-        .await;
-
-        // Statement-or-triple OR predicate with a null-triple probe matches
-        // the null-triple row by the triple branch (Postgres `=` would return
-        // NULL on (NULL, NULL, NULL); `IS NOT DISTINCT FROM` is what makes
-        // it work).
-        let matches =
-            find_matching_active_facts(&pool, thought_id, "unrelated statement", None, None, None)
-                .await
-                .unwrap();
-        assert_eq!(matches.len(), 1, "null triple should match exactly one row");
-        assert_eq!(matches[0].id, null_fact);
-
-        // Exact triple match.
-        let triple_match = find_matching_active_facts(
-            &pool, thought_id, "unrelated statement", Some("S"), Some("P"), Some("O"),
-        )
-        .await
-        .unwrap();
-        assert_eq!(triple_match.len(), 1);
-        assert_eq!(triple_match[0].statement, "with triple");
-
-        // No match for an unrelated triple AND an unrelated statement.
-        let none = find_matching_active_facts(
-            &pool, thought_id, "still unrelated", Some("X"), Some("Y"), Some("Z"),
-        )
-        .await
-        .unwrap();
-        assert!(none.is_empty());
-    }
-
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn find_matching_active_facts_skips_superseded(pool: PgPool) {
-        let scope = Scope::global();
-        let thought_id = insert_test_thought(&pool, "anchor", "global").await;
-        let run_id = start_run(&pool, "fake/extractor", 1, None).await.unwrap();
-        let fact_id = insert_active_fact(
-            &pool, thought_id, &scope, "gone", (Some("S"), Some("P"), Some("O")), run_id, 0.9,
-        )
-        .await;
-        supersede_fact(&pool, fact_id, None).await.unwrap();
-
-        let result = find_matching_active_facts(
-            &pool, thought_id, "gone", Some("S"), Some("P"), Some("O"),
-        )
-        .await
-        .unwrap();
-        assert!(
-            result.is_empty(),
-            "superseded match must not be returned"
-        );
-    }
-
-    /// The M2 dogfood failure case: v1 fact has statement S, triple (a, b, c);
-    /// v2 extraction produces the same statement S but triple (x, y, z).
-    /// (S, P, O) match is empty; statement match catches it.
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn find_matching_active_facts_matches_on_statement_alone_when_triple_differs(
-        pool: PgPool,
-    ) {
-        let scope = Scope::global();
-        let thought_id = insert_test_thought(&pool, "anchor", "global").await;
-        let run_id = start_run(&pool, "fake/extractor", 1, None).await.unwrap();
-        let v1 = insert_active_fact(
-            &pool,
-            thought_id,
-            &scope,
-            "current API surface is append-only",
-            (Some("current API surface"), Some("is"), Some("append-only")),
-            run_id,
-            0.9,
-        )
-        .await;
-
-        // v2 probe: same statement, different decomposition.
-        let matches = find_matching_active_facts(
-            &pool,
-            thought_id,
-            "current API surface is append-only",
-            Some("thoughts in current API surface"),
-            Some("are"),
-            Some("append-only"),
-        )
-        .await
-        .unwrap();
-        assert_eq!(matches.len(), 1, "statement match must catch the v1 row");
-        assert_eq!(matches[0].id, v1);
-    }
-
-    /// The prior intended case: v1 has triple T and statement S; v2 produces
-    /// the same triple T but a different statement S'. Triple match catches it.
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn find_matching_active_facts_matches_on_triple_alone_when_statement_differs(
-        pool: PgPool,
-    ) {
-        let scope = Scope::global();
-        let thought_id = insert_test_thought(&pool, "anchor", "global").await;
-        let run_id = start_run(&pool, "fake/extractor", 1, None).await.unwrap();
-        let v1 = insert_active_fact(
-            &pool,
-            thought_id,
-            &scope,
-            "old wording",
-            (Some("S"), Some("P"), Some("O")),
-            run_id,
-            0.9,
-        )
-        .await;
-
-        let matches = find_matching_active_facts(
-            &pool,
-            thought_id,
-            "rephrased wording",
-            Some("S"),
-            Some("P"),
-            Some("O"),
-        )
-        .await
-        .unwrap();
-        assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].id, v1);
-    }
-
-    /// Pre-existing audit-corrupt state: two parallel-active rows that both
-    /// match the new probe. Both should come back so the caller can fold
-    /// them into one canonical row.
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn find_matching_active_facts_returns_multiple_when_audit_already_corrupt(
-        pool: PgPool,
-    ) {
-        let scope = Scope::global();
-        let thought_id = insert_test_thought(&pool, "anchor", "global").await;
-        let run_id = start_run(&pool, "fake/extractor", 1, None).await.unwrap();
-        // Two pre-existing actives: one matches by statement, the other by triple.
-        let a = insert_active_fact(
-            &pool,
-            thought_id,
-            &scope,
-            "shared statement",
-            (Some("a"), Some("b"), Some("c")),
-            run_id,
-            0.9,
-        )
-        .await;
-        let b = insert_active_fact(
-            &pool,
-            thought_id,
-            &scope,
-            "different wording",
-            (Some("S"), Some("P"), Some("O")),
-            run_id,
-            0.9,
-        )
-        .await;
-
-        // Probe matches `a` by statement and `b` by triple.
-        let matches = find_matching_active_facts(
-            &pool,
-            thought_id,
-            "shared statement",
-            Some("S"),
-            Some("P"),
-            Some("O"),
-        )
-        .await
-        .unwrap();
-        let ids: Vec<_> = matches.iter().map(|f| f.id).collect();
-        assert_eq!(ids.len(), 2);
-        assert!(ids.contains(&a));
-        assert!(ids.contains(&b));
-    }
-
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn find_matching_superseded_facts_returns_retraction_no_replacement(pool: PgPool) {
-        // The retraction-without-replacement case: `correct_fact` retract,
-        // or `retract_thought` cascade — `superseded_by` is NULL.
-        let scope = Scope::global();
-        let thought_id = insert_test_thought(&pool, "anchor", "global").await;
-        let run_id = start_run(&pool, "fake/extractor", 1, None).await.unwrap();
-        let fact_id = insert_active_fact(
-            &pool,
-            thought_id,
-            &scope,
-            "withdrawn claim",
-            (Some("S"), Some("P"), Some("O")),
-            run_id,
-            0.9,
-        )
-        .await;
-        supersede_fact(&pool, fact_id, None).await.unwrap();
-
-        let matches = find_matching_superseded_facts(
-            &pool,
-            thought_id,
-            "withdrawn claim",
-            Some("S"),
-            Some("P"),
-            Some("O"),
-        )
-        .await
-        .unwrap();
-        assert_eq!(matches.len(), 1);
-        let (fact, superseded_by) = &matches[0];
-        assert_eq!(fact.id, fact_id);
-        assert!(superseded_by.is_none(), "retraction-without-replacement carries NULL");
-    }
-
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn find_matching_superseded_facts_returns_replaced_with_canonical(pool: PgPool) {
-        // The "replaced by a different canonical" case: `superseded_by`
-        // points at another fact. Caller should inherit that canonical
-        // when re-extracting the same claim.
-        let scope = Scope::global();
-        let thought_id = insert_test_thought(&pool, "anchor", "global").await;
-        let run_id = start_run(&pool, "fake/extractor", 1, None).await.unwrap();
-        let old_id = insert_active_fact(
-            &pool,
-            thought_id,
-            &scope,
-            "old wording",
-            (Some("S"), Some("P"), Some("O")),
-            run_id,
-            0.9,
-        )
-        .await;
-        let canonical_id = insert_active_fact(
-            &pool,
-            thought_id,
-            &scope,
-            "new wording",
-            (Some("S"), Some("P"), Some("O")),
-            run_id,
-            0.9,
-        )
-        .await;
-        supersede_fact(&pool, old_id, Some(canonical_id)).await.unwrap();
-
-        let matches = find_matching_superseded_facts(
-            &pool,
-            thought_id,
-            "old wording",
-            Some("S"),
-            Some("P"),
-            Some("O"),
-        )
-        .await
-        .unwrap();
-        assert_eq!(matches.len(), 1);
-        let (fact, superseded_by) = &matches[0];
-        assert_eq!(fact.id, old_id);
-        assert_eq!(*superseded_by, Some(canonical_id));
-    }
-
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn find_subsuming_active_facts_filters_by_thought_subject_predicate(pool: PgPool) {
-        let scope = Scope::global();
-        let thought_id = insert_test_thought(&pool, "anchor", "global").await;
-        let other_thought = insert_test_thought(&pool, "different anchor", "global").await;
-        let run_id = start_run(&pool, "fake/extractor", 1, None).await.unwrap();
-
-        // Two candidates on the right thought, sharing (subject, predicate).
-        let general = insert_active_fact(
-            &pool,
-            thought_id,
-            &scope,
-            "Ron does not like Python",
-            (Some("Ron"), Some("does not like"), Some("Python")),
-            run_id,
-            0.9,
-        )
-        .await;
-        let specific = insert_active_fact(
-            &pool,
-            thought_id,
-            &scope,
-            "Ron does not like Python for enterprise software",
-            (Some("Ron"), Some("does not like"), Some("Python for enterprise software")),
-            run_id,
-            0.9,
-        )
-        .await;
-
-        // Distractors: same subject/predicate on a different thought; same
-        // thought but different predicate; same thought + predicate but
-        // NULL object (skipped per the helper's filter).
-        let _other_thought_match = insert_active_fact(
-            &pool,
-            other_thought,
-            &scope,
-            "Ron does not like Python",
-            (Some("Ron"), Some("does not like"), Some("Python")),
-            run_id,
-            0.9,
-        )
-        .await;
-        let _different_predicate = insert_active_fact(
-            &pool,
-            thought_id,
-            &scope,
-            "Ron prefers Rust",
-            (Some("Ron"), Some("prefers"), Some("Rust")),
-            run_id,
-            0.9,
-        )
-        .await;
-        let _null_object = insert_active_fact(
-            &pool,
-            thought_id,
-            &scope,
-            "Ron does not like programming",
-            (Some("Ron"), Some("does not like"), None),
-            run_id,
-            0.9,
-        )
-        .await;
-
-        let hits = find_subsuming_active_facts(&pool, thought_id, "Ron", "does not like")
+    async fn enqueue_tag_job_inserts_into_pending_tags(pool: PgPool) {
+        let id = insert_test_thought(&pool, "to tag", "global").await;
+        let inserted = enqueue_tag_job(&pool, id, "vllm/qwen2.5-7b-instruct")
             .await
             .unwrap();
-        let ids: Vec<_> = hits.iter().map(|f| f.id).collect();
-        assert_eq!(ids.len(), 2);
-        assert!(ids.contains(&general));
-        assert!(ids.contains(&specific));
+        assert!(inserted);
+
+        let jobs = fetch_pending_tag_jobs(&pool, 10).await.unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].thought_id, id);
+        assert_eq!(jobs[0].tagger_model_id, "vllm/qwen2.5-7b-instruct");
+        assert_eq!(jobs[0].attempts, 0);
     }
 
     #[sqlx::test(migrations = "../../migrations")]
-    async fn insert_review_queue_row_defaults_decision_to_pending(pool: PgPool) {
-        let thought_id = insert_test_thought(&pool, "questionable claim", "global").await;
-        let run_id = start_run(&pool, "fake/extractor", 1, None).await.unwrap();
+    async fn enqueue_tag_job_idempotent_on_conflict(pool: PgPool) {
+        let id = insert_test_thought(&pool, "to tag", "global").await;
+        let first = enqueue_tag_job(&pool, id, "v1").await.unwrap();
+        let second = enqueue_tag_job(&pool, id, "v1").await.unwrap();
+        assert!(first);
+        assert!(!second, "duplicate enqueue should be a no-op");
 
-        let row_id = insert_review_queue_row(
-            &pool,
-            NewReviewRow {
-                statement: "weak fact",
-                subject: None,
-                predicate: None,
-                object: None,
-                source_thought_id: thought_id,
-                extractor_model: "fake/extractor",
-                extractor_version: 1,
-                source_run_id: Some(run_id),
-                confidence: 0.3,
-            },
-        )
-        .await
-        .unwrap();
-
-        let row = sqlx::query!(
-            r#"SELECT statement, decision, confidence, reviewed_at, source_run_id
-               FROM facts_review_queue WHERE id = $1"#,
-            row_id,
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(row.statement, "weak fact");
-        assert_eq!(row.decision, "pending");
-        assert!((row.confidence - 0.3).abs() < 1e-5);
-        assert!(row.reviewed_at.is_none());
-        assert_eq!(row.source_run_id, Some(run_id.0));
+        let jobs = fetch_pending_tag_jobs(&pool, 10).await.unwrap();
+        assert_eq!(jobs.len(), 1);
     }
 
-    // -- M3 starter: thought retraction ----------------------------------
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn complete_tag_job_removes_from_queue(pool: PgPool) {
+        let id = insert_test_thought(&pool, "to tag", "global").await;
+        enqueue_tag_job(&pool, id, "v1").await.unwrap();
+
+        complete_tag_job(&pool, id).await.unwrap();
+
+        let jobs = fetch_pending_tag_jobs(&pool, 10).await.unwrap();
+        assert!(jobs.is_empty());
+    }
 
     #[sqlx::test(migrations = "../../migrations")]
-    async fn retract_thought_sets_retracted_at_and_supersedes_facts(pool: PgPool) {
-        let scope = Scope::global();
-        let thought_id = insert_test_thought(&pool, "wrong claim", "global").await;
-        let run_id = start_run(&pool, "fake/extractor", 1, None).await.unwrap();
-        insert_active_fact(&pool, thought_id, &scope, "f1", (None, None, None), run_id, 0.9).await;
-        insert_active_fact(&pool, thought_id, &scope, "f2", (None, None, None), run_id, 0.9).await;
-        insert_active_fact(&pool, thought_id, &scope, "f3", (None, None, None), run_id, 0.9).await;
+    async fn increment_tag_job_attempts_bumps_counter(pool: PgPool) {
+        let id = insert_test_thought(&pool, "to tag", "global").await;
+        enqueue_tag_job(&pool, id, "v1").await.unwrap();
 
-        let outcome = retract_thought(&pool, thought_id, Some("operator error"))
+        increment_tag_job_attempts(&pool, id).await.unwrap();
+        increment_tag_job_attempts(&pool, id).await.unwrap();
+
+        let jobs = fetch_pending_tag_jobs(&pool, 10).await.unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].attempts, 2);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn find_untagged_or_stale_thoughts_returns_only_null_when_rerun_false(pool: PgPool) {
+        let untagged = insert_test_thought(&pool, "untagged", "global").await;
+        let already_tagged = insert_test_thought(&pool, "already tagged", "global").await;
+        update_thought_tags(&pool, already_tagged, &Tags::default(), "v1-model", 1)
             .await
             .unwrap();
+
+        let walk = find_untagged_or_stale_thoughts(&pool, /*target_version*/ 1, /*rerun*/ false, None, None, 100)
+            .await
+            .unwrap();
+        let ids: Vec<ThoughtId> = walk.iter().map(|t| t.id).collect();
+        assert!(ids.contains(&untagged));
+        assert!(!ids.contains(&already_tagged));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn find_untagged_or_stale_thoughts_returns_stale_when_rerun_true(pool: PgPool) {
+        let untagged = insert_test_thought(&pool, "untagged", "global").await;
+        let stale_v1 = insert_test_thought(&pool, "stale at v1", "global").await;
+        update_thought_tags(&pool, stale_v1, &Tags::default(), "v1-model", 1)
+            .await
+            .unwrap();
+        let fresh_v2 = insert_test_thought(&pool, "fresh at v2", "global").await;
+        update_thought_tags(&pool, fresh_v2, &Tags::default(), "v2-model", 2)
+            .await
+            .unwrap();
+
+        // target_version=2, rerun=true → walks NULL and version<2.
+        let walk = find_untagged_or_stale_thoughts(&pool, 2, true, None, None, 100)
+            .await
+            .unwrap();
+        let ids: Vec<ThoughtId> = walk.iter().map(|t| t.id).collect();
+        assert!(ids.contains(&untagged));
+        assert!(ids.contains(&stale_v1));
+        assert!(!ids.contains(&fresh_v2));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn fetch_thought_tags_returns_none_for_missing_thought(pool: PgPool) {
+        let id = ThoughtId::new();
+        assert!(fetch_thought_tags(&pool, id).await.unwrap().is_none());
+    }
+
+    // -- M4: retraction (simplified — no fact cascade) ----------------------
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn retract_thought_sets_retracted_at(pool: PgPool) {
+        let id = insert_test_thought(&pool, "to retract", "global").await;
+        let outcome = retract_thought(&pool, id, Some("test reason")).await.unwrap();
         assert!(outcome.retracted);
-        assert_eq!(outcome.facts_superseded, 3);
 
         let row = sqlx::query!(
             r#"SELECT retracted_at, retracted_reason FROM thoughts WHERE id = $1"#,
-            thought_id.into_uuid(),
+            id.into_uuid(),
         )
         .fetch_one(&pool)
         .await
         .unwrap();
         assert!(row.retracted_at.is_some());
-        assert_eq!(row.retracted_reason.as_deref(), Some("operator error"));
-
-        let active_facts = sqlx::query!(
-            r#"SELECT COUNT(*) AS "n!" FROM facts
-               WHERE source_thought_id = $1 AND superseded_at IS NULL"#,
-            thought_id.into_uuid(),
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap()
-        .n;
-        assert_eq!(active_facts, 0);
+        assert_eq!(row.retracted_reason.as_deref(), Some("test reason"));
     }
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn retract_thought_is_idempotent_on_already_retracted(pool: PgPool) {
-        let thought_id = insert_test_thought(&pool, "wrong", "global").await;
-        let first = retract_thought(&pool, thought_id, None).await.unwrap();
+        let id = insert_test_thought(&pool, "to retract", "global").await;
+        let first = retract_thought(&pool, id, None).await.unwrap();
+        let second = retract_thought(&pool, id, None).await.unwrap();
         assert!(first.retracted);
-
-        let second = retract_thought(&pool, thought_id, Some("ignored")).await.unwrap();
         assert!(!second.retracted);
-        assert_eq!(second.facts_superseded, 0);
     }
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn retract_thought_on_missing_id_reports_no_op(pool: PgPool) {
         let outcome = retract_thought(&pool, ThoughtId::new(), None).await.unwrap();
         assert!(!outcome.retracted);
-        assert_eq!(outcome.facts_superseded, 0);
     }
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn retracted_thought_excluded_from_recent_thoughts(pool: PgPool) {
-        let kept = insert_test_thought(&pool, "kept", "global").await;
-        let gone = insert_test_thought(&pool, "gone", "global").await;
-        retract_thought(&pool, gone, None).await.unwrap();
+        let active = insert_test_thought(&pool, "active", "global").await;
+        let retracted = insert_test_thought(&pool, "retracted", "global").await;
+        retract_thought(&pool, retracted, None).await.unwrap();
 
-        let results = recent_thoughts(&pool, None, 10).await.unwrap();
-        let ids: Vec<ThoughtId> = results.iter().map(|t| t.id).collect();
-        assert!(ids.contains(&kept));
-        assert!(!ids.contains(&gone), "retracted thought must not appear");
+        let recent = recent_thoughts(&pool, None, 10).await.unwrap();
+        let ids: Vec<ThoughtId> = recent.iter().map(|t| t.id).collect();
+        assert!(ids.contains(&active));
+        assert!(!ids.contains(&retracted));
     }
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn retracted_thought_excluded_from_search_trigram(pool: PgPool) {
-        let kept = insert_test_thought(&pool, "kept widget alpha", "global").await;
-        let gone = insert_test_thought(&pool, "gone widget alpha", "global").await;
-        retract_thought(&pool, gone, None).await.unwrap();
+        let _active = insert_test_thought(&pool, "unique_keyword active", "global").await;
+        let retracted = insert_test_thought(&pool, "unique_keyword retracted", "global").await;
+        retract_thought(&pool, retracted, None).await.unwrap();
 
-        let hits = search_trigram(&pool, "widget", None, 10).await.unwrap();
-        let ids: Vec<ThoughtId> = hits.iter().map(|h| h.thought.id).collect();
-        assert!(ids.contains(&kept));
-        assert!(!ids.contains(&gone));
+        let hits = search_trigram(&pool, "unique_keyword", None, 10).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_ne!(hits[0].thought.id, retracted);
     }
 
     #[sqlx::test(migrations = "../../migrations")]
-    async fn retracted_thought_excluded_from_find_unfacted_thoughts(pool: PgPool) {
-        let kept = insert_test_thought(&pool, "kept", "global").await;
-        let gone = insert_test_thought(&pool, "gone", "global").await;
-        retract_thought(&pool, gone, None).await.unwrap();
+    async fn retracted_thought_excluded_from_find_untagged_or_stale(pool: PgPool) {
+        let active = insert_test_thought(&pool, "active", "global").await;
+        let retracted = insert_test_thought(&pool, "retracted", "global").await;
+        retract_thought(&pool, retracted, None).await.unwrap();
 
-        let pending = find_unfacted_thoughts(&pool, None, 100).await.unwrap();
-        let ids: Vec<ThoughtId> = pending.iter().map(|t| t.id).collect();
-        assert!(ids.contains(&kept));
-        assert!(!ids.contains(&gone), "reflector must not see retracted thoughts");
-    }
-
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn retracted_thought_excluded_from_find_facted_thoughts(pool: PgPool) {
-        let scope = Scope::global();
-        let thought_id = insert_test_thought(&pool, "anchor", "global").await;
-        let run_id = start_run(&pool, "fake/extractor", 1, None).await.unwrap();
-        insert_active_fact(&pool, thought_id, &scope, "f1", (None, None, None), run_id, 0.9).await;
-
-        // Before retraction: visible in find_facted_thoughts.
-        let before = find_facted_thoughts(&pool, None, None, 100).await.unwrap();
-        assert!(before.iter().any(|t| t.id == thought_id));
-
-        retract_thought(&pool, thought_id, None).await.unwrap();
-
-        // After retraction: gone — because the auto-supersede dropped its
-        // active facts, *and* the new retraction filter would have caught
-        // it anyway. Belt-and-braces.
-        let after = find_facted_thoughts(&pool, None, None, 100).await.unwrap();
-        assert!(after.iter().all(|t| t.id != thought_id));
-    }
-
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn retracted_thought_excludes_its_facts_from_search_facts_trigram(pool: PgPool) {
-        let scope = Scope::global();
-        let thought_id = insert_test_thought(&pool, "anchor", "global").await;
-        let run_id = start_run(&pool, "fake/extractor", 1, None).await.unwrap();
-        insert_active_fact(
-            &pool, thought_id, &scope, "search me later", (None, None, None), run_id, 0.9,
-        )
-        .await;
-
-        // Before retraction: fact is searchable.
-        let before = search_facts_trigram(&pool, "search me", None, 10).await.unwrap();
-        assert_eq!(before.len(), 1);
-
-        retract_thought(&pool, thought_id, None).await.unwrap();
-
-        // After: fact is gone from search_facts (because auto-superseded *and*
-        // the JOIN on thoughts now filters retracted).
-        let after = search_facts_trigram(&pool, "search me", None, 10).await.unwrap();
-        assert!(after.is_empty());
+        let walk = find_untagged_or_stale_thoughts(&pool, 1, false, None, None, 100)
+            .await
+            .unwrap();
+        let ids: Vec<ThoughtId> = walk.iter().map(|t| t.id).collect();
+        assert!(ids.contains(&active));
+        assert!(!ids.contains(&retracted));
     }
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn fetch_thought_with_provenance_surfaces_retracted_at(pool: PgPool) {
+        let id = insert_test_thought(&pool, "to retract", "global").await;
+        retract_thought(&pool, id, Some("operator decision")).await.unwrap();
+
         let model = EmbeddingModel::bge_m3();
-        let thought_id = insert_test_thought(&pool, "anchor", "global").await;
-
-        let before = fetch_thought_with_provenance(&pool, thought_id, &model)
+        let prov = fetch_thought_with_provenance(&pool, id, &model)
             .await
             .unwrap()
             .unwrap();
-        assert!(before.retracted_at.is_none());
-        assert!(before.retracted_reason.is_none());
-
-        retract_thought(&pool, thought_id, Some("test reason"))
-            .await
-            .unwrap();
-
-        let after = fetch_thought_with_provenance(&pool, thought_id, &model)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(after.retracted_at.is_some());
-        assert_eq!(after.retracted_reason.as_deref(), Some("test reason"));
+        assert!(prov.retracted_at.is_some());
+        assert_eq!(prov.retracted_reason.as_deref(), Some("operator decision"));
     }
 }
