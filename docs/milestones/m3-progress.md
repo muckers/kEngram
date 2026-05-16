@@ -155,19 +155,23 @@ End state: three-band confidence routing live with `flagged` surfacing in MCP re
 
 ## Phase D — Operator dogfood + close-out
 
-Not yet planned. Items:
+**Closed out 2026-05-16; outcome is the M4 collapse.** Items:
 
-- [ ] Run M3 for ~1 week of real use.
-- [ ] Evaluate against milestone-level Success criteria in `m3-search-quality.md`.
-- [ ] Decide rerank-on-by-default vs off based on daily-use feel.
-- [ ] Write the closing `m3-progress.md` History entry.
-- [ ] Mark M3 ✅ in `README.md`.
+- [x] Run M3 for ~1 week of real use. *(7 rounds of dogfood against the v4 extractor prompt + `qwen3-coder:30b` between 2026-05-15 and 2026-05-16.)*
+- [x] Evaluate against milestone-level Success criteria in `m3-search-quality.md`. *(Retrieval criteria met; extraction criteria — three-band-routing utility, dedup-via-supersession robustness, SPO-fidelity — all surfaced fundamental abstraction-level problems rather than tunable parameters. See `m3-search-quality.md` for the per-criterion verdict.)*
+- [x] Decide rerank-on-by-default vs off based on daily-use feel. *(Rerank on by default; the cross-encoder calibration measurably moves the right answer up.)*
+- [x] Write the closing `m3-progress.md` History entry. *(2026-05-16 entry above.)*
+- [x] Mark M3 ✅ in `README.md`. *(Done in the M4 Wave 5b documentation pass.)*
+
+The 7 dogfood rounds produced negative knowledge: *the extraction-side abstraction was wrong for the use case.* Statements were faithful; triples were brittle in ways no v4 prompt iteration could consistently fix. Rather than ship M3 with a known-broken extraction surface and try to fix it in a follow-on prompt-engineering loop, the operator and architect agreed to collapse the schema (M4, [Path B-OB1](../engram-design-v0.md#10-operational-shape--what-makes-the-store-honest)) and retire the facts pipeline entirely. The M3 retrieval improvements (hybrid + reranker + A/B harness) all survive the collapse and operate on the simpler thoughts-only schema.
 
 ## History
 
 Dated notes appended as items land. Format: `YYYY-MM-DD — <one-line summary>`. Multi-line entries fine for decisions that need explanation.
 
 <!-- Most recent entry first. -->
+
+- **2026-05-16** — **M3 closed out; close-out is M4.** Retrieval portion shipped end-to-end (Phase A pipeline-quality fixes + Phase B step 1 fact embeddings + Phase B step 2 cross-encoder reranker + Phase B step 3 A/B benchmarking harness + Phase C deeper pipeline quality with three-band routing / flagged / subsumption-aware dedup / quality-aware canonical selection / per-claim retraction durability). Phase D operator dogfood ran 7 rounds against the v4 extractor prompt + `qwen3-coder:30b`; the convergent finding across all 7 was **statements faithful, triples broken** — comparative S/O inversion, self-referential subjects, conditional-as-subject, predicate verbosity, polarity contradictions, triple-semantic drift. Each prompt patch traded one failure mode for another; no v4 prompt iteration consistently produced clean SPO triples. The consumer (LLM agents reading prose) doesn't query by (S, P, O); the producer (local 30B coding model) can't reliably emit them. **The substrate generating the failure modes was the wrong abstraction for the use case.** Independent corroboration arrived 2026-03-11 via Nate B. Jones's [Open Brain (OB1)](https://github.com/NateBJones-Projects/OB1) — same problem space (MCP-native personal memory), single `thoughts` table, LLM extraction collapsed into a JSONB `metadata` column. Stated philosophy: *raw data is permanent, embeddings (and tags) are derived.* M4 collapses Engram to the OB1 shape with the M3-shipped retrieval improvements preserved (`pg_trgm` + RRF hybrid + cross-encoder rerank); the facts table goes away, replaced by a JSONB `tags` sidecar (people / action_items / topics / dates_mentioned / kind) on the same row. Plan and progress live in `docs/milestones/m4-collapse-to-thoughts.md`; the prescriptive contract for downstream waves is in `docs/milestones/m4-spec.md`. **M3 status: ✅ retrieval shipped; extraction-side close-out is the M4 collapse.**
 
 - **2026-05-16** — **Phase D dogfood round 2: triple-coherence + meta-policy + confidence-vs-triple findings.** Clean run against fresh scope `engram.m3.dogfood` on source thought `8a533e15` (a ~700-char mission statement with 6 propositions). Reflector emitted 5 facts at confidence ≥ 0.90 (none flagged); **statements were all faithful** (paraphrase-correct), but **4-of-5 triples were systematically broken** — inverted, partial, self-referential, or semantically drifted. Three new items filed under `## In scope > Pipeline quality` in `m3-search-quality.md`:
 

@@ -91,23 +91,22 @@ The migration creates the three required extensions in the `engram` database and
 
 ```bash
 cargo build --workspace
-cargo test --workspace                       # unit + sqlx::test (~140 from M2 Phase B)
+cargo test --workspace                       # unit + sqlx::test
 cargo test --workspace --features integration   # adds a live-Ollama round-trip test
 
 cargo run --bin engram -- serve              # starts the MCP server on 127.0.0.1:8080
 cargo run --bin engram -- worker             # in a second shell — drains pending_embeddings
 ```
 
-Point an MCP-capable client (Claude Code, Claude Desktop, `mcp-inspector`) at `http://127.0.0.1:8080/mcp` (streamable-HTTP transport, per the current MCP spec). Six tools are exposed:
+Point an MCP-capable client (Claude Code, Claude Desktop, `mcp-inspector`) at `http://127.0.0.1:8080/mcp` (streamable-HTTP transport, per the current MCP spec). Five tools are exposed:
 
-- `capture` — write a thought; returns `thought_id` + `embedding_status: "pending"`.
-- `search_thoughts` — RRF-fused vector + trigram retrieval over thoughts; recency-boosted.
+- `capture` — write a thought; returns `thought_id`, `embedding_status: "pending"`, and `is_duplicate`. Same content captured twice (SHA-256 fingerprint match) returns the existing `thought_id`.
+- `search_thoughts` — RRF-fused vector + trigram retrieval over thoughts; recency-boosted; optional cross-encoder rerank; optional `tag_filter` JSONB-containment filter (e.g. `{"kind": "task"}`). Each hit carries its `tags` object.
 - `recent_thoughts` — chronological browse.
-- `get_thought` — full thought + provenance + active `linked_facts`.
-- `search_facts` — trigram search over facts with source-thought enrichment (M3 adds the vector leg).
-- `correct_fact` — operator-driven supersede with optional manual-author replacement.
+- `get_thought` — full thought + provenance + tags + tagger provenance.
+- `retract_thought` — mark a thought as untrusted (excluded from retrieval; still visible via `get_thought` for audit).
 
-`engram serve` and `engram worker` are paired: `serve` writes thoughts and enqueues embedding jobs; `worker` drains the queue and (with `reflector.enabled = true`) runs the reflector cron that produces facts. Running `serve` without `worker` is fine — thoughts are still durable and trigram-searchable — but vector kNN won't surface them and no facts will be extracted until the worker runs.
+`engram serve` and `engram worker` are paired: `serve` writes thoughts and enqueues embedding + tag jobs; `worker` drains both queues (`pending_embeddings` and `pending_tags`). Running `serve` without `worker` is fine — thoughts are still durable and trigram-searchable — but vector kNN won't surface them and tags stay empty until the worker runs. When `[tagger].provider` is empty, the tag-job enqueue at capture is a no-op and the tag drainer doesn't spawn.
 
 `sqlx::query!` macros and the `sqlx::test` attribute both require `DATABASE_URL` to be set at *build time*, not just at runtime. The `.env` file at the workspace root is read by `sqlx-cli` but NOT by `cargo build` — set `DATABASE_URL` in your shell or pass it inline: `DATABASE_URL=... cargo build`.
 
@@ -134,35 +133,30 @@ cargo run --bin engram -- embed-backfill --limit 1000
 # or restricted to one scope:
 cargo run --bin engram -- embed-backfill --scope work --limit 100
 
-# One-shot reflector run: like a single tick of the worker's cron task.
-# Requires vLLM (or another OpenAI-compatible extractor endpoint) up on the
-# `[extractor]` config's endpoint. Useful for catching up after the operator
-# captured a batch of thoughts with `reflector.enabled = false`.
-cargo run --bin engram -- reflect --limit 50
-cargo run --bin engram -- reflect --scope work --limit 100
+# One-shot tagger run: like a single tick of the worker's tag drainer.
+# Tags thoughts where `tags_extractor_version IS NULL`. Requires vLLM
+# (or another OpenAI-compatible chat endpoint) reachable on the
+# `[tagger]` config's endpoint. Useful for catching up after capturing
+# a batch of thoughts before configuring `[tagger]`.
+cargo run --bin engram -- tag --limit 50
+cargo run --bin engram -- tag --scope work --limit 100
 
-# Rerun: re-evaluate already-facted thoughts. Use this after upgrading the
-# extractor model. Dedup predicate is "statement match OR (S, P, O) match" —
-# either signal counts as the same claim. For each new extraction:
-#   - no match → insert as a brand-new claim.
-#   - match, byte-identical to an active row → no-op (no insert, no
-#     supersession); drift rows on the same claim fold into the byte-
-#     identical canonical via `superseded_by`.
-#   - match, none byte-identical → insert the new row as canonical; drift
-#     rows fold into it via `superseded_by`. Audit trail preserved.
-# Existing facts the new extractor *doesn't* produce stay active (no
-# subtractive logic — sampling variance shouldn't silently lose claims).
-# Low-confidence rerun extractions route to the review queue and do NOT
-# supersede the active row. Pair with --since to bound the rerun to recent
-# thoughts.
-cargo run --bin engram -- reflect --rerun --scope work
-cargo run --bin engram -- reflect --rerun --since 2026-04-01T00:00:00Z
+# Re-tag: re-run the tagger over thoughts whose stored
+# `tags_extractor_version` is below the configured current version.
+# Use this after bumping `[tagger].model_version` (typically after a
+# prompt or schema change). Tags are overwritten in place — no
+# supersede semantics, no audit chain. Pair with --since to bound the
+# rerun to recent thoughts. Use `--since 1970-01-01T00:00:00Z` to
+# re-tag the entire corpus (e.g. after enabling the tagger for the
+# first time on a previously-captured backlog).
+cargo run --bin engram -- tag --rerun --scope work
+cargo run --bin engram -- tag --rerun --since 2026-04-01T00:00:00Z
 
 # A/B-benchmark the reranker against RRF-only on an operator-curated
 # fixture corpus. Prints a markdown table to stdout with per-query
 # nDCG@10 and MRR for both rankings, plus an AVERAGE row. Requires a
 # configured [reranker] section in engram.toml and the corpus's
-# relevant_ids to point at real rows in your DB. See
+# relevant_ids to point at real thought_id rows in your DB. See
 # tests/fixtures/bench-rerank.example.json for the schema.
 cargo run --bin engram -- bench rerank --corpus ~/.engram/my-bench.json
 ```
@@ -190,33 +184,21 @@ dimensions = 1024
 timeout_seconds = 5
 
 [worker]
-tick_interval_seconds = 5                # how often `engram worker` drains the queue
-batch_size = 16                          # max jobs per tick
+tick_interval_seconds = 5                # how often `engram worker` drains pending_embeddings and pending_tags
+batch_size = 16                          # max jobs per tick (per queue)
 
-[extractor]
-provider = "openai-compatible"           # also "openrouter"
+[tagger]                                 # M4. Empty provider = silent disable: no tag jobs enqueued, no tag drainer.
+provider = "openai-compatible"           # also "openrouter"; "" = disabled
 endpoint = "http://localhost:8000/v1"    # vLLM default; OpenRouter is https://openrouter.ai/api/v1
 model_name = "qwen2.5-7b-instruct"       # the model the backend serves
-model_id = "vllm/qwen2.5-7b-instruct"    # provenance written into facts.extractor_model
-model_version = 4                        # bump when prompt/schema changes; v4 = relations rule + reinforced SPO few-shots for the dogfood leak set + flagged-band framing (2026-05-15, M3 Phase C). v3 = SPO decomposition rules + tighter confidence rubric + episodic negatives (2026-05-14).
+model_id = "vllm/qwen2.5-7b-instruct"    # provenance written into thoughts.tags_extractor_model
+model_version = 1                        # tagger prompt/schema version; bump on change and `engram tag --rerun` to re-tag rows whose stored version is older.
+api_key = ""                             # bearer token for hosted endpoints (OpenRouter, etc.)
 timeout_seconds = 60                     # vLLM JSON-Schema responses can run long
 temperature = 0.2
-max_facts_per_thought = 8
-# system_prompt_file = "~/.config/engram/extractor-prompt.txt"
-# When set, the file's contents replace the bundled prompt. Must contain
-# the {MAX_FACTS} placeholder. Operator is responsible for bumping
-# model_version when the prompt changes. The extractor emits a WARN at
-# startup when a custom prompt is in use.
-
-[reflector]
-enabled = false                          # opt-in: flip to true when vLLM is running
-schedule = "0 0 3 * * *"                 # 6-field cron: sec min hour dom month dow (03:00 daily)
-scope_filter = ""                        # leave blank for all scopes
-max_thoughts_per_run = 1000
-max_facts_per_thought = 8
-review_queue_below = 0.7                 # confidence < this → facts_review_queue (M3 Phase C three-band lower bound)
-min_confidence_to_store = 0.85           # M3 Phase C: review_queue_below ≤ confidence < this → facts with flagged=true; ≥ → facts with flagged=false. Kill-switch: set equal to review_queue_below to collapse back to two-band routing (every committed row flagged=false).
-subsumption_keep = "specific"            # M3 Phase C: when two facts on the same thought share (subject, predicate) and one's object refines the other, keep the more "specific" (default) or "general"
+# system_prompt_file = "~/.config/engram/tagger-prompt.txt"
+# When set, the file's contents replace the bundled v1 tagger prompt.
+# Operator is responsible for bumping model_version when the prompt changes.
 
 [reranker]                                              # M3 Phase B step 2; opt-in
 provider = "tei"                                        # "" = disabled (default); "tei" = TEI sidecar
@@ -225,7 +207,7 @@ model_id = "cross-encoder/ms-marco-MiniLM-L-6-v2"      # small/fast dev default;
 timeout_seconds = 30
 ```
 
-Env override examples: `ENGRAM_WORKER__TICK_INTERVAL_SECONDS=2 cargo run --bin engram -- worker` (snappier ticks for development), `ENGRAM_REFLECTOR__ENABLED=true ENGRAM_REFLECTOR__SCHEDULE="*/30 * * * * *"` (every 30 seconds — useful for live dogfood), `ENGRAM_EXTRACTOR__API_KEY=sk-...` (OpenRouter key without checking it into config).
+Env override examples: `ENGRAM_WORKER__TICK_INTERVAL_SECONDS=2 cargo run --bin engram -- worker` (snappier ticks for development), `ENGRAM_TAGGER__API_KEY=sk-...` (OpenRouter key without checking it into config), `ENGRAM_TAGGER__PROVIDER=""` (silent-disable the tagger for a run).
 
 ## Port conflicts
 
