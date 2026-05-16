@@ -1,32 +1,31 @@
-# M5 — Operational maturity
+# M6 — Operational maturity
 
 ## Goal
 
-Engram becomes production-shaped: observable, securable for non-Tailnet access, backed up, and continuously evaluated. After M5 the operator can confidently run engram for years and — should they choose — share access with non-Tailnet clients (Claude Desktop, ChatGPT) without giving up on auth or audit.
+Engram becomes production-shaped: observable, securable for non-Tailnet access, backed up, and continuously evaluated. After M6 the operator can confidently run engram for years and — should they choose — share access with non-Tailnet clients (Claude Desktop, ChatGPT) without giving up on auth or audit.
 
-This milestone is omnibus by design. It bundles the operational concerns that earned their keep in M1–M4 but were deferred so the core loop could ship faster.
+This milestone is omnibus by design. It bundles the operational concerns that earned their keep in M1–M5 but were deferred so the core loop could ship faster.
 
 ## In scope
 
-- **Prometheus `/metrics` endpoint.** Exposed on the same axum server. Metrics: capture-rate, search-latency P50/P95/P99 (per tool), embedding-queue depth, embedder failure count, extractor failure count, fact-review-queue size.
+- **Prometheus `/metrics` endpoint.** Exposed on the same axum server. Metrics: capture-rate, search-latency P50/P95/P99 (per tool), embedding-queue depth, embedder failure count, tagger-queue depth, tagger failure count.
 - **Tier 2 auth.** Bearer tokens validated against a hashed allowlist in a new `engram_tokens` table. Per-token scope-list — a token can be locked to `work.*` and not see `personal.*`. Audit log records `(token_id, tool, args_hash, ts)` for every call. Allow/deny is enforced at the MCP handler layer.
 - **Backup tooling.** Scripts (likely systemd timers + small shell wrappers; the operator's preference) for nightly `pg_dump --format=custom` to a separate disk, weekly off-site copy (Backblaze B2 / rsync.net). A new CLI subcommand `engram restore --from <dump>` for disaster-recovery validation.
 - **Eval suite.** Three suites per design doc §13 — capture-recall, cross-model retrieval consistency, LongMemEval-style. Runs via `engram eval --suite <name>`; emits a JSON report. Fixture corpus is a small, version-controlled set of seeded conversations and target queries.
-- **`stats` MCP tool.** Per-scope counts, last activity timestamp, embedding model id and version, number of facts, queue depths.
+- **`stats` MCP tool.** Per-scope counts, last activity timestamp, embedding model id and version, tagger model id and version, queue depths.
 - **Tier 1 → Tier 2 deployment guide.** A short ops doc covering the steps to expose engram outside the Tailnet (Cloudflare Tunnel or Caddy + Let's Encrypt; token issuance; revocation).
-- **Catch-up-on-startup for the reflector cron.** `tokio-cron-scheduler` fires at the next occurrence of a configured wall-clock time; it doesn't replay missed firings. On a laptop deployment with a closed lid at 3am (the default schedule), the cron literally never fires, period. Surfaced 2026-05-14 during M2 dogfood when the operator noticed `reflector_runs` had no entries from any 3am window despite the worker running. Fix: on `engram worker` startup with `[reflector] enabled = true`, query `MAX(finished_at) FROM reflector_runs WHERE error IS NULL`; if NULL or older than a configurable threshold (default: max(24h, schedule's natural interval)), trigger one `run_reflector_once` immediately before handing control to `JobScheduler`. ~20 LOC, one new storage fn (`most_recent_reflector_run_finished_at`), no schema change. Could move to M3 if dogfood reveals the friction earlier — it's small enough.
 
 ## Out of scope (deferred to which milestone)
 
 - Tier 3 (public + multi-user) — out of scope indefinitely. Would require OAuth2, per-user data partitioning, much more audit infrastructure. Implementable later if there's a reason, which is currently not foreseen.
 - Web UI — out of scope indefinitely.
 - Cross-instance replication — Postgres logical replication is straightforward but only worth doing if actually used.
-- Memory forgetting / TTL policies — possibly post-M5 if the operator finds engram retains things they want pruned.
-- Capture UX surfaces (Telegram bot, Raycast extension, browser extension) — possibly post-M5 as standalone projects that talk to engram via MCP.
+- Memory forgetting / TTL policies — possibly post-M6 if the operator finds engram retains things they want pruned.
+- Capture UX surfaces (Telegram bot, Raycast extension, browser extension) — possibly post-M6 as standalone projects that talk to engram via MCP.
 
 ## Schema impact
 
-Migration `0004_operational.sql` adds:
+A new migration (next available number after the M4 `0006_collapse_to_thoughts.sql`) adds:
 
 - `engram_tokens (id, hash, scopes, label, created_at, revoked_at)` — bearer token registry.
 - `engram_audit (id, token_id, tool, args_hash, ts)` — call audit log. Append-only; rotated externally.
@@ -35,7 +34,7 @@ The eval suite is filesystem-resident (fixture YAML / JSON; report JSON output).
 
 ## MCP surface delta
 
-- `stats(scope?: string) -> { thoughts: int, facts: int, last_capture_at: timestamptz, embedding_model_id: string, embedding_count: int, queue_depth: int, ... }` — the omnibus introspection tool.
+- `stats(scope?: string) -> { thoughts: int, last_capture_at: timestamptz, embedding_model_id: string, embedding_count: int, tagger_model_id: string, tagged_count: int, queue_depth: int, ... }` — the omnibus introspection tool.
 
 No other tool's signature changes; auth is enforced at the MCP-handler level and is invisible to compliant callers.
 
@@ -48,14 +47,14 @@ No other tool's signature changes; auth is enforced at the MCP-handler level and
 
 ## Dependencies
 
-- **Prior milestones:** all (M1–M4). Many of M5's metrics are only meaningful once the worker (M2), reranker (M3), and artifacts (M4) exist.
+- **Prior milestones:** all (M1–M5). Many of M6's metrics are only meaningful once the worker (M2), reranker (M3), tagger (M4), and artifacts (M5) exist.
 - **External services:** a Prometheus scraper for `/metrics` to be useful (operator-managed; out of engram's scope). Cloudflare Tunnel / Caddy if Tier 2 is used.
 
 ## Success criteria
 
 1. **Prometheus integrated.** A scraper targeting `/metrics` produces a usable dashboard. Operator can answer "what's my capture-rate this week?" and "is my embedding queue growing?" without `psql`.
 2. **Tier 2 auth enforced.** A request with a missing or invalid token gets a clean 401. A token with `scope: ["work.*"]` cannot read `personal.*` thoughts. The audit log shows one row per request.
-3. **Backup + restore round-trip.** A `pg_dump` taken yesterday, restored to a fresh Postgres, plus the engram binary booted against that DB → all M1–M4 functionality works end-to-end. The operator has done this at least once and trusts the runbook.
+3. **Backup + restore round-trip.** A `pg_dump` taken yesterday, restored to a fresh Postgres, plus the engram binary booted against that DB → all M1–M5 functionality works end-to-end. The operator has done this at least once and trusts the runbook.
 4. **Eval suite reproducible.** `engram eval --suite capture-recall` produces the same JSON report on a clean checkout. Cross-model eval (re-embed with a different model, measure top-10 overlap) detects an obvious quality regression intentionally introduced for the test.
 5. **Operator dogfood.** Engram has been running for a quarter; backups exist and have been restored at least once for verification; the eval suite has caught at least one real regression during development; the operator is comfortable enough to consider sharing it.
 

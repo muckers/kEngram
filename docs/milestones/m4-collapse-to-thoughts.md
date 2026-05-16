@@ -513,3 +513,87 @@ Wave 5: CLI, DOCS (2 agents, parallel) → INTEGRATE (coordinator)
 5. **Empty `[tagger]` config behavior**: silently disable (no tag drainer runs)? Or refuse to boot? Recommendation: silent-disable, matches `[reranker]` pattern from Phase B.
 
 These are settled by the SPEC agent (or human in lieu of), and the answers go into `docs/milestones/m4-spec.md` for downstream agents to reference.
+
+## Progress
+
+Living checklist tracking M4 implementation; **History** at the bottom captures dated notes per wave merge. Wave 5a (CLI) and Wave 5b (DOCS) run in parallel on isolated worktrees; commit hashes for those waves are filled in once the coordinator merges them.
+
+### Wave 1 — SPEC
+- [x] `docs/milestones/m4-spec.md` written; 5 open questions answered; types, JSON schema, prompt v1, migration SQL all locked.
+
+### Wave 2 — CORE (`engram-core`)
+- [x] `Thought` extended with `content_fingerprint: [u8; 32]` + 4 tag-related fields.
+- [x] `tags.rs` new module: `Tags` struct + `TagKind` enum with serde + tests.
+- [x] `extractor.rs` repurposed to `tagger.rs`: `Tagger` trait + `TaggerError` (with `is_transient`).
+- [x] `fact.rs` deleted.
+- [x] Re-exports in `lib.rs` updated.
+- [x] `cargo build -p engram-core` / `cargo test -p engram-core` / clippy clean.
+
+### Wave 3a — STORAGE (`engram-storage`)
+- [x] Drop all fact functions, `RunId`, `start_run`/`finish_run`, review-queue helpers, `NewReviewRow`.
+- [x] `NewThought` gains `content_fingerprint`; `insert_thought` returns `(InsertedThought, is_new)` via ON CONFLICT.
+- [x] `retract_thought` drops fact-cascade UPDATE.
+- [x] New: `update_thought_tags`, `enqueue_tag_job`, `fetch_thought_tags`, `fetch_pending_tag_jobs`, `complete_tag_job`, `increment_tag_job_attempts`, `find_untagged_or_stale_thoughts`.
+- [x] All SELECT paths on `thoughts` updated for new columns.
+- [x] Tests: dedup-by-fingerprint paths, tag update, queue mechanics.
+
+### Wave 3b — MIGRATION (`migrations/0006_collapse_to_thoughts.sql`)
+- [x] DROP `facts_review_queue`, `reflector_runs`, `facts` CASCADE.
+- [x] DELETE fact-targeted rows from `embeddings` + `pending_embeddings`.
+- [x] ALTER `thoughts` to add `content_fingerprint`, `tags`, `tags_extractor_*`.
+- [x] Backfill `content_fingerprint = digest(content, 'sha256')`.
+- [x] Lock NOT NULL + UNIQUE on fingerprint; GIN index on `tags`.
+- [x] CREATE `pending_tags` queue table.
+- [x] Clean apply against fresh DB; idempotent re-run.
+
+### Wave 3c — EXTRACT (`engram-extract`)
+- [x] `OpenAICompatibleExtractor` → `OpenAICompatibleTagger`; new `BUNDLED_TAGGER_PROMPT` + `tags_response_format`.
+- [x] `FakeExtractor` → `FakeTagger` with `Empty` / `Canned(Tags)` / `Substring(map)` / soft-fail behaviors.
+- [x] Lib re-exports updated; tests rewritten.
+- [x] `cargo build -p engram-extract` / tests / clippy clean.
+
+### Wave 4 — MCP (`engram-mcp`)
+- [x] Delete `reflect.rs`, `correct.rs`, all `search_facts` code in `search.rs`.
+- [x] `search_thoughts` gains `tag_filter`; `SearchHit` gains `tags`.
+- [x] `capture` computes SHA-256, threads `is_new` → `is_duplicate`; enqueues both embedding and tag jobs on insert.
+- [x] `retract_thought` drops fact-cascade reporting.
+- [x] `drain.rs` split into embed-drainer + tag-drainer.
+- [x] `backfill.rs` drops fact-target arm (thoughts-only).
+- [x] Server tool wiring: drop `search_facts` / `correct_fact` tools; add `tag_filter` arg + `tags` in response shapes.
+- [x] `cargo build -p engram-mcp` / tests / clippy clean.
+
+### Wave 5a — CLI (`engram-cli`)
+- [ ] `Command::Reflect` → `Command::Tag`; `run_reflect` → `run_tag` against tagger.
+- [ ] Worker drops reflector cron; runs embed + tag drainers in tick loops.
+- [ ] `embed-backfill` drops `--target` flag.
+- [ ] Config: rename `ExtractorConfig` → `TaggerConfig` (drop `max_facts_per_thought`); delete `ReflectorConfig`.
+- [ ] Bench harness: drop `BenchTarget`, fact-target dispatch; fixture-JSON drops `target` field.
+- [ ] Tests + clippy clean.
+
+### Wave 5b — DOCS
+- [x] `README.md`: "How fact extraction works" → "How tagging works"; MCP surface table updated; `[extractor]`/`[reflector]` config replaced with `[tagger]`; status + roadmap reflect M4-shipped, M5/M6 planned.
+- [x] `DEVELOPMENT.md`: `engram reflect` examples → `engram tag`; `[tagger]` config block; tagger backend setup notes.
+- [x] `docs/engram-design-v0.md`: §6 + §10 rewritten as tagging sidecar + operational shape; §5 schema rewritten; SPO / confidence-routing / supersede-facts / correct-fact / dedup-via-supersession discussion all dropped.
+- [x] `docs/milestones/m3-progress.md` + `m3-search-quality.md`: M3 ✅ for retrieval; extraction-side close-out forward-references M4.
+- [x] `docs/milestones/m4-collapse-to-thoughts.md`: this Progress section.
+- [x] Renames: `m4-artifacts.md` → `m5-artifacts.md`; `m5-operational-maturity.md` → `m6-operational-maturity.md` (via `git mv`); cross-references updated.
+- [x] `scripts/bench-rerank.md`: fact-target instructions dropped.
+
+### Wave 6 — INTEGRATE
+- [ ] Coordinator merges Wave 5a + 5b onto `m4-collapse-to-thoughts`.
+- [ ] Full workspace clean: `cargo build --workspace`, `cargo test --workspace`, `cargo clippy --all-targets -- -D warnings`.
+- [ ] Migration applies cleanly against the operator's DB; smoke pass per Wave 6 step 7.
+- [ ] `git grep` audit confirms no orphan references to the removed entities.
+- [ ] Single bundled commit `M4: collapse to thoughts-only with metadata-tagging sidecar (Path B-OB1)` on `main`.
+
+## History
+
+Format: `YYYY-MM-DD — <one-line summary>`. Multi-line entries fine for decisions that need explanation. **Most recent entry first.**
+
+- **2026-05-16** — **Wave 5b DOCS landed (this commit).** Major documentation overhaul: README's "How fact extraction works" section replaced with shorter "How tagging works"; MCP-surface table updated (dropped `search_facts` / `correct_fact` rows; `capture` row now mentions content-fingerprint dedup + `is_duplicate`; `search_thoughts` row now mentions `tag_filter` + per-hit `tags`; `retract_thought` simplified). "Configuring the extractor backend" → "Configuring the tagger backend." `[extractor]` and `[reflector]` config blocks replaced with `[tagger]` everywhere. Roadmap table renumbered: M2 marked superseded-by-M4; M3 ✅ retrieval; **M4 ✅ collapse to thoughts-only**; M5 ⏳ artifacts (was M4); M6 ⏳ operational maturity (was M5). `DEVELOPMENT.md`: `engram reflect` examples replaced with `engram tag`; reflect-rerun runbook block dropped; `--target` flag for embed-backfill dropped (thoughts-only). `docs/engram-design-v0.md`: §6 rewritten as "Ingest path + Tagging sidecar"; §10 rewritten as "Operational shape — what makes the store honest" (operational guarantees, no drift-defense ceremony); §5 schema rewritten; §8 MCP surface table updated; §9 traits updated (`Tagger` replaces `Extractor`); §11 / §12 / §13 milestone callouts updated for the M5→M6 shift; revision history extended with the M4 entry. Renames: `m4-artifacts.md` → `m5-artifacts.md`; `m5-operational-maturity.md` → `m6-operational-maturity.md` via `git mv`; cross-references inside renamed files updated (M4→M5 / M5→M6). `m3-progress.md` + `m3-search-quality.md` final close-out: M3 status ✅ retrieval; extraction findings forward-reference M4. `scripts/bench-rerank.md`: dropped `target: "facts"` instructions; thoughts-only authoring guidance. Doc-only commit; no code touched.
+- **2026-05-16** — **Wave 4 MCP landed.** `crates/engram-mcp` simplified for thoughts-only: `reflect.rs` + `correct.rs` deleted; `search.rs` drops all `search_facts` / `SearchFactHit` / `rrf_fuse_facts` code and gains `tag_filter` threading; `SearchHit` gains `tags`. `capture.rs` computes SHA-256 of content, threads `is_new` → `is_duplicate`, and enqueues both embedding and tag jobs on a fresh insert. `retract.rs` drops the fact-cascade reporting (no `facts_superseded` field on response). `drain.rs` split into `drain_pending_embeddings` (unchanged shape) + `drain_pending_tags` (NEW). `backfill.rs` drops the fact-target arm. `server.rs` tool wiring drops `search_facts` + `correct_fact`; `SearchThoughtsArgs` gains `tag_filter`; both `search_thoughts_response_json` and `get_thought_response_json` emit `tags` + tag provenance. Test count drops substantially from M3's 105. Commit `358f86b`.
+- **2026-05-16** — **Wave 3c EXTRACT landed (via merge `2000059`).** `engram-extract` repurposed: `OpenAICompatibleExtractor` → `OpenAICompatibleTagger`; bundled prompt replaced with the v1 tagger prompt; `facts_response_format` → `tags_response_format` per the locked JSON schema. `FakeExtractor` → `FakeTagger` with `Empty` / `Canned(Tags)` / `Substring(map)` / soft-fail behaviors. Lib re-exports updated. Commit `d7892ac`.
+- **2026-05-16** — **Wave 3b MIGRATION landed.** `migrations/0006_collapse_to_thoughts.sql`: drops `facts_review_queue`, `reflector_runs`, `facts` CASCADE; deletes fact-targeted rows from `embeddings` + `pending_embeddings`; extends `thoughts` with `content_fingerprint`, `tags`, `tags_extractor_*`; backfills fingerprint via `digest(content, 'sha256')` (requires pgcrypto, already enabled); locks NOT NULL + UNIQUE on fingerprint; creates GIN index on `tags`; creates `pending_tags` queue table. Verified clean against snapshot of current dev DB; idempotent re-run check passed. Commit `ca2fcd0`.
+- **2026-05-16** — **Wave 3a STORAGE landed.** `engram-storage` rewritten for thoughts-only: all fact storage functions dropped; `RunId` / `start_run` / `finish_run` / review-queue helpers gone; `NewThought` gains `content_fingerprint`; `insert_thought` returns `(InsertedThought, is_new)` via ON CONFLICT; `retract_thought` drops the fact-cascade UPDATE. New: `update_thought_tags`, `enqueue_tag_job`, `fetch_thought_tags`, `fetch_pending_tag_jobs`, `complete_tag_job`, `increment_tag_job_attempts`, `find_untagged_or_stale_thoughts`. Commit `4a93571`.
+- **2026-05-16** — **Wave 2 CORE landed.** `engram-core` type contract for thoughts-only: `Thought` extended with `content_fingerprint: [u8; 32]` plus 4 tag-related fields; new `tags.rs` module with `Tags` + `TagKind`; `extractor.rs` repurposed to `tagger.rs` (`Tagger` trait + `TaggerError`); `fact.rs` deleted; re-exports updated. Commit `b7a22c4`.
+- **2026-05-16** — **Wave 1 SPEC landed.** `docs/milestones/m4-spec.md` written: 5 open questions answered (drainer cadence reuses `[worker]` knobs; backfill UX is `engram tag --rerun`; `is_duplicate` surfaced; tag fields match OB1; empty `[tagger]` silent-disables); types + JSON schema + v1 prompt + migration SQL + MCP wire shapes + storage function signatures locked as the prescriptive contract for downstream waves. Commit `34ba756`.

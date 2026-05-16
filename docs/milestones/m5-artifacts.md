@@ -1,4 +1,4 @@
-# M4 — Artifacts
+# M5 — Artifacts
 
 ## Goal
 
@@ -20,14 +20,14 @@ This is the milestone that turns engram from "memory of agent interactions" into
 - Audio / video transcription — operator runs an external pipeline and ingests the resulting transcript. Indefinitely.
 - Image OCR. Indefinitely.
 - Web crawling beyond a single page. Indefinitely.
-- `search_facts` extending to artifact-derived facts (the extractor currently runs over thoughts only). Possibly post-M5.
-- Auth, observability, eval suite, `stats` MCP tool → **M5**
+- The facts pipeline was removed in M4 (collapse to thoughts-only); artifact chunks share the thoughts retrieval surface — they don't need a separate facts surface.
+- Auth, observability, eval suite, `stats` MCP tool → **M6**
 
 ## Schema impact
 
 No new tables. The existing `artifacts` and `artifact_chunks` (shipped empty in M1) are now populated. The `embeddings` table now contains `target_kind = 'artifact_chunk'` rows; the existing HNSW partial index covers them because the predicate is on `model_id`, not `target_kind`.
 
-If the chunker needs persistent state (e.g. tokenizer-version tracking), that may motivate an `artifact_chunks.chunker_version` column added in `0003_artifacts.sql`. To be decided in M4 planning.
+If the chunker needs persistent state (e.g. tokenizer-version tracking), that may motivate an `artifact_chunks.chunker_version` column added in the M5 artifacts migration. To be decided in M5 planning.
 
 ## MCP surface delta
 
@@ -60,7 +60,7 @@ If the chunker needs persistent state (e.g. tokenizer-version tracking), that ma
 
 - **Chunker selection.** Fixed-token (`tiktoken-rs`), sentence-aware (`text-splitter` crate), semantic (chunk on topic shifts via the embedder)? Token-count target — 500? 1000? Overlap — 50? 100? 0? These affect retrieval quality and storage cost.
 - **Deduplication policy.** Re-ingesting the same URI: refuse, replace-by-version, or replace-in-place? What about same-content-different-URI?
-- **Large files.** Hard cap (e.g. 50 MB) with a clear error, or stream-and-chunk so size is unbounded? The latter is more complex; the former is fine for v0 of M4.
+- **Large files.** Hard cap (e.g. 50 MB) with a clear error, or stream-and-chunk so size is unbounded? The latter is more complex; the former is fine for the M5 v0.
 - **Chunk metadata.** Position info (line / page / offset) preserved in chunk metadata? Useful for "open the source" UX but the UX doesn't exist yet.
 - **HTML extraction.** Use `html2text` / `readability-rs` to strip nav and ads before chunking? Or chunk raw HTML and let the embedder figure it out? Quality vs. preprocessing-cost trade.
 - **Transcript ingestion.** Special case timestamps as chunk boundaries, or treat as plain text? Hinges on whether the operator wants "find the moment when X was discussed" as a use case.

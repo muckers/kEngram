@@ -1,5 +1,7 @@
 # M3 — Search and extraction quality
 
+**Status: ✅ retrieval portion shipped (Phase A + Phase B steps 1-3 + Phase C). Extraction-side findings carried forward into M4 — see [`m4-collapse-to-thoughts.md`](./m4-collapse-to-thoughts.md).**
+
 ## Goal
 
 The original framing was narrow: improve retrieval with a cross-encoder rerank pass; "almost-right" results become "the right one is in the top three." That stays the headline. But M3's scope expanded mid-M2-dogfood (2026-05-13) as the facts pipeline produced enough real data to expose three classes of quality issue that aren't reranker-shaped: (a) the extractor produces noise on mixed-content thoughts; (b) `--rerun` is additive-only so paraphrase-level duplicates accumulate; (c) observability gaps make it hard to tell run-time symptoms apart from data-quality symptoms.
@@ -303,3 +305,11 @@ The per-phase implementation questions below stay open and are settled when each
 ### Scope semantics (carried forward from M1)
 
 - **Scope prefix filtering.** Today `scope` is exact-match only (confirmed empirically on 2026-05-12 during the M1 smoke test). The dotted-scope convention in the design doc is purely human-readable — `work.tcgplayer.platform.pricing` is not findable when filtering by `work.tcgplayer`. The operator has adopted a "flat-and-few" scope convention to live with the constraint. Open: after a week+ of M1+M2 dogfood, is the lack of prefix filtering actually painful? If yes, add `WHERE scope = $1 OR scope LIKE $1 || '.%'` to the storage layer (one-line change, no schema impact). If no — i.e. the discipline of flat scopes is doing useful work — leave it alone. Decide with dogfood evidence, not speculation.
+
+## Close-out (2026-05-16)
+
+M3 shipped its retrieval improvements in full: hybrid (vector ∪ trigram) RRF retrieval over thoughts and facts, fact embeddings on the same async-embedding seam as thoughts, the cross-encoder reranker via TEI with per-leg `vector_score` / `trigram_score` / `rrf_score` / `rerank_score` surfaced on every hit, and the `engram bench rerank` A/B harness reporting nDCG@10 + MRR for RRF-only vs reranked rankings.
+
+The pipeline-quality items pulled in mid-M3 (Phase A v3 prompt + within-call dedup + `extract` flag + observability + SPO trigram; Phase C three-band routing with `flagged` + subsumption-aware dedup + quality-aware canonical selection + per-claim retraction durability + v4 extractor prompt) also shipped. But Phase D dogfood — 7 rounds against the v4 prompt on the operator's local 30B coder model — produced a consistent finding: **statements were faithful, triples were broken.** Comparative S/O inversion, self-referential subjects, conditional-as-subject, predicate verbosity, polarity contradictions, triple-semantic drift. Each v4-prompt patch traded one failure mode for another. The substrate generating the failure modes was the wrong abstraction for the operator's use case (LLM agents reading prose, not querying by `(S, P, O)`).
+
+The architectural pivot — collapse the facts pipeline, replace it with a JSONB metadata sidecar (people / action_items / topics / dates_mentioned / kind) on the `thoughts` table — lives at [`docs/milestones/m4-collapse-to-thoughts.md`](./m4-collapse-to-thoughts.md). The retrieval improvements M3 shipped (hybrid + reranker + A/B harness) carry forward unchanged onto the simpler thoughts-only schema.
