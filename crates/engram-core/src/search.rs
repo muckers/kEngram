@@ -167,7 +167,7 @@ pub fn recency_boost(hits: &mut [Hit], half_life_days: f32, now: OffsetDateTime)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Metadata, Scope, Source, ThoughtId};
+    use crate::{Metadata, Scope, Source, Tags, ThoughtId};
 
     fn thought(id_seed: u128, content: &str, age_seconds: i64) -> Thought {
         let id = ThoughtId::from(uuid::Uuid::from_u128(id_seed));
@@ -178,6 +178,11 @@ mod tests {
             source: Source::new("test").unwrap(),
             created_at: OffsetDateTime::from_unix_timestamp(1_700_000_000 - age_seconds).unwrap(),
             metadata: Metadata::empty(),
+            content_fingerprint: [0u8; 32],
+            tags: Tags::default(),
+            tags_extractor_model: None,
+            tags_extractor_version: None,
+            tags_extracted_at: None,
         }
     }
 
