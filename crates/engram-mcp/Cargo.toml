@@ -14,6 +14,7 @@ async-trait.workspace = true
 rmcp.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2 = "0.10"
 sqlx.workspace = true
 thiserror.workspace = true
 time.workspace = true

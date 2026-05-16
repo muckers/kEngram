@@ -1,16 +1,19 @@
-//! `drain_pending_embeddings` — pull a batch of claimed jobs off the
-//! `pending_embeddings` queue, embed each one, and persist the result. The
-//! worker process (`engram worker`) calls this on every tick; the
-//! `engram embed-backfill` CLI calls it in a loop after healing any gaps.
+//! Drainers for the two background queues — `pending_embeddings` (embed
+//! drainer) and `pending_tags` (tag drainer).
 //!
-//! Crash-replay safety: `insert_thought_embedding` is idempotent via
-//! `ON CONFLICT DO NOTHING` (migration 0001 has the UNIQUE constraint;
-//! `engram-storage` was updated to use it during M2 Phase B). So if the
-//! worker dies between `insert_thought_embedding` and `mark_embedded`, the
-//! next tick re-claims the row, re-embeds, re-inserts (no-op), and marks
-//! embedded — clean.
+//! Both are pulled on every `engram worker` tick. Each tick processes a
+//! bounded batch (`batch_size`) and reports per-job outcome. On transient
+//! failures the job stays queued (attempts++) for the next tick; on
+//! permanent failures we either log and drop the job (tag drainer, after
+//! `MAX_TAG_ATTEMPTS`) or set `last_error` (embed drainer, keeping the row
+//! for operator inspection).
+//!
+//! Crash-replay safety for the embed drainer: `insert_thought_embedding` is
+//! idempotent via `ON CONFLICT DO NOTHING`. So if the worker dies between
+//! `insert_thought_embedding` and `mark_embedded`, the next tick re-claims
+//! the row, re-embeds, re-inserts (no-op), and marks embedded — clean.
 
-use engram_core::{Embedder, Embedding, EmbedderError, EmbeddingError, ThoughtId};
+use engram_core::{Embedder, EmbedderError, Embedding, EmbeddingError, Tagger, ThoughtId};
 use sqlx::PgPool;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -19,8 +22,7 @@ pub struct DrainReport {
     pub found: usize,
     /// Number that successfully embedded + persisted + marked.
     pub embedded: usize,
-    /// Number that failed embed/persist. Each is logged with thought_id +
-    /// reason and left in the queue (with `last_error` set) for the next tick.
+    /// Number that failed embed/persist.
     pub failed: usize,
 }
 
@@ -30,9 +32,9 @@ pub enum DrainError {
     Storage(#[from] engram_storage::StorageError),
 }
 
-/// Drain up to `batch_size` jobs. Returns a `DrainReport`. Errors only on
-/// claim-level storage failures (the queue itself is unreachable); per-job
-/// failures stay in the queue and are reflected in `report.failed`.
+/// Drain up to `batch_size` jobs from `pending_embeddings`. Errors only on
+/// claim-level storage failures; per-job failures stay in the queue and
+/// are reflected in `report.failed`.
 pub async fn drain_pending_embeddings(
     pool: &PgPool,
     embedder: &dyn Embedder,
@@ -45,7 +47,7 @@ pub async fn drain_pending_embeddings(
     };
 
     for job in jobs {
-        match process_job(pool, embedder, &job).await {
+        match process_embed_job(pool, embedder, &job).await {
             Ok(()) => report.embedded += 1,
             Err(err) => {
                 tracing::warn!(
@@ -54,7 +56,7 @@ pub async fn drain_pending_embeddings(
                     target_id = %job.target_id,
                     attempts = job.attempts,
                     reason = %err,
-                    "drain: job failed; row stays queued",
+                    "embed-drain: job failed; row stays queued",
                 );
                 let _ = engram_storage::mark_failed(pool, job.id, &err.to_string()).await;
                 report.failed += 1;
@@ -66,15 +68,9 @@ pub async fn drain_pending_embeddings(
 }
 
 #[derive(Debug)]
-enum JobError {
-    /// The job's `model_id` doesn't match the active embedder. Multi-model
-    /// support isn't in Phase B; this is a guardrail for the future.
+enum EmbedJobError {
     ModelMismatch { expected: String, got: String },
-    /// The job targets something other than `thought`. Phase B only handles
-    /// thoughts; M4 will extend to artifact chunks.
     UnsupportedTargetKind(String),
-    /// The source thought was deleted (or never existed) between enqueue
-    /// and drain. The job is unprocessable.
     SourceMissing,
     Embedder(EmbedderError),
     Embedding(EmbeddingError),
@@ -82,7 +78,7 @@ enum JobError {
     EmptyEmbedderOutput,
 }
 
-impl std::fmt::Display for JobError {
+impl std::fmt::Display for EmbedJobError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ModelMismatch { expected, got } => write!(
@@ -99,85 +95,212 @@ impl std::fmt::Display for JobError {
     }
 }
 
-async fn process_job(
+async fn process_embed_job(
     pool: &PgPool,
     embedder: &dyn Embedder,
     job: &engram_storage::PendingJob,
-) -> Result<(), JobError> {
+) -> Result<(), EmbedJobError> {
     let active_model = &embedder.model().id;
     if &job.model_id != active_model {
-        return Err(JobError::ModelMismatch {
+        return Err(EmbedJobError::ModelMismatch {
             expected: active_model.clone(),
             got: job.model_id.clone(),
         });
     }
 
-    // Resolve the text to embed and the insert path by `target_kind`. Both
-    // branches share the embed → insert → mark_embedded shape; the only
-    // difference is which DB row provides the input text and which
-    // `insert_*_embedding` wrapper receives the vector.
+    // M4: only thoughts are embeddable; facts are gone.
     let text = match job.target_kind.as_str() {
         engram_storage::target::THOUGHT => {
             let thought_id = ThoughtId::from(job.target_id);
             let thought = engram_storage::fetch_thought(pool, thought_id)
                 .await
-                .map_err(JobError::Storage)?
-                .ok_or(JobError::SourceMissing)?;
+                .map_err(EmbedJobError::Storage)?
+                .ok_or(EmbedJobError::SourceMissing)?;
             thought.content
         }
-        engram_storage::target::FACT => {
-            let fact = engram_storage::fetch_fact(pool, job.target_id)
-                .await
-                .map_err(JobError::Storage)?
-                .ok_or(JobError::SourceMissing)?;
-            fact.statement
+        _ => {
+            return Err(EmbedJobError::UnsupportedTargetKind(
+                job.target_kind.clone(),
+            ));
         }
-        _ => return Err(JobError::UnsupportedTargetKind(job.target_kind.clone())),
     };
 
     let texts = vec![text];
-    let mut vectors = embedder.embed(&texts).await.map_err(JobError::Embedder)?;
-    let vector = vectors.pop().ok_or(JobError::EmptyEmbedderOutput)?;
-    let embedding = Embedding::new(embedder.model().clone(), vector).map_err(JobError::Embedding)?;
+    let mut vectors = embedder
+        .embed(&texts)
+        .await
+        .map_err(EmbedJobError::Embedder)?;
+    let vector = vectors.pop().ok_or(EmbedJobError::EmptyEmbedderOutput)?;
+    let embedding =
+        Embedding::new(embedder.model().clone(), vector).map_err(EmbedJobError::Embedding)?;
 
-    match job.target_kind.as_str() {
-        engram_storage::target::THOUGHT => {
-            engram_storage::insert_thought_embedding(
-                pool,
-                ThoughtId::from(job.target_id),
-                &embedding,
-            )
-            .await
-            .map_err(JobError::Storage)?;
-        }
-        engram_storage::target::FACT => {
-            engram_storage::insert_fact_embedding(pool, job.target_id, &embedding)
-                .await
-                .map_err(JobError::Storage)?;
-        }
-        _ => unreachable!("target_kind validated above"),
-    }
+    engram_storage::insert_thought_embedding(pool, ThoughtId::from(job.target_id), &embedding)
+        .await
+        .map_err(EmbedJobError::Storage)?;
 
     engram_storage::mark_embedded(pool, job.id)
         .await
-        .map_err(JobError::Storage)?;
+        .map_err(EmbedJobError::Storage)?;
 
     Ok(())
+}
+
+// -- tag drainer ------------------------------------------------------------
+
+/// Permanent-failure cap. After this many attempts on a single thought
+/// (counting the initial enqueue as 0, so 5 attempts = 5 tagger calls
+/// that all failed), the tag drainer logs and removes the job rather
+/// than leaving it pinned in the queue forever.
+pub const MAX_TAG_ATTEMPTS: i32 = 5;
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DrainTagsReport {
+    /// Number of jobs fetched this drain call.
+    pub processed: usize,
+    /// Number that successfully tagged + persisted + completed.
+    pub completed: usize,
+    /// Number that hit a transient TaggerError; job stays in queue with
+    /// attempts++.
+    pub failed_transient: usize,
+    /// Number that hit a non-transient TaggerError or hit
+    /// `MAX_TAG_ATTEMPTS`; job is removed from queue.
+    pub failed_permanent: usize,
+}
+
+/// Drain up to `batch_size` jobs from `pending_tags`.
+///
+/// For each job:
+/// 1. Fetch the thought's content (skip-with-permanent-fail if the thought
+///    no longer exists).
+/// 2. Call `tagger.tag(content)`.
+/// 3. On Ok: `update_thought_tags` + `complete_tag_job`.
+/// 4. On Err(transient): `increment_tag_job_attempts` (job stays).
+/// 5. On Err(non-transient): log, `complete_tag_job` (job dropped).
+/// 6. After `MAX_TAG_ATTEMPTS` regardless of transience, `complete_tag_job`.
+pub async fn drain_pending_tags(
+    pool: &PgPool,
+    tagger: &dyn Tagger,
+    batch_size: i64,
+) -> Result<DrainTagsReport, DrainError> {
+    let jobs = engram_storage::fetch_pending_tag_jobs(pool, batch_size).await?;
+    let mut report = DrainTagsReport {
+        processed: jobs.len(),
+        ..Default::default()
+    };
+
+    for job in jobs {
+        match process_tag_job(pool, tagger, &job).await {
+            TagJobOutcome::Completed => report.completed += 1,
+            TagJobOutcome::Transient => report.failed_transient += 1,
+            TagJobOutcome::Permanent => report.failed_permanent += 1,
+        }
+    }
+
+    Ok(report)
+}
+
+enum TagJobOutcome {
+    Completed,
+    Transient,
+    Permanent,
+}
+
+async fn process_tag_job(
+    pool: &PgPool,
+    tagger: &dyn Tagger,
+    job: &engram_storage::PendingTagJob,
+) -> TagJobOutcome {
+    // Fetch the thought's content.
+    let thought = match engram_storage::fetch_thought(pool, job.thought_id).await {
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            tracing::warn!(
+                thought_id = %job.thought_id,
+                "tag-drain: thought no longer exists; dropping job",
+            );
+            let _ = engram_storage::complete_tag_job(pool, job.thought_id).await;
+            return TagJobOutcome::Permanent;
+        }
+        Err(e) => {
+            tracing::warn!(
+                thought_id = %job.thought_id,
+                error = %e,
+                "tag-drain: storage error fetching thought; leaving job for retry",
+            );
+            let _ = engram_storage::increment_tag_job_attempts(pool, job.thought_id).await;
+            return TagJobOutcome::Transient;
+        }
+    };
+
+    match tagger.tag(&thought.content).await {
+        Ok(tags) => {
+            if let Err(e) = engram_storage::update_thought_tags(
+                pool,
+                job.thought_id,
+                &tags,
+                tagger.model_id(),
+                tagger.version(),
+            )
+            .await
+            {
+                tracing::warn!(
+                    thought_id = %job.thought_id,
+                    error = %e,
+                    "tag-drain: failed to persist tags; leaving job for retry",
+                );
+                let _ = engram_storage::increment_tag_job_attempts(pool, job.thought_id).await;
+                return TagJobOutcome::Transient;
+            }
+            if let Err(e) = engram_storage::complete_tag_job(pool, job.thought_id).await {
+                tracing::warn!(
+                    thought_id = %job.thought_id,
+                    error = %e,
+                    "tag-drain: tags persisted but failed to dequeue; next tick re-runs idempotently",
+                );
+                // Not a failure-of-tagging — tags were written. The next
+                // tick will re-tag (idempotent overwrite). Report as
+                // completed.
+            }
+            TagJobOutcome::Completed
+        }
+        Err(err) => {
+            let transient = err.is_transient();
+            let attempts_after = job.attempts.saturating_add(1);
+            tracing::warn!(
+                thought_id = %job.thought_id,
+                error = %err,
+                attempts = attempts_after,
+                transient,
+                "tag-drain: tagger error",
+            );
+
+            if !transient || attempts_after >= MAX_TAG_ATTEMPTS {
+                // Permanent failure or exhausted attempts — drop the job.
+                let _ = engram_storage::complete_tag_job(pool, job.thought_id).await;
+                TagJobOutcome::Permanent
+            } else {
+                let _ = engram_storage::increment_tag_job_attempts(pool, job.thought_id).await;
+                TagJobOutcome::Transient
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capture::{capture, CaptureRequest};
-    use engram_core::{EmbeddingModel, Scope, Source};
+    use crate::capture::{CaptureRequest, capture};
+    use engram_core::{EmbeddingModel, Scope, Source, TagKind, Tags};
     use engram_embed::{FakeBehavior, FakeEmbedder};
+    use engram_extract::{FakeBehavior as TaggerFakeBehavior, FakeTagger};
 
-    const TEST_MODEL_ID: &str = "bge-m3:1024";
+    const TEST_EMBEDDER_MODEL_ID: &str = "bge-m3:1024";
 
     async fn capture_one(pool: &PgPool, content: &str) -> ThoughtId {
         capture(
             pool,
-            TEST_MODEL_ID,
+            TEST_EMBEDDER_MODEL_ID,
+            None,
             CaptureRequest {
                 content: content.to_string(),
                 source: Source::new("test").unwrap(),
@@ -189,6 +312,8 @@ mod tests {
         .unwrap()
         .thought_id
     }
+
+    // -- embed drainer (preserved from M3 with fact branch deleted) ----------
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn drain_processes_pending_to_embedding(pool: PgPool) {
@@ -219,13 +344,10 @@ mod tests {
         assert_eq!(report.embedded, 0);
         assert_eq!(report.failed, 1);
 
-        // Row stays in queue; last_error is set; attempts bumped to 1.
-        let row = sqlx::query!(
-            r#"SELECT attempts, last_error FROM pending_embeddings"#,
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let row = sqlx::query!(r#"SELECT attempts, last_error FROM pending_embeddings"#,)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(row.attempts, 1);
         assert!(row.last_error.is_some());
         assert_eq!(engram_storage::count_pending(&pool).await.unwrap(), 1);
@@ -233,30 +355,22 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn drain_idempotent_on_crash_replay(pool: PgPool) {
-        // Simulate the worker crashing between insert_thought_embedding and
-        // mark_embedded: do the first two steps by hand (leaving the queue
-        // row in place with attempts=1), then run drain — the second
-        // re-insert must be a no-op rather than a UNIQUE-violation error.
         let id = capture_one(&pool, "replay").await;
         let model = EmbeddingModel::bge_m3();
 
-        // Claim (bumps attempts→1, leaves row).
         let job = engram_storage::claim_pending(&pool, 10)
             .await
             .unwrap()
             .pop()
             .unwrap();
-        // Insert the embedding directly (worker did this) but skip mark_embedded.
         let emb = Embedding::new(model.clone(), vec![0.5_f32; 1024]).unwrap();
         engram_storage::insert_thought_embedding(&pool, id, &emb)
             .await
             .unwrap();
 
-        // Queue row still present (operator's "crash" happened here).
         assert_eq!(engram_storage::count_pending(&pool).await.unwrap(), 1);
         let _ = job;
 
-        // Recovery drain: must not panic on duplicate insert.
         let good = FakeEmbedder::new();
         let report = drain_pending_embeddings(&pool, &good, 10).await.unwrap();
         assert_eq!(report.found, 1);
@@ -267,9 +381,6 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn drain_marks_failed_when_model_id_mismatch(pool: PgPool) {
-        // Capture under the active model, then run drain with a *different*
-        // embedder model. The job should be marked failed (not silently
-        // embedded under the wrong model).
         let _id = capture_one(&pool, "mismatched model").await;
 
         let other = FakeEmbedder::with_model(EmbeddingModel::new("other:1024", 1024));
@@ -278,12 +389,10 @@ mod tests {
         assert_eq!(report.embedded, 0);
         assert_eq!(report.failed, 1);
 
-        let row = sqlx::query!(
-            r#"SELECT last_error FROM pending_embeddings"#,
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let row = sqlx::query!(r#"SELECT last_error FROM pending_embeddings"#,)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert!(
             row.last_error
                 .as_deref()
@@ -303,116 +412,133 @@ mod tests {
         assert_eq!(report.failed, 0);
     }
 
-    // -- M3 Phase B step 1: fact dispatch in process_job ----------------------
+    // -- tag drainer ----------------------------------------------------------
 
-    /// Helper: insert a fact and enqueue an embedding for it, bypassing the
-    /// reflector. Returns the new fact's id.
-    async fn enqueue_fact(pool: &PgPool, statement: &str) -> uuid::Uuid {
-        let scope = Scope::new("global").unwrap();
-        let thought_id = capture_one(pool, "anchor thought").await;
-        let run_id = engram_storage::start_run(pool, "fake/extractor", 1, None)
-            .await
-            .unwrap();
-        let fact_id = engram_storage::insert_fact(
+    /// Capture and enqueue a tag job for the captured thought.
+    async fn capture_and_enqueue_tag(pool: &PgPool, content: &str) -> ThoughtId {
+        capture(
             pool,
-            engram_storage::NewFact {
-                scope: &scope,
-                statement,
-                subject: None,
-                predicate: None,
-                object: None,
-                source_thought_id: thought_id,
-                extractor_model: "fake/extractor",
-                extractor_version: 1,
-                source_run_id: Some(run_id),
-                confidence: 0.9,
-                flagged: false,
+            TEST_EMBEDDER_MODEL_ID,
+            Some("fake/tagger"),
+            CaptureRequest {
+                content: content.to_string(),
+                source: Source::new("test").unwrap(),
+                scope: Some(Scope::new("global").unwrap()),
+                metadata: None,
             },
         )
         .await
-        .unwrap();
-        engram_storage::enqueue_embedding(
-            pool,
-            engram_storage::target::FACT,
-            fact_id,
-            TEST_MODEL_ID,
-        )
-        .await
-        .unwrap();
-        fact_id
+        .unwrap()
+        .thought_id
     }
 
     #[sqlx::test(migrations = "../../migrations")]
-    async fn drain_processes_fact_pending_to_embedding(pool: PgPool) {
-        let fact_id = enqueue_fact(&pool, "Engram uses pgvector").await;
+    async fn drain_tags_updates_thought_tags_on_success(pool: PgPool) {
+        let id = capture_and_enqueue_tag(&pool, "captured thought needing tags").await;
 
-        let good = FakeEmbedder::new();
-        let report = drain_pending_embeddings(&pool, &good, 10).await.unwrap();
-        // capture_one also enqueued the source thought → 2 jobs found, 2 embedded.
-        assert!(report.found >= 1);
-        assert!(report.embedded >= 1);
-        assert_eq!(report.failed, 0);
+        let tags = Tags {
+            people: vec!["Sarah".into()],
+            kind: Some(TagKind::Task),
+            ..Tags::default()
+        };
+        let tagger = FakeTagger::with_canned(tags.clone());
 
-        // Fact row landed under target_kind='fact'.
-        let n = sqlx::query!(
-            r#"SELECT COUNT(*) AS "n!" FROM embeddings
-               WHERE target_kind = 'fact' AND target_id = $1 AND model_id = $2"#,
-            fact_id,
-            TEST_MODEL_ID,
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap()
-        .n;
-        assert_eq!(n, 1, "fact embedding should be present after drain");
+        let report = drain_pending_tags(&pool, &tagger, 10).await.unwrap();
+        assert_eq!(report.processed, 1);
+        assert_eq!(report.completed, 1);
+        assert_eq!(report.failed_transient, 0);
+        assert_eq!(report.failed_permanent, 0);
 
-        // pending row removed.
-        let pending = sqlx::query!(
-            r#"SELECT COUNT(*) AS "n!" FROM pending_embeddings
-               WHERE target_kind = 'fact' AND target_id = $1"#,
-            fact_id,
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap()
-        .n;
-        assert_eq!(pending, 0);
+        // Tags persisted; queue drained.
+        let read = engram_storage::fetch_thought_tags(&pool, id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.tags, tags);
+        assert_eq!(read.tagger_model_id.as_deref(), Some("fake/tagger"));
+        assert_eq!(read.tagger_version, Some(1));
+        let remaining = engram_storage::fetch_pending_tag_jobs(&pool, 10)
+            .await
+            .unwrap();
+        assert!(remaining.is_empty());
+
+        // Tagger was called with the thought's content.
+        let recorded = tagger.last_call().unwrap();
+        assert_eq!(recorded.content, "captured thought needing tags");
     }
 
     #[sqlx::test(migrations = "../../migrations")]
-    async fn drain_marks_failed_when_fact_target_missing(pool: PgPool) {
-        // Enqueue a pending row for a fact_id that doesn't exist.
-        let bogus = uuid::Uuid::new_v4();
-        engram_storage::enqueue_embedding(
-            &pool,
-            engram_storage::target::FACT,
-            bogus,
-            TEST_MODEL_ID,
-        )
-        .await
-        .unwrap();
+    async fn drain_tags_increments_attempts_on_transient_failure(pool: PgPool) {
+        let id = capture_and_enqueue_tag(&pool, "transient-fail content").await;
 
-        let good = FakeEmbedder::new();
-        let report = drain_pending_embeddings(&pool, &good, 10).await.unwrap();
-        assert_eq!(report.found, 1);
-        assert_eq!(report.embedded, 0);
-        assert_eq!(report.failed, 1);
+        let tagger = FakeTagger::always_failing(TaggerFakeBehavior::Timeout);
+        let report = drain_pending_tags(&pool, &tagger, 10).await.unwrap();
+        assert_eq!(report.processed, 1);
+        assert_eq!(report.completed, 0);
+        assert_eq!(report.failed_transient, 1);
+        assert_eq!(report.failed_permanent, 0);
 
-        // Row stays in the queue with last_error set (SourceMissing).
-        let row = sqlx::query!(
-            r#"SELECT last_error FROM pending_embeddings
-               WHERE target_kind = 'fact' AND target_id = $1"#,
-            bogus,
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert!(
-            row.last_error
-                .as_deref()
-                .is_some_and(|e| e.contains("source thought no longer exists")),
-            "expected SourceMissing-derived error, got {:?}",
-            row.last_error
-        );
+        // Job stays in queue with attempts bumped.
+        let jobs = engram_storage::fetch_pending_tag_jobs(&pool, 10)
+            .await
+            .unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].thought_id, id);
+        assert_eq!(jobs[0].attempts, 1);
+
+        // Thought still has no tags.
+        let read = engram_storage::fetch_thought_tags(&pool, id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(read.tagger_model_id.is_none());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn drain_tags_drops_job_after_max_attempts(pool: PgPool) {
+        let id = capture_and_enqueue_tag(&pool, "exhaust attempts").await;
+
+        // Hand-poke attempts to MAX-1 so a single transient failure trips
+        // the drop threshold.
+        for _ in 0..(MAX_TAG_ATTEMPTS - 1) {
+            engram_storage::increment_tag_job_attempts(&pool, id)
+                .await
+                .unwrap();
+        }
+
+        let tagger = FakeTagger::always_failing(TaggerFakeBehavior::Timeout);
+        let report = drain_pending_tags(&pool, &tagger, 10).await.unwrap();
+        assert_eq!(report.processed, 1);
+        assert_eq!(report.failed_permanent, 1);
+
+        // Job dropped from queue.
+        let jobs = engram_storage::fetch_pending_tag_jobs(&pool, 10)
+            .await
+            .unwrap();
+        assert!(jobs.is_empty());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn drain_tags_drops_job_on_permanent_failure(pool: PgPool) {
+        let _id = capture_and_enqueue_tag(&pool, "misconfigured tagger").await;
+
+        let tagger = FakeTagger::always_failing(TaggerFakeBehavior::Misconfigured);
+        let report = drain_pending_tags(&pool, &tagger, 10).await.unwrap();
+        assert_eq!(report.processed, 1);
+        assert_eq!(report.failed_permanent, 1);
+
+        // Misconfigured is non-transient → drop on first failure.
+        let jobs = engram_storage::fetch_pending_tag_jobs(&pool, 10)
+            .await
+            .unwrap();
+        assert!(jobs.is_empty());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn drain_tags_empty_queue_is_a_noop(pool: PgPool) {
+        let tagger = FakeTagger::new();
+        let report = drain_pending_tags(&pool, &tagger, 10).await.unwrap();
+        assert_eq!(report.processed, 0);
+        assert_eq!(report.completed, 0);
     }
 }

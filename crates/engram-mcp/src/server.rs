@@ -1,7 +1,13 @@
 //! The rmcp `ServerHandler` wiring. `EngramServer` is the per-connection
-//! service factory; it holds an `Arc<dyn Embedder>` and a `PgPool` (both
-//! cheap to clone). The actual orchestration lives in [`crate::capture`]
-//! and [`crate::search`].
+//! service factory; it holds an `Arc<dyn Embedder>`, an optional
+//! `Arc<dyn Reranker>`, the configured embedder/tagger model ids, and a
+//! `PgPool` (cheap to clone). The actual orchestration lives in
+//! [`crate::capture`] and [`crate::search`].
+//!
+//! M4: no more facts. `search_facts`, `correct_fact`, `linked_facts`,
+//! `reflect`, `reflect_rerun` are gone. The server's only handles are
+//! `capture`, `search_thoughts`, `recent_thoughts`, `get_thought`,
+//! `retract_thought`. Tag drainage lives in the worker, not here.
 
 use engram_core::{Embedder, Metadata, Scope, Source, ThoughtId};
 use engram_embed::Reranker;
@@ -17,11 +23,10 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use crate::capture::{self, CaptureError, CaptureRequest, MAX_CONTENT_LEN};
-use crate::correct::{self, CorrectError, CorrectFactRequest, FactReplacement};
 use crate::retract::{self, RetractError, RetractThoughtRequest};
 use crate::search::{
-    self, GetThoughtResponse, ReadError, RecentRequest, RecentResponse, SearchFactsRequest,
-    SearchFactsResponse, SearchRequest, SearchResponse,
+    self, GetThoughtResponse, ReadError, RecentRequest, RecentResponse, SearchRequest,
+    SearchResponse,
 };
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -29,13 +34,19 @@ pub struct CaptureArgs {
     #[schemars(description = "The thought text. Required, non-empty, max 1 MiB.")]
     pub content: String,
 
-    #[schemars(description = "Provenance label. Required. Examples: 'manual', 'agent:claude-code'.")]
+    #[schemars(
+        description = "Provenance label. Required. Examples: 'manual', 'agent:claude-code'."
+    )]
     pub source: String,
 
-    #[schemars(description = "Scope label. Optional; defaults to 'global'. Convention is dotted ('work.tcgplayer').")]
+    #[schemars(
+        description = "Scope label. Optional; defaults to 'global'. Convention is dotted ('work.tcgplayer')."
+    )]
     pub scope: Option<String>,
 
-    #[schemars(description = "Optional free-form metadata object. Recommended keys: client_name, session_id, tool_name, agent_role.")]
+    #[schemars(
+        description = "Optional free-form metadata object. Recommended keys: client_name, session_id, tool_name, agent_role."
+    )]
     pub metadata: Option<serde_json::Value>,
 }
 
@@ -50,14 +61,25 @@ pub struct SearchThoughtsArgs {
     #[schemars(description = "Max results. Optional; defaults to 10, max 100.")]
     pub limit: Option<usize>,
 
-    #[schemars(description = "Recency boost half-life in days. Optional; defaults to 30. Set to 0 to disable recency boost.")]
+    #[schemars(
+        description = "Recency boost half-life in days. Optional; defaults to 30. Set to 0 to disable recency boost."
+    )]
     pub recency_half_life_days: Option<f32>,
 
-    #[schemars(description = "Apply the cross-encoder rerank stage. Defaults to true when a reranker is configured. Set false for A/B comparison against the RRF + recency pipeline.")]
+    #[schemars(
+        description = "Apply the cross-encoder rerank stage. Defaults to true when a reranker is configured. Set false for A/B comparison against the RRF + recency pipeline."
+    )]
     pub rerank: Option<bool>,
 
-    #[schemars(description = "Number of post-RRF candidates fed into the reranker. Ignored when rerank is off. Defaults to 50.")]
+    #[schemars(
+        description = "Number of post-RRF candidates fed into the reranker. Ignored when rerank is off. Defaults to 32."
+    )]
     pub candidate_pool: Option<usize>,
+
+    #[schemars(
+        description = "Optional JSONB-containment filter against thought tags. Examples: {\"kind\": \"task\"} returns only thoughts the tagger classified as tasks; {\"people\": [\"Sarah\"]} returns thoughts whose people-tag contains Sarah; {\"topics\": [\"rust\"], \"kind\": \"idea\"} combines both. Empty object {} is a no-op."
+    )]
+    pub tag_filter: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -76,54 +98,14 @@ pub struct GetThoughtArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct SearchFactsArgs {
-    #[schemars(description = "Search query. Required, non-empty. Matched against fact.statement via trigram similarity.")]
-    pub query: String,
-
-    #[schemars(description = "Scope filter. Optional; when omitted, searches across all scopes.")]
-    pub scope: Option<String>,
-
-    #[schemars(description = "Max results. Optional; defaults to 10, max 100.")]
-    pub limit: Option<usize>,
-
-    #[schemars(description = "Recency boost half-life in days, keyed on the source thought's created_at. Optional; defaults to 30. Set to 0 to disable.")]
-    pub recency_half_life_days: Option<f32>,
-
-    #[schemars(description = "Apply the cross-encoder rerank stage. Defaults to true when a reranker is configured.")]
-    pub rerank: Option<bool>,
-
-    #[schemars(description = "Number of post-RRF candidates fed into the reranker. Ignored when rerank is off. Defaults to 50.")]
-    pub candidate_pool: Option<usize>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct CorrectFactArgs {
-    #[schemars(description = "Fact ID (UUID string) to correct or retract.")]
-    pub fact_id: String,
-
-    #[schemars(description = "Optional replacement. If present, a new fact is inserted with manual-author provenance (extractor_model='manual', extractor_version=0, confidence=1.0) and the old fact is superseded with `superseded_by` pointing at the new row. If omitted, the old fact is superseded with no replacement (delete-by-supersede).")]
-    pub replacement: Option<CorrectFactReplacementArgs>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RetractThoughtArgs {
     #[schemars(description = "Thought ID (UUID string) to retract.")]
     pub thought_id: String,
 
-    #[schemars(description = "Optional free-text reason for the retraction (e.g. 'wrong claim — see thought <new id> for correction'). Stored on thoughts.retracted_reason for audit; max 1000 chars.")]
+    #[schemars(
+        description = "Optional free-text reason for the retraction (e.g. 'wrong claim — see thought <new id> for correction'). Stored on thoughts.retracted_reason for audit; max 1000 chars."
+    )]
     pub reason: Option<String>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct CorrectFactReplacementArgs {
-    #[schemars(description = "Natural-language statement for the corrected fact. Required, non-empty.")]
-    pub statement: String,
-    #[schemars(description = "Optional subject of the (S, P, O) triple.")]
-    pub subject: Option<String>,
-    #[schemars(description = "Optional predicate of the (S, P, O) triple.")]
-    pub predicate: Option<String>,
-    #[schemars(description = "Optional object of the (S, P, O) triple.")]
-    pub object: Option<String>,
 }
 
 #[derive(Clone)]
@@ -131,10 +113,12 @@ pub struct EngramServer {
     pool: PgPool,
     embedder: Arc<dyn Embedder>,
     /// `None` when no `[reranker]` config is provided; the search pipeline
-    /// silently falls through to the M3 Phase B step 1 RRF + recency
-    /// pipeline. `Some(_)` enables the rerank stage on calls that don't
-    /// opt out via `rerank: false`.
+    /// silently falls through to the RRF + recency pipeline.
     reranker: Option<Arc<dyn Reranker>>,
+    /// `None` when `[tagger]` is unconfigured — silent-disables tag-job
+    /// enqueue at capture time. `Some(model_id)` enqueues a `pending_tags`
+    /// row per fresh capture; the worker's tag drainer picks it up.
+    tagger_model_id: Option<String>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -143,19 +127,21 @@ impl EngramServer {
         pool: PgPool,
         embedder: Arc<dyn Embedder>,
         reranker: Option<Arc<dyn Reranker>>,
+        tagger_model_id: Option<String>,
     ) -> Self {
         Self {
             pool,
             embedder,
             reranker,
+            tagger_model_id,
             tool_router: Self::tool_router(),
         }
     }
 
-    /// Convenience for tests that don't exercise the rerank stage.
+    /// Convenience for tests that don't exercise the rerank stage or tagger.
     #[cfg(test)]
     pub fn new_without_reranker(pool: PgPool, embedder: Arc<dyn Embedder>) -> Self {
-        Self::new(pool, embedder, None)
+        Self::new(pool, embedder, None, None)
     }
 }
 
@@ -163,19 +149,18 @@ impl std::fmt::Debug for EngramServer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EngramServer")
             .field("model_id", &self.embedder.model().id)
+            .field("tagger_model_id", &self.tagger_model_id)
             .finish()
     }
 }
 
 #[tool_router]
 impl EngramServer {
-    #[tool(description = "Capture a thought into engram's persistent memory. Returns the thought_id and embedding_status='pending'. The thought is durable and findable by trigram (lexical) search immediately; vector search picks it up on the next worker tick (default 5 seconds). To make vector-search-readiness fully synchronous, run `engram worker` alongside `engram serve`.")]
-    async fn capture(
-        &self,
-        Parameters(args): Parameters<CaptureArgs>,
-    ) -> Result<String, String> {
-        let source = Source::new(args.source)
-            .map_err(|e| format!("invalid source: {e}"))?;
+    #[tool(
+        description = "Capture a thought into engram's persistent memory. Returns the thought_id and embedding_status='pending'. The thought is durable and findable by trigram (lexical) search immediately; vector search picks it up on the next worker tick (default 5 seconds). Identical content (SHA-256 of the bytes) is deduplicated — the response will include `is_duplicate: true` and the pre-existing thought_id when the fingerprint collides."
+    )]
+    async fn capture(&self, Parameters(args): Parameters<CaptureArgs>) -> Result<String, String> {
+        let source = Source::new(args.source).map_err(|e| format!("invalid source: {e}"))?;
 
         let scope = match args.scope {
             Some(s) => Some(Scope::new(s).map_err(|e| format!("invalid scope: {e}"))?),
@@ -191,20 +176,27 @@ impl EngramServer {
             metadata,
         };
 
-        let resp = capture::capture(&self.pool, &self.embedder.model().id, request)
-            .await
-            .map_err(map_capture_error)?;
+        let resp = capture::capture(
+            &self.pool,
+            &self.embedder.model().id,
+            self.tagger_model_id.as_deref(),
+            request,
+        )
+        .await
+        .map_err(map_capture_error)?;
 
         let body = serde_json::json!({
             "thought_id": resp.thought_id.to_string(),
             "embedding_status": resp.embedding_status,
+            "is_duplicate": resp.is_duplicate,
         });
 
-        serde_json::to_string(&body)
-            .map_err(|e| format!("response serialization error: {e}"))
+        serde_json::to_string(&body).map_err(|e| format!("response serialization error: {e}"))
     }
 
-    #[tool(description = "Hybrid search across captured thoughts. Combines vector kNN (over the active embedding model) with trigram lexical similarity via reciprocal rank fusion, then applies a recency boost. When a cross-encoder reranker is configured, the top `candidate_pool` post-RRF hits are re-scored and returned in rerank order. Results are returned in post-pipeline order; per-hit per-leg fields (`vector_score`, `trigram_score`, `rrf_score`, `rerank_score`) carry every signal — pick `rerank_score ?? rrf_score` for thresholding. If the embedder is unreachable, results still come back from the trigram leg and `vector_search_available` is false; if the reranker fails, results come back in RRF + recency order and `rerank_used` is false.")]
+    #[tool(
+        description = "Hybrid search across captured thoughts. Combines vector kNN (over the active embedding model) with trigram lexical similarity via reciprocal rank fusion, then applies a recency boost. When a cross-encoder reranker is configured, the top `candidate_pool` post-RRF hits are re-scored and returned in rerank order. Optional `tag_filter` narrows to thoughts whose tags JSONB satisfies a containment query. If the embedder is unreachable, results still come back from the trigram leg and `vector_search_available` is false; if the reranker fails, results come back in RRF + recency order and `rerank_used` is false. Each hit carries the thought's tags so consumers can show / threshold without a follow-up get_thought."
+    )]
     async fn search_thoughts(
         &self,
         Parameters(args): Parameters<SearchThoughtsArgs>,
@@ -221,6 +213,7 @@ impl EngramServer {
             recency_half_life_days: args.recency_half_life_days,
             rerank: args.rerank,
             candidate_pool: args.candidate_pool,
+            tag_filter: args.tag_filter,
         };
 
         let resp = search::search_thoughts(
@@ -236,7 +229,9 @@ impl EngramServer {
             .map_err(|e| format!("response serialization error: {e}"))
     }
 
-    #[tool(description = "Recent thoughts in (optional) scope, ordered newest first. No retrieval scoring — just chronological browsing.")]
+    #[tool(
+        description = "Recent thoughts in (optional) scope, ordered newest first. No retrieval scoring — just chronological browsing."
+    )]
     async fn recent_thoughts(
         &self,
         Parameters(args): Parameters<RecentThoughtsArgs>,
@@ -259,7 +254,9 @@ impl EngramServer {
             .map_err(|e| format!("response serialization error: {e}"))
     }
 
-    #[tool(description = "Fetch a single thought by ID along with its provenance: whether it's been embedded ('indexed' or 'pending'), when it was embedded, and the active (non-superseded) facts derived from it. Each linked fact carries `flagged: true` for middle-band-confidence claims (under `min_confidence_to_store`); consumers may filter or de-emphasize.")]
+    #[tool(
+        description = "Fetch a single thought by ID along with its provenance: whether it's been embedded ('indexed' or 'pending'), when it was embedded, the LLM-extracted tags (with tagger model_id/version/extracted_at), and any retraction state."
+    )]
     async fn get_thought(
         &self,
         Parameters(args): Parameters<GetThoughtArgs>,
@@ -275,39 +272,9 @@ impl EngramServer {
             .map_err(|e| format!("response serialization error: {e}"))
     }
 
-    #[tool(description = "Hybrid search across extracted facts. Combines vector kNN over fact embeddings with trigram lexical similarity over fact.statement (and the SPO triple), fused via RRF, with optional cross-encoder rerank. Filters to active (non-superseded) facts whose source thought is also not retracted. Each result carries the fact's S/P/O triple, `confidence`, `flagged` (true for middle-band-confidence claims), and the source thought's content/scope/created_at — no follow-up get_thought call needed. Per-leg fields (`vector_score`, `trigram_score`, `rrf_score`, `rerank_score`) expose every signal; for thresholding use `rerank_score ?? rrf_score`.")]
-    async fn search_facts(
-        &self,
-        Parameters(args): Parameters<SearchFactsArgs>,
-    ) -> Result<String, String> {
-        let scope = match args.scope {
-            Some(s) => Some(Scope::new(s).map_err(|e| format!("invalid scope: {e}"))?),
-            None => None,
-        };
-
-        let request = SearchFactsRequest {
-            query: args.query,
-            scope,
-            limit: args.limit,
-            recency_half_life_days: args.recency_half_life_days,
-            rerank: args.rerank,
-            candidate_pool: args.candidate_pool,
-        };
-
-        let resp = search::search_facts(
-            &self.pool,
-            self.embedder.as_ref(),
-            self.reranker.as_deref(),
-            request,
-        )
-        .await
-        .map_err(map_read_error)?;
-
-        serde_json::to_string(&search_facts_response_json(&resp))
-            .map_err(|e| format!("response serialization error: {e}"))
-    }
-
-    #[tool(description = "Retract a thought as untrusted (e.g. the operator captured a wrong claim). Atomically marks `thoughts.retracted_at = NOW()` and auto-supersedes every active fact derived from the thought, so a subsequent reflector run won't re-extract from the still-untrusted source. The thought row itself stays in the DB (`get_thought` still finds it; the response carries `retracted_at` and `retracted_reason`). Use this rather than retracting facts one at a time, which is fragile if the operator misses any.")]
+    #[tool(
+        description = "Retract a thought as untrusted (e.g. the operator captured a wrong claim). Marks `thoughts.retracted_at = NOW()`. The thought row itself stays in the DB (`get_thought` still finds it; the response carries `retracted_at` and `retracted_reason`); retrieval (`search_thoughts`, `recent_thoughts`) skips it. To correct a wrong thought, retract it and capture a corrected one."
+    )]
     async fn retract_thought(
         &self,
         Parameters(args): Parameters<RetractThoughtArgs>,
@@ -317,43 +284,18 @@ impl EngramServer {
 
         let resp = retract::retract_thought(
             &self.pool,
-            RetractThoughtRequest { thought_id, reason: args.reason },
+            RetractThoughtRequest {
+                thought_id,
+                reason: args.reason,
+            },
         )
         .await
         .map_err(map_retract_error)?;
 
         let body = serde_json::json!({
             "retracted": resp.retracted,
-            "facts_superseded": resp.facts_superseded,
         });
-        serde_json::to_string(&body)
-            .map_err(|e| format!("response serialization error: {e}"))
-    }
-
-    #[tool(description = "Correct or retract a fact. With a replacement, inserts a new fact (manual provenance: extractor_model='manual', version=0, confidence=1.0) and supersedes the old one; the audit trail (superseded_by, superseded_at) is preserved. Without a replacement, the fact is superseded with no successor — the row stays in the DB but search_facts and get_thought will no longer surface it.")]
-    async fn correct_fact(
-        &self,
-        Parameters(args): Parameters<CorrectFactArgs>,
-    ) -> Result<String, String> {
-        let fact_id = uuid::Uuid::from_str(&args.fact_id)
-            .map_err(|e| format!("invalid fact_id: {e}"))?;
-        let replacement = args.replacement.map(|r| FactReplacement {
-            statement: r.statement,
-            subject: r.subject,
-            predicate: r.predicate,
-            object: r.object,
-        });
-
-        let resp = correct::correct_fact(&self.pool, CorrectFactRequest { fact_id, replacement })
-            .await
-            .map_err(map_correct_error)?;
-
-        let body = serde_json::json!({
-            "superseded": resp.superseded,
-            "new_fact_id": resp.new_fact_id.map(|u| u.to_string()),
-        });
-        serde_json::to_string(&body)
-            .map_err(|e| format!("response serialization error: {e}"))
+        serde_json::to_string(&body).map_err(|e| format!("response serialization error: {e}"))
     }
 }
 
@@ -384,21 +326,6 @@ fn map_read_error(err: ReadError) -> String {
     }
 }
 
-fn map_correct_error(err: CorrectError) -> String {
-    match err {
-        CorrectError::AlreadySupersededOrMissing(id) => {
-            format!("fact not found or already superseded: {id}")
-        }
-        CorrectError::EmptyReplacementStatement => {
-            "replacement statement must not be empty".to_string()
-        }
-        CorrectError::Storage(e) => {
-            tracing::error!(error = %e, "correct_fact storage error");
-            "internal database error".to_string()
-        }
-    }
-}
-
 fn map_retract_error(err: RetractError) -> String {
     match err {
         RetractError::NotFoundOrAlreadyRetracted(id) => {
@@ -423,6 +350,7 @@ fn search_response_json(resp: &SearchResponse) -> serde_json::Value {
                 "source": h.source.as_str(),
                 "created_at": h.created_at.format(&time::format_description::well_known::Rfc3339).unwrap_or_default(),
                 "metadata": h.metadata.as_value(),
+                "tags": h.tags,
                 "vector_score": h.vector_score,
                 "trigram_score": h.trigram_score,
                 "rrf_score": h.rrf_score,
@@ -456,24 +384,6 @@ fn recent_response_json(resp: &RecentResponse) -> serde_json::Value {
 }
 
 fn get_thought_response_json(resp: &GetThoughtResponse) -> serde_json::Value {
-    let linked_facts: Vec<serde_json::Value> = resp
-        .linked_facts
-        .iter()
-        .map(|f| {
-            serde_json::json!({
-                "fact_id": f.id.to_string(),
-                "statement": f.statement,
-                "subject": f.subject,
-                "predicate": f.predicate,
-                "object": f.object,
-                "confidence": f.confidence,
-                "flagged": f.flagged,
-                "extractor_model": f.extractor_model,
-                "extractor_version": f.extractor_version,
-                "created_at": f.created_at.format(&time::format_description::well_known::Rfc3339).unwrap_or_default(),
-            })
-        })
-        .collect();
     serde_json::json!({
         "thought": {
             "thought_id": resp.thought.id.to_string(),
@@ -486,64 +396,46 @@ fn get_thought_response_json(resp: &GetThoughtResponse) -> serde_json::Value {
         "provenance": {
             "embedding_status": resp.embedding_status,
             "embedded_at": resp.embedded_at.and_then(|t| t.format(&time::format_description::well_known::Rfc3339).ok()),
-            "linked_facts": linked_facts,
+            "tags": resp.thought.tags,
+            "tags_extractor_model": resp.thought.tags_extractor_model,
+            "tags_extractor_version": resp.thought.tags_extractor_version,
+            "tags_extracted_at": resp.thought.tags_extracted_at.and_then(|t| t.format(&time::format_description::well_known::Rfc3339).ok()),
             "retracted_at": resp.retracted_at.and_then(|t| t.format(&time::format_description::well_known::Rfc3339).ok()),
             "retracted_reason": resp.retracted_reason,
         },
     })
 }
 
-fn search_facts_response_json(resp: &SearchFactsResponse) -> serde_json::Value {
-    let results: Vec<serde_json::Value> = resp
-        .results
-        .iter()
-        .map(|h| {
-            serde_json::json!({
-                "fact_id": h.fact_id.to_string(),
-                "statement": h.statement,
-                "subject": h.subject,
-                "predicate": h.predicate,
-                "object": h.object,
-                "confidence": h.confidence,
-                "source_thought_id": h.source_thought_id.to_string(),
-                "source_thought_content": h.source_thought_content,
-                "source_thought_scope": h.source_thought_scope.as_str(),
-                "source_thought_created_at": h.source_thought_created_at.format(&time::format_description::well_known::Rfc3339).unwrap_or_default(),
-                "flagged": h.flagged,
-                "vector_score": h.vector_score,
-                "trigram_score": h.trigram_score,
-                "rrf_score": h.rrf_score,
-                "rerank_score": h.rerank_score,
-            })
-        })
-        .collect();
-    serde_json::json!({
-        "results": results,
-        "vector_search_available": resp.vector_search_available,
-        "rerank_used": resp.rerank_used,
-    })
-}
-
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for EngramServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions(
-                "Engram — self-hosted MCP-native memory service. \
-                 Use `capture` to record a thought, `search_thoughts` for hybrid retrieval, \
-                 `recent_thoughts` to browse by recency, and `get_thought` for full provenance \
-                 of a single thought.",
-            )
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
+            "Engram — self-hosted MCP-native memory service. \
+                 Use `capture` to record a thought, `search_thoughts` for hybrid retrieval \
+                 (with optional JSONB tag_filter), `recent_thoughts` to browse by recency, \
+                 `get_thought` for full provenance, and `retract_thought` to mark a thought \
+                 untrusted.",
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use engram_core::{TagKind, Tags};
     use engram_embed::FakeEmbedder;
 
     fn server(pool: PgPool) -> EngramServer {
-        EngramServer::new(pool, Arc::new(FakeEmbedder::new()), None)
+        EngramServer::new(pool, Arc::new(FakeEmbedder::new()), None, None)
+    }
+
+    fn server_with_tagger(pool: PgPool) -> EngramServer {
+        EngramServer::new(
+            pool,
+            Arc::new(FakeEmbedder::new()),
+            None,
+            Some("fake/tagger".to_string()),
+        )
     }
 
     #[sqlx::test(migrations = "../../migrations")]
@@ -560,8 +452,8 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert!(json["thought_id"].is_string());
-        // M2 Phase B flip: pending is the normal return; worker drains on its tick.
         assert_eq!(json["embedding_status"], "pending");
+        assert_eq!(json["is_duplicate"], false);
     }
 
     #[sqlx::test(migrations = "../../migrations")]
@@ -577,6 +469,35 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("content"));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn capture_tool_returns_duplicate_flag_on_repeat_content(pool: PgPool) {
+        let s = server(pool);
+        let first_raw = s
+            .capture(Parameters(CaptureArgs {
+                content: "duplicate content".into(),
+                source: "test".into(),
+                scope: None,
+                metadata: None,
+            }))
+            .await
+            .unwrap();
+        let first: serde_json::Value = serde_json::from_str(&first_raw).unwrap();
+        assert_eq!(first["is_duplicate"], false);
+
+        let second_raw = s
+            .capture(Parameters(CaptureArgs {
+                content: "duplicate content".into(),
+                source: "test".into(),
+                scope: None,
+                metadata: None,
+            }))
+            .await
+            .unwrap();
+        let second: serde_json::Value = serde_json::from_str(&second_raw).unwrap();
+        assert_eq!(second["is_duplicate"], true);
+        assert_eq!(second["thought_id"], first["thought_id"]);
     }
 
     #[sqlx::test(migrations = "../../migrations")]
@@ -596,7 +517,10 @@ mod tests {
                 query: "tcgplayer".into(),
                 scope: None,
                 limit: None,
-                recency_half_life_days: None, rerank: None, candidate_pool: None,
+                recency_half_life_days: None,
+                rerank: None,
+                candidate_pool: None,
+                tag_filter: None,
             }))
             .await
             .unwrap();
@@ -605,13 +529,120 @@ mod tests {
         let results = json["results"].as_array().unwrap();
         assert!(!results.is_empty());
         assert!(results[0]["thought_id"].is_string());
-        assert!(results[0]["content"].as_str().unwrap().contains("tcgplayer"));
+        assert!(
+            results[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("tcgplayer")
+        );
+        // Each hit carries a tags object (empty by default).
+        assert!(results[0]["tags"].is_object());
     }
 
-    /// Regression: M3 Phase C dropped the unified `score` field. Per-leg
-    /// fields (`rrf_score`, plus `rerank_score` when reranked, plus the
-    /// raw leg signals) carry every signal; consumers no longer rely on
-    /// a single sortable scalar.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_thoughts_tool_response_carries_tags_per_hit(pool: PgPool) {
+        let s = server(pool.clone());
+        let cap_raw = s
+            .capture(Parameters(CaptureArgs {
+                content: "tag-aware tcgplayer note".into(),
+                source: "test".into(),
+                scope: None,
+                metadata: None,
+            }))
+            .await
+            .unwrap();
+        let cap_json: serde_json::Value = serde_json::from_str(&cap_raw).unwrap();
+        let thought_id = ThoughtId::from_str(cap_json["thought_id"].as_str().unwrap()).unwrap();
+
+        // Write tags directly via storage.
+        let tags = Tags {
+            topics: vec!["rust".into()],
+            kind: Some(TagKind::Idea),
+            ..Tags::default()
+        };
+        engram_storage::update_thought_tags(&pool, thought_id, &tags, "fake/tagger", 1)
+            .await
+            .unwrap();
+
+        let raw = s
+            .search_thoughts(Parameters(SearchThoughtsArgs {
+                query: "tcgplayer".into(),
+                scope: None,
+                limit: None,
+                recency_half_life_days: Some(0.0),
+                rerank: None,
+                candidate_pool: None,
+                tag_filter: None,
+            }))
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let results = json["results"].as_array().unwrap();
+        let hit = results
+            .iter()
+            .find(|h| h["thought_id"] == cap_json["thought_id"])
+            .expect("inserted hit present");
+        assert_eq!(hit["tags"]["topics"], serde_json::json!(["rust"]));
+        assert_eq!(hit["tags"]["kind"], "idea");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_thoughts_tool_applies_tag_filter(pool: PgPool) {
+        let s = server(pool.clone());
+        // Capture two thoughts; tag one with kind=task.
+        let task_raw = s
+            .capture(Parameters(CaptureArgs {
+                content: "task one keyword".into(),
+                source: "test".into(),
+                scope: None,
+                metadata: None,
+            }))
+            .await
+            .unwrap();
+        let _other_raw = s
+            .capture(Parameters(CaptureArgs {
+                content: "idea two keyword".into(),
+                source: "test".into(),
+                scope: None,
+                metadata: None,
+            }))
+            .await
+            .unwrap();
+        let task_json: serde_json::Value = serde_json::from_str(&task_raw).unwrap();
+        let task_id = ThoughtId::from_str(task_json["thought_id"].as_str().unwrap()).unwrap();
+
+        engram_storage::update_thought_tags(
+            &pool,
+            task_id,
+            &Tags {
+                kind: Some(TagKind::Task),
+                ..Tags::default()
+            },
+            "fake/tagger",
+            1,
+        )
+        .await
+        .unwrap();
+
+        let raw = s
+            .search_thoughts(Parameters(SearchThoughtsArgs {
+                query: "keyword".into(),
+                scope: None,
+                limit: None,
+                recency_half_life_days: Some(0.0),
+                rerank: None,
+                candidate_pool: None,
+                tag_filter: Some(serde_json::json!({"kind": "task"})),
+            }))
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let results = json["results"].as_array().unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["thought_id"], task_json["thought_id"]);
+    }
+
+    /// Regression: Phase C dropped the unified `score` field.
     #[sqlx::test(migrations = "../../migrations")]
     async fn search_response_omits_score_field(pool: PgPool) {
         let s = server(pool);
@@ -629,7 +660,10 @@ mod tests {
                 query: "Nix".into(),
                 scope: None,
                 limit: None,
-                recency_half_life_days: None, rerank: None, candidate_pool: None,
+                recency_half_life_days: None,
+                rerank: None,
+                candidate_pool: None,
+                tag_filter: None,
             }))
             .await
             .unwrap();
@@ -641,7 +675,6 @@ mod tests {
             first.get("score").is_none(),
             "Phase C dropped `score` from search_thoughts hits"
         );
-        // Per-leg signals are present (rrf_score should always be set on a fused hit).
         assert!(first.get("rrf_score").is_some());
     }
 
@@ -699,10 +732,56 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert!(json["thought"].is_object());
         assert_eq!(json["thought"]["content"], "hello");
-        // M2 Phase B: capture leaves the embedding pending; no worker has run.
         assert_eq!(json["provenance"]["embedding_status"], "pending");
         assert!(json["provenance"]["embedded_at"].is_null());
-        assert_eq!(json["provenance"]["linked_facts"], serde_json::json!([]));
+        // No linked_facts field post-M4.
+        assert!(json["provenance"].get("linked_facts").is_none());
+        // Tag fields exist (empty defaults).
+        assert!(json["provenance"]["tags"].is_object());
+        assert!(json["provenance"]["tags_extractor_model"].is_null());
+        assert!(json["provenance"]["tags_extractor_version"].is_null());
+        assert!(json["provenance"]["tags_extracted_at"].is_null());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn get_thought_tool_carries_tags_and_tagger_provenance(pool: PgPool) {
+        let s = server(pool.clone());
+        let cap_raw = s
+            .capture(Parameters(CaptureArgs {
+                content: "tagged thought".into(),
+                source: "test".into(),
+                scope: None,
+                metadata: None,
+            }))
+            .await
+            .unwrap();
+        let cap_json: serde_json::Value = serde_json::from_str(&cap_raw).unwrap();
+        let thought_id = ThoughtId::from_str(cap_json["thought_id"].as_str().unwrap()).unwrap();
+
+        let tags = Tags {
+            people: vec!["Sarah".into()],
+            kind: Some(TagKind::PersonNote),
+            ..Tags::default()
+        };
+        engram_storage::update_thought_tags(&pool, thought_id, &tags, "fake/tagger", 1)
+            .await
+            .unwrap();
+
+        let raw = s
+            .get_thought(Parameters(GetThoughtArgs {
+                thought_id: cap_json["thought_id"].as_str().unwrap().to_string(),
+            }))
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            json["provenance"]["tags"]["people"],
+            serde_json::json!(["Sarah"])
+        );
+        assert_eq!(json["provenance"]["tags"]["kind"], "person_note");
+        assert_eq!(json["provenance"]["tags_extractor_model"], "fake/tagger");
+        assert_eq!(json["provenance"]["tags_extractor_version"], 1);
+        assert!(json["provenance"]["tags_extracted_at"].is_string());
     }
 
     #[sqlx::test(migrations = "../../migrations")]
@@ -717,248 +796,20 @@ mod tests {
         assert!(err.contains("invalid thought_id"));
     }
 
-    // -- M2 Phase D tool tests --
-
-    async fn seed_fact_for_tool_test(
-        pool: &PgPool,
-        thought_content: &str,
-        statement: &str,
-    ) -> (String, String) {
-        // Capture a thought, insert a fact against it, return (thought_id, fact_id).
-        let scope = Scope::global();
-        let source = Source::new("test").unwrap();
-        let metadata = engram_core::Metadata::empty();
-        let inserted = engram_storage::insert_thought(
-            pool,
-            engram_storage::NewThought {
-                scope: &scope,
-                content: thought_content,
-                source: &source,
-                metadata: &metadata,
-            },
-        )
-        .await
-        .unwrap();
-        let run_id = engram_storage::start_run(pool, "fake/extractor", 1, None)
-            .await
-            .unwrap();
-        let fact_id = engram_storage::insert_fact(
-            pool,
-            engram_storage::NewFact {
-                scope: &scope,
-                statement,
-                subject: None,
-                predicate: None,
-                object: None,
-                source_thought_id: inserted.id,
-                extractor_model: "fake/extractor",
-                extractor_version: 1,
-                source_run_id: Some(run_id),
-                confidence: 0.9,
-                flagged: false,
-            },
-        )
-        .await
-        .unwrap();
-        (inserted.id.to_string(), fact_id.to_string())
-    }
-
     #[sqlx::test(migrations = "../../migrations")]
-    async fn search_facts_tool_returns_results_with_source_thought_content(pool: PgPool) {
-        seed_fact_for_tool_test(&pool, "Engram uses pgvector", "pgvector is the vector store").await;
-
-        let s = server(pool);
-        let raw = s
-            .search_facts(Parameters(SearchFactsArgs {
-                query: "pgvector".to_string(),
-                scope: None,
-                limit: None,
-                recency_half_life_days: Some(0.0), rerank: None, candidate_pool: None,
-            }))
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        let results = json["results"].as_array().unwrap();
-        assert_eq!(results.len(), 1);
-        assert!(results[0]["fact_id"].is_string());
-        assert_eq!(results[0]["statement"], "pgvector is the vector store");
-        assert_eq!(results[0]["source_thought_content"], "Engram uses pgvector");
-        assert_eq!(results[0]["source_thought_scope"], "global");
-    }
-
-    /// Regression: M3 Phase C dropped the unified `score` field from
-    /// `search_facts` hits; consumers use `rerank_score ?? rrf_score`
-    /// for thresholding. Also pins `flagged` as a top-level boolean field.
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn search_facts_response_omits_score_field(pool: PgPool) {
-        seed_fact_for_tool_test(&pool, "Engram uses pgvector", "pgvector is the vector store")
-            .await;
-        let s = server(pool);
-        let raw = s
-            .search_facts(Parameters(SearchFactsArgs {
-                query: "pgvector".to_string(),
-                scope: None,
-                limit: None,
-                recency_half_life_days: Some(0.0),
-                rerank: None,
-                candidate_pool: None,
-            }))
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        let results = json["results"].as_array().unwrap();
-        assert!(!results.is_empty());
-        let first = &results[0];
-        assert!(
-            first.get("score").is_none(),
-            "Phase C dropped `score` from search_facts hits"
-        );
-        assert!(first.get("rrf_score").is_some());
-        // `flagged` always present (defaults false for seeded fact at 0.9 confidence).
-        assert_eq!(first["flagged"], serde_json::Value::Bool(false));
-    }
-
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn correct_fact_tool_supersedes_with_replacement(pool: PgPool) {
-        let (_thought_id, fact_id) =
-            seed_fact_for_tool_test(&pool, "anchor", "old wording").await;
+    async fn retract_thought_tool_marks_thought(pool: PgPool) {
         let s = server(pool.clone());
-
-        let raw = s
-            .correct_fact(Parameters(CorrectFactArgs {
-                fact_id: fact_id.clone(),
-                replacement: Some(CorrectFactReplacementArgs {
-                    statement: "new wording".to_string(),
-                    subject: Some("S".to_string()),
-                    predicate: Some("P".to_string()),
-                    object: Some("O".to_string()),
-                }),
-            }))
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(json["superseded"], true);
-        assert!(json["new_fact_id"].is_string());
-
-        // Old fact is superseded; new fact exists with manual sentinel.
-        let old_uuid = uuid::Uuid::from_str(&fact_id).unwrap();
-        let old_row = sqlx::query!(
-            r#"SELECT superseded_at FROM facts WHERE id = $1"#,
-            old_uuid,
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert!(old_row.superseded_at.is_some());
-
-        let new_uuid =
-            uuid::Uuid::from_str(json["new_fact_id"].as_str().unwrap()).unwrap();
-        let new_row = sqlx::query!(
-            r#"SELECT extractor_model, extractor_version FROM facts WHERE id = $1"#,
-            new_uuid,
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(new_row.extractor_model, "manual");
-        assert_eq!(new_row.extractor_version, 0);
-    }
-
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn correct_fact_tool_errors_on_unknown_id(pool: PgPool) {
-        let s = server(pool);
-        let err = s
-            .correct_fact(Parameters(CorrectFactArgs {
-                fact_id: uuid::Uuid::new_v4().to_string(),
-                replacement: None,
-            }))
-            .await
-            .unwrap_err();
-        assert!(err.contains("not found or already superseded"));
-    }
-
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn correct_fact_tool_invalid_uuid_errors(pool: PgPool) {
-        let s = server(pool);
-        let err = s
-            .correct_fact(Parameters(CorrectFactArgs {
-                fact_id: "not-a-uuid".to_string(),
-                replacement: None,
-            }))
-            .await
-            .unwrap_err();
-        assert!(err.contains("invalid fact_id"));
-    }
-
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn get_thought_tool_includes_linked_facts(pool: PgPool) {
-        let (thought_id, _fact_id) =
-            seed_fact_for_tool_test(&pool, "with linked fact", "the fact").await;
-        let s = server(pool);
-
-        let raw = s
-            .get_thought(Parameters(GetThoughtArgs { thought_id }))
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        let facts = json["provenance"]["linked_facts"].as_array().unwrap();
-        assert_eq!(facts.len(), 1);
-        assert_eq!(facts[0]["statement"], "the fact");
-        assert!(facts[0]["fact_id"].is_string());
-        // Fresh thought has no retraction state.
-        assert!(json["provenance"]["retracted_at"].is_null());
-        assert!(json["provenance"]["retracted_reason"].is_null());
-    }
-
-    /// M3 Phase C: linked_facts items carry `flagged: bool` so consumers
-    /// can filter middle-band-confidence claims from a `get_thought`
-    /// response.
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn get_thought_response_linked_facts_carry_flagged(pool: PgPool) {
-        let (thought_id, _fact_id) =
-            seed_fact_for_tool_test(&pool, "fact source", "claim text").await;
-        let s = server(pool);
-
-        let raw = s
-            .get_thought(Parameters(GetThoughtArgs { thought_id }))
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        let facts = json["provenance"]["linked_facts"].as_array().unwrap();
-        assert_eq!(facts.len(), 1);
-        // Seeded fact has confidence 0.9 (above default min_confidence_to_store).
-        assert_eq!(facts[0]["flagged"], serde_json::Value::Bool(false));
-    }
-
-    /// M3 Phase C: `search_facts` responses carry `flagged: bool` per hit
-    /// so consumers can threshold downstream.
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn search_facts_response_carries_flagged(pool: PgPool) {
-        seed_fact_for_tool_test(&pool, "anchor source", "queryable claim").await;
-        let s = server(pool);
-        let raw = s
-            .search_facts(Parameters(SearchFactsArgs {
-                query: "queryable".to_string(),
+        let cap_raw = s
+            .capture(Parameters(CaptureArgs {
+                content: "wrong claim".into(),
+                source: "test".into(),
                 scope: None,
-                limit: None,
-                recency_half_life_days: Some(0.0),
-                rerank: None,
-                candidate_pool: None,
+                metadata: None,
             }))
             .await
             .unwrap();
-        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        let results = json["results"].as_array().unwrap();
-        assert!(!results.is_empty());
-        let first = &results[0];
-        assert_eq!(first["flagged"], serde_json::Value::Bool(false));
-    }
-
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn retract_thought_tool_marks_thought_and_supersedes_facts(pool: PgPool) {
-        let (thought_id, fact_id) =
-            seed_fact_for_tool_test(&pool, "wrong claim", "derived false fact").await;
-        let s = server(pool.clone());
+        let cap_json: serde_json::Value = serde_json::from_str(&cap_raw).unwrap();
+        let thought_id = cap_json["thought_id"].as_str().unwrap().to_string();
 
         let raw = s
             .retract_thought(Parameters(RetractThoughtArgs {
@@ -969,35 +820,35 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(json["retracted"], true);
-        assert_eq!(json["facts_superseded"], 1);
+        // No facts_superseded field post-M4.
+        assert!(json.get("facts_superseded").is_none());
 
-        // get_thought now surfaces retraction state + empty linked_facts.
+        // get_thought surfaces retraction state.
         let raw = s
-            .get_thought(Parameters(GetThoughtArgs { thought_id: thought_id.clone() }))
+            .get_thought(Parameters(GetThoughtArgs {
+                thought_id: thought_id.clone(),
+            }))
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert!(json["provenance"]["retracted_at"].is_string());
         assert_eq!(json["provenance"]["retracted_reason"], "test reason");
-        let linked = json["provenance"]["linked_facts"].as_array().unwrap();
-        assert!(linked.is_empty());
-
-        // The derived fact is now superseded in the DB.
-        let fact_uuid = uuid::Uuid::from_str(&fact_id).unwrap();
-        let row = sqlx::query!(
-            r#"SELECT superseded_at FROM facts WHERE id = $1"#,
-            fact_uuid,
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert!(row.superseded_at.is_some());
     }
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn retract_thought_tool_errors_on_already_retracted(pool: PgPool) {
-        let (thought_id, _) = seed_fact_for_tool_test(&pool, "wrong claim", "f").await;
-        let s = server(pool);
+        let s = server(pool.clone());
+        let cap_raw = s
+            .capture(Parameters(CaptureArgs {
+                content: "wrong claim".into(),
+                source: "test".into(),
+                scope: None,
+                metadata: None,
+            }))
+            .await
+            .unwrap();
+        let cap_json: serde_json::Value = serde_json::from_str(&cap_raw).unwrap();
+        let thought_id = cap_json["thought_id"].as_str().unwrap().to_string();
 
         s.retract_thought(Parameters(RetractThoughtArgs {
             thought_id: thought_id.clone(),
@@ -1007,7 +858,10 @@ mod tests {
         .unwrap();
 
         let err = s
-            .retract_thought(Parameters(RetractThoughtArgs { thought_id, reason: None }))
+            .retract_thought(Parameters(RetractThoughtArgs {
+                thought_id,
+                reason: None,
+            }))
             .await
             .unwrap_err();
         assert!(err.contains("not found or already retracted"));
@@ -1028,8 +882,7 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn capture_then_drain_makes_thought_indexed_via_get_thought(pool: PgPool) {
-        // M2 Phase B end-to-end (success criterion #4 in m2-facts-pipeline.md):
-        // capture → worker drains → get_thought reports embedding_status=indexed.
+        // Capture → worker drains → get_thought reports embedding_status=indexed.
         let s = server(pool.clone());
 
         let cap_raw = s
@@ -1045,14 +898,12 @@ mod tests {
         let thought_id = cap_json["thought_id"].as_str().unwrap().to_string();
         assert_eq!(cap_json["embedding_status"], "pending");
 
-        // Worker tick: pull the queue, embed, mark.
         let report = crate::drain::drain_pending_embeddings(&pool, s.embedder.as_ref(), 16)
             .await
             .unwrap();
         assert_eq!(report.embedded, 1);
         assert_eq!(report.failed, 0);
 
-        // After the drain, get_thought reports indexed.
         let raw = s
             .get_thought(Parameters(GetThoughtArgs { thought_id }))
             .await
@@ -1060,5 +911,42 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(json["provenance"]["embedding_status"], "indexed");
         assert!(json["provenance"]["embedded_at"].is_string());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn server_with_tagger_enqueues_tag_job_on_capture(pool: PgPool) {
+        let s = server_with_tagger(pool.clone());
+        s.capture(Parameters(CaptureArgs {
+            content: "needs tagging".into(),
+            source: "test".into(),
+            scope: None,
+            metadata: None,
+        }))
+        .await
+        .unwrap();
+
+        let jobs = engram_storage::fetch_pending_tag_jobs(&pool, 10)
+            .await
+            .unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].tagger_model_id, "fake/tagger");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn server_without_tagger_skips_tag_enqueue(pool: PgPool) {
+        let s = server(pool.clone());
+        s.capture(Parameters(CaptureArgs {
+            content: "no tagger".into(),
+            source: "test".into(),
+            scope: None,
+            metadata: None,
+        }))
+        .await
+        .unwrap();
+
+        let jobs = engram_storage::fetch_pending_tag_jobs(&pool, 10)
+            .await
+            .unwrap();
+        assert!(jobs.is_empty());
     }
 }
