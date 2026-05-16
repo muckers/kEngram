@@ -695,6 +695,7 @@ dependencies = [
  "figment",
  "rmcp",
  "serde",
+ "serde_json",
  "sqlx",
  "time",
  "tokio",
@@ -702,6 +703,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

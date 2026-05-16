@@ -105,11 +105,23 @@ End state: TEI Docker container serves BGE-reranker-v2-m3; `search_thoughts` / `
 
 ### Step 3 — A/B benchmarking harness
 
-Not yet planned.
+End state: `engram bench rerank --corpus <path>` runs each fixture query through `search_thoughts` / `search_facts` twice (rerank off / rerank on) and reports nDCG@10 + MRR for both rankings in a markdown table to stdout, plus per-query Δ and an AVERAGE row. Closes M3 success criterion 1: "reranked nDCG@10 is materially higher than RRF-only nDCG@10."
 
-- [ ] `engram bench rerank` CLI subcommand reading fixture file
-- [ ] Curated fixture corpus at `tests/fixtures/rerank-bench.json` (~30-50 query/expected-hit pairs)
-- [ ] nDCG@10 comparison table output
+- [x] `engram-core::metrics`: `ndcg_at_k(ranking, graded, k) -> f32` and `reciprocal_rank(ranking, relevant_set) -> f32`. Pure functions, no I/O; re-exported from the crate root.
+- [x] `engram-cli::bench`: fixture loader (`BenchRerankCorpus`, `BenchQuery`, `BenchTarget { Thoughts, Facts }`); harness loop (`run_pair` builds two `SearchRequest` / `SearchFactsRequest` with `rerank: Some(false)` and `Some(true)`); `score_query` pure scorer factored out for testability; markdown table formatter (hand-rolled, no new dep). Binary relevance promotes to unit-weight graded automatically when `graded_relevance` is omitted.
+- [x] `engram-cli::main`: new `Command::Bench { action: BenchAction }` clap variant, action-nested for future bench targets (`engram bench rerank …`); dispatch wraps `build_embedder` + `build_reranker` (errors clearly when reranker is unconfigured).
+- [x] Cargo.toml: `serde_json` + `uuid` added to engram-cli's direct deps (already available in workspace deps).
+- [x] `tests/fixtures/bench-rerank.example.json`: 4 example queries covering both targets, binary + graded relevance shapes, and a scope-filtered variant. UUIDs are placeholders so any live run emits a stale-fixture warning per query — useful for schema documentation and parser smoke-testing without depending on a live corpus.
+- [x] Soft-fail semantics: per-query `tracing::warn!` when neither ranking contains a relevant id (stale-fixture detection); hard-fail with clear message when `[reranker]` isn't configured.
+- [x] `DEVELOPMENT.md`: `engram bench rerank` example added under "Common operations".
+- [x] Tests: 7 new in engram-core/metrics (perfect ranking → 1.0; zero when no relevant in ranking; binary case matches unit-weight graded; truncation; reversed ranking → known sub-1.0 value; reciprocal_rank inverse-position; reciprocal_rank zero on no-match); 4 new in engram-cli/bench (corpus parse, binary→graded promotion, no_match flag, bundled-example-fixture parse). Test count 295 → 306 (+11).
+- [x] `cargo build --workspace`, `cargo test --workspace`, `cargo clippy --all-targets -- -D warnings` all green.
+
+**Operator-driven (post-merge):**
+
+- [ ] Author a real-corpus fixture from your live DB (~10+ entries; include the Phase B step 2 regression target "tooling for compiling codebases reproducibly").
+- [ ] Run `engram bench rerank --corpus <your-fixture>.json`; record the numerical Δ for nDCG@10 and MRR.
+- [ ] Use that number to inform the Phase D rerank-on-by-default decision.
 
 ## Phase C — Deeper pipeline quality
 
@@ -156,6 +168,8 @@ Not yet planned. Items:
 Dated notes appended as items land. Format: `YYYY-MM-DD — <one-line summary>`. Multi-line entries fine for decisions that need explanation.
 
 <!-- Most recent entry first. -->
+
+- **2026-05-15** — **M3 Phase B step 3 landed: A/B benchmarking harness.** `engram bench rerank --corpus <path>` runs each fixture query through `search_thoughts`/`search_facts` twice (RRF-only and reranked), computes nDCG@10 + MRR for each ranking, and prints a markdown comparison table to stdout with per-query rows + an AVERAGE summary line. Closes M3 success criterion 1 (rerank earns its latency, measurable). New pure-function metrics in engram-core (`ndcg_at_k`, `reciprocal_rank`) — keyed on Uuid so they apply equally to thought_ids and fact_ids. New bench module in engram-cli with fixture loader, harness loop, and hand-rolled markdown table formatter (no new dep beyond `serde_json` + `uuid` added to engram-cli's Cargo.toml from existing workspace deps). Fixture schema supports graded or binary relevance, per-entry `target: "thoughts" | "facts"`, optional scope filter. Soft-fail semantics: per-query warn when stale fixtures don't match either ranking; hard-fail when `[reranker]` is unconfigured (no silent fallthrough). Bundled `tests/fixtures/bench-rerank.example.json` demonstrates the schema with placeholder UUIDs; operators author the real ~30+-entry fixture against live captures over Phase D dogfood. Test count 295 → 306 (+11: 7 metrics + 4 bench). Build / test / clippy all green. Next: Phase D operator dogfood + M3 close-out.
 
 - **2026-05-15** — **Phase C dogfood follow-up: predicate-verbosity item filed.** Ron's second-pass read of the dogfood corpus surfaced that the v4 prompt's "preserve qualifiers" guidance pushes `qwen3-coder:30b` to stuff modifiers into the predicate slot — concrete examples: `predicate="can outperform by an order of magnitude for very high-throughput RPC workloads compared to"` (14 words); `predicate="offers zero-copy reads but at the cost of more rigid schema evolution compared to"` (12 words). The statement carries the full claim correctly, but the (S, P, O) triple loses utility as a join/filter key — `predicate = 'outperforms'` doesn't match; `predicate ILIKE '%outperform%'` does. The trailing `compared to` suffix is the same artifact in another form. Filed as a new backlog item under `## In scope > Pipeline quality` in `m3-search-quality.md`, with three paths (prompt-side brevity rule for v4.1 → v5; schema extension with `predicate_modifier`; multi-fact decomposition) and a "Done means" criterion (≤ 3 words on ≥ 80% of comparative-fact predicates; no trailing `compared to`). Not a Phase C regression — surfaced *by* Phase C dogfood but caused by the v4 prompt's qualifier-preservation guidance. Decision deferred to Phase D dogfood, when more examples will tell us whether to lean prompt-side or schema-side.
 

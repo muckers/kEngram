@@ -157,6 +157,14 @@ cargo run --bin engram -- reflect --scope work --limit 100
 # thoughts.
 cargo run --bin engram -- reflect --rerun --scope work
 cargo run --bin engram -- reflect --rerun --since 2026-04-01T00:00:00Z
+
+# A/B-benchmark the reranker against RRF-only on an operator-curated
+# fixture corpus. Prints a markdown table to stdout with per-query
+# nDCG@10 and MRR for both rankings, plus an AVERAGE row. Requires a
+# configured [reranker] section in engram.toml and the corpus's
+# relevant_ids to point at real rows in your DB. See
+# tests/fixtures/bench-rerank.example.json for the schema.
+cargo run --bin engram -- bench rerank --corpus ~/.engram/my-bench.json
 ```
 
 ## Configuration

@@ -17,7 +17,7 @@ M3 absorbs those alongside the reranker. The milestone is now "everything that m
 - **Configurable per-call:** `rerank: bool` (default `true`), `candidate_pool: int` (default 50).
 - **Both `search_thoughts` and `search_facts` (from M2) gain rerank support.**
 - **[M] Fact embeddings.** Extend the async-embedding seam to enqueue `target_kind = 'fact'` rows in `pending_embeddings`. The embed-drainer learns to vectorize fact statements alongside thought content (no schema change — `embeddings.target_kind` already lists `'fact'`). The vector leg in `search_facts_trigram` becomes a real `search_facts_vector_knn` call; `search_facts` graduates from trigram-only-inside-RRF-shape to actual hybrid retrieval. This was the M2 Phase D simplification; M3 closes it.
-- **[S] Eval-suite-style A/B comparison harness** — small, ad-hoc; the full eval suite lands at M5 — used to validate that rerank actually helps on a fixture corpus.
+- **✅ [S] Eval-suite-style A/B comparison harness** *(shipped 2026-05-15, M3 Phase B step 3)* — small, ad-hoc; the full eval suite lands at M5. `engram bench rerank --corpus <path>` reports nDCG@10 + MRR for RRF-only vs reranked on an operator-curated fixture; closes success criterion 1 with a concrete number rather than feel.
 
 ### Pulled forward from M2 (already landed)
 

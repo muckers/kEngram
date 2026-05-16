@@ -1,6 +1,7 @@
 //! engram — the only binary. Phase B wires up the `serve` and `migrate`
 //! subcommands; `embed-backfill` lands in Phase D.
 
+mod bench;
 mod config;
 
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
@@ -78,6 +79,26 @@ enum Command {
         /// RFC-3339 timestamp. Rejected without --rerun.
         #[arg(long)]
         since: Option<String>,
+    },
+    /// Benchmarking harness — A/B comparisons across search-pipeline
+    /// configurations. Subcommand-action shape leaves room for additional
+    /// bench targets without flattening the CLI.
+    Bench {
+        #[command(subcommand)]
+        action: BenchAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum BenchAction {
+    /// Run rerank A/B (RRF-only vs cross-encoder-reranked) over a fixture
+    /// corpus. Prints a markdown table to stdout. See
+    /// `tests/fixtures/bench-rerank.example.json` for the fixture schema.
+    /// Requires `[reranker]` to be configured.
+    Rerank {
+        /// Path to the fixture JSON file.
+        #[arg(long)]
+        corpus: PathBuf,
     },
 }
 
@@ -610,5 +631,22 @@ async fn main() -> anyhow::Result<()> {
         Command::Reflect { scope, limit, rerun, since } => {
             run_reflect(config, scope, limit, rerun, since).await
         }
+        Command::Bench { action } => match action {
+            BenchAction::Rerank { corpus } => run_bench_rerank(config, corpus).await,
+        },
     }
+}
+
+async fn run_bench_rerank(config: Config, corpus: PathBuf) -> anyhow::Result<()> {
+    let pool = PgPoolOptions::new()
+        .max_connections(config.database.max_connections)
+        .connect(&config.database.url)
+        .await
+        .with_context(|| format!("connecting to {}", config.database.url))?;
+
+    let embedder = build_embedder(&config.embedder)?;
+    let reranker = build_reranker(&config.reranker)?.context(
+        "bench rerank requires a configured [reranker] section; see DEVELOPMENT.md",
+    )?;
+    bench::run_bench_rerank(&pool, embedder, reranker, &corpus).await
 }
