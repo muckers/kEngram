@@ -1,5 +1,9 @@
-//! engram — the only binary. Phase B wires up the `serve` and `migrate`
-//! subcommands; `embed-backfill` lands in Phase D.
+//! engram — the only binary. M1 wired `serve` and `migrate`; M2 added the
+//! worker; M3 added `reflect`, `embed-backfill --target`, and the bench
+//! harness. M4 collapses the facts pipeline into a thoughts-only sidecar:
+//! `reflect` → `tag`, `embed-backfill` loses its `--target` flag, and the
+//! worker drops its reflector cron in favour of a plain tag drainer that
+//! runs on the same tick as the embed drainer.
 
 mod bench;
 mod config;
@@ -7,23 +11,22 @@ mod config;
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::Context;
-use clap::{Parser, Subcommand, ValueEnum};
-use engram_core::{Embedder, EmbeddingModel, Extractor};
+use clap::{Parser, Subcommand};
+use engram_core::{Embedder, EmbeddingModel, Tagger};
 use engram_embed::{
     OpenAICompatibleConfig, OpenAICompatibleEmbedder, Reranker, TeiReranker, TeiRerankerConfig,
 };
 use engram_extract::{
-    OpenAICompatibleConfig as ExtractorConfigBuilder, OpenAICompatibleExtractor,
+    OpenAICompatibleConfig as TaggerConfigBuilder, OpenAICompatibleTagger,
 };
-use engram_mcp::{EngramServer, ReflectorOptions};
+use engram_mcp::EngramServer;
 use rmcp::transport::streamable_http_server::{
     StreamableHttpService, StreamableHttpServerConfig, session::local::LocalSessionManager,
 };
 use sqlx::postgres::PgPoolOptions;
-use tokio_cron_scheduler::{Job, JobScheduler};
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{Config, EmbedderConfig, ExtractorConfig, RerankerConfig, WorkerConfig};
+use crate::config::{Config, EmbedderConfig, RerankerConfig, TaggerConfig, WorkerConfig};
 
 #[derive(Parser, Debug)]
 #[command(name = "engram", version, about = "Self-hosted MCP-native memory service")]
@@ -42,41 +45,40 @@ enum Command {
     Serve,
     /// Apply pending database migrations.
     Migrate,
-    /// Long-running worker process: drains the `pending_embeddings` queue.
-    /// (M2 Phase C adds the reflector cron as a second task in the same
-    /// process.) Knobs live in `[worker]` config — no CLI flags needed.
+    /// Long-running worker process: drains both `pending_embeddings` and
+    /// `pending_tags` on every `[worker] tick_interval_seconds` tick.
+    /// Tag drainer only spawns when `[tagger]` is configured.
     Worker,
-    /// Embed thoughts and/or facts that don't yet have an embedding row for the active model.
+    /// Embed thoughts that don't yet have an embedding row for the active
+    /// embedder model. M4 thoughts-only (the `--target` flag is gone).
     EmbedBackfill {
         /// Restrict to a single scope.
         #[arg(long)]
         scope: Option<String>,
-        /// Maximum number of items to embed in this run. Defaults to 1000.
-        /// With `--target all` the limit applies independently to each kind.
+        /// Maximum number of thoughts to embed in this run.
         #[arg(long, default_value_t = 1000)]
         limit: i64,
-        /// Which embedding targets to backfill. `thoughts` (pre-M3 default),
-        /// `facts` (Phase B addition for the fact-embedding seam), or `all`
-        /// (M3 default — covers both).
-        #[arg(long, value_enum, default_value_t = BackfillTarget::All)]
-        target: BackfillTarget,
     },
-    /// One-shot reflector run. By default acts on unfacted thoughts (same as
-    /// the worker's cron tick). With --rerun, re-evaluates already-facted
-    /// thoughts and supersedes obsolete extractions (preserving the audit
-    /// trail) — useful after upgrading the extractor model or schema.
-    Reflect {
-        /// Restrict to a single scope. Overrides `[reflector] scope_filter`.
+    /// One-shot tag run. By default walks untagged thoughts (where
+    /// `tags_extractor_version IS NULL`). With `--rerun`, also walks
+    /// thoughts whose `tags_extractor_version < [tagger].model_version`
+    /// (the tagger prompt has been bumped) — useful after upgrading the
+    /// tagger model or prompt.
+    Tag {
+        /// Restrict to a single scope (exact match).
         #[arg(long)]
         scope: Option<String>,
-        /// Max thoughts to process. Overrides `[reflector] max_thoughts_per_run`.
-        #[arg(long)]
-        limit: Option<i64>,
-        /// Re-evaluate already-facted thoughts. Pairs naturally with --since.
+        /// Max thoughts to process this run. Defaults to 200.
+        #[arg(long, default_value_t = 200)]
+        limit: i64,
+        /// Re-tag thoughts whose `tags_extractor_version` is older than the
+        /// configured `[tagger].model_version`. Without this, only
+        /// never-tagged thoughts are walked.
         #[arg(long)]
         rerun: bool,
-        /// With --rerun, only re-evaluate thoughts created at or after this
-        /// RFC-3339 timestamp. Rejected without --rerun.
+        /// Restrict to thoughts created at or after this RFC-3339 timestamp.
+        /// Allowed with or without `--rerun` (unlike `engram reflect`'s
+        /// `--since`, which required `--rerun`).
         #[arg(long)]
         since: Option<String>,
     },
@@ -161,30 +163,61 @@ fn build_reranker(c: &RerankerConfig) -> anyhow::Result<Option<Arc<dyn Reranker>
     }
 }
 
-fn build_extractor(c: &ExtractorConfig) -> anyhow::Result<Arc<dyn Extractor>> {
+/// Resolved tagger plus the bits of the original config the callers need
+/// to know about. `tagger` is `None` on silent-disable (empty `provider`);
+/// the `version` field is the configured `model_version` either way so
+/// `engram tag` and the worker tick can compare against it without
+/// re-reading config.
+struct ResolvedTagger {
+    tagger: Option<Arc<dyn Tagger>>,
+    /// Stable identity the server stamps onto `pending_tags` rows at
+    /// capture time. `None` mirrors `tagger == None`.
+    model_id: Option<String>,
+    /// Prompt/schema version, written into `thoughts.tags_extractor_version`.
+    version: i32,
+}
+
+/// Build the tagger per `[tagger]` config. Returns a `ResolvedTagger` with
+/// every field present on opt-in and only `version` populated on silent-
+/// disable (empty `provider`). Mirrors `build_reranker`'s silent-disable
+/// pattern. Logs the resolved config at INFO level on opt-in (Phase A
+/// startup-config observability convention; commit 1d627e4).
+fn build_tagger(c: &TaggerConfig) -> anyhow::Result<ResolvedTagger> {
+    if c.provider.is_empty() {
+        tracing::info!("tagger: not configured (capture-time enqueue silently disabled)");
+        return Ok(ResolvedTagger {
+            tagger: None,
+            model_id: None,
+            version: c.model_version,
+        });
+    }
+
     // Resolve the system prompt: bundled by default; load from a file when
     // `system_prompt_file` is set. The path is anyhow-context'd so errors
     // surface with the path the operator typed.
     let system_prompt = match c.system_prompt_file.as_ref() {
         Some(path) => Some(std::fs::read_to_string(path).with_context(|| {
-            format!("reading extractor system_prompt_file at {}", path.display())
+            format!("reading tagger system_prompt_file at {}", path.display())
         })?),
         None => None,
     };
     tracing::info!(
+        provider = %c.provider,
+        endpoint = %c.endpoint,
         system_prompt = %match c.system_prompt_file.as_ref() {
             Some(p) => format!("file:{}", p.display()),
             None => "bundled".to_string(),
         },
         model_name = %c.model_name,
+        model_id = %c.model_id,
         model_version = c.model_version,
         timeout_seconds = c.timeout_seconds,
-        "extractor: resolved config",
+        "tagger: resolved config",
     );
 
     match c.provider.as_str() {
         "openai-compatible" | "openrouter" => {
-            let extractor = OpenAICompatibleExtractor::new(ExtractorConfigBuilder {
+            let tagger = OpenAICompatibleTagger::new(TaggerConfigBuilder {
                 endpoint: c.endpoint.clone(),
                 model_name: c.model_name.clone(),
                 model_id: c.model_id.clone(),
@@ -192,14 +225,17 @@ fn build_extractor(c: &ExtractorConfig) -> anyhow::Result<Arc<dyn Extractor>> {
                 api_key: c.api_key.clone(),
                 timeout: Duration::from_secs(c.timeout_seconds),
                 temperature: c.temperature,
-                max_facts_per_thought: c.max_facts_per_thought,
                 system_prompt,
             })
-            .with_context(|| format!("constructing extractor for endpoint {}", c.endpoint))?;
-            Ok(Arc::new(extractor))
+            .with_context(|| format!("constructing tagger for endpoint {}", c.endpoint))?;
+            Ok(ResolvedTagger {
+                tagger: Some(Arc::new(tagger)),
+                model_id: Some(c.model_id.clone()),
+                version: c.model_version,
+            })
         }
         other => anyhow::bail!(
-            "unknown extractor provider: {other:?} (valid: 'openai-compatible', 'openrouter')"
+            "unknown tagger provider: {other:?} (valid: 'openai-compatible', 'openrouter', or empty for silent-disable)"
         ),
     }
 }
@@ -213,6 +249,13 @@ async fn run_serve(config: Config) -> anyhow::Result<()> {
 
     let embedder = build_embedder(&config.embedder)?;
     let reranker = build_reranker(&config.reranker)?;
+    // Server only needs the tagger model_id (to stamp pending_tags rows).
+    // The actual tagger HTTP client lives in the worker process.
+    let ResolvedTagger {
+        tagger: _,
+        model_id: tagger_model_id,
+        version: _,
+    } = build_tagger(&config.tagger)?;
 
     let bind: SocketAddr = config
         .server
@@ -223,11 +266,13 @@ async fn run_serve(config: Config) -> anyhow::Result<()> {
     let pool_for_factory = pool.clone();
     let embedder_for_factory = embedder.clone();
     let reranker_for_factory = reranker.clone();
+    let tagger_model_id_for_factory = tagger_model_id.clone();
     let factory = move || {
         Ok(EngramServer::new(
             pool_for_factory.clone(),
             embedder_for_factory.clone(),
             reranker_for_factory.clone(),
+            tagger_model_id_for_factory.clone(),
         ))
     };
 
@@ -258,6 +303,10 @@ async fn run_serve(config: Config) -> anyhow::Result<()> {
         bind = %bind,
         embedder_endpoint = %config.embedder.endpoint,
         model_id = %config.embedder.model_id,
+        tagger = %match tagger_model_id.as_deref() {
+            Some(id) => format!("enabled ({id})"),
+            None => "disabled".to_string(),
+        },
         "engram serve started"
     );
 
@@ -306,51 +355,44 @@ async fn run_worker(config: Config) -> anyhow::Result<()> {
         .await
         .with_context(|| format!("connecting to {}", config.database.url))?;
     let embedder = build_embedder(&config.embedder)?;
+    let ResolvedTagger {
+        tagger,
+        model_id: tagger_model_id,
+        version: _,
+    } = build_tagger(&config.tagger)?;
 
     let cancel = CancellationToken::new();
     let mut set = tokio::task::JoinSet::new();
 
-    let drain_pool = pool.clone();
-    let drain_embedder = embedder.clone();
-    let drain_cancel = cancel.clone();
     let WorkerConfig {
         tick_interval_seconds,
         batch_size,
     } = config.worker;
     let interval = Duration::from_secs(tick_interval_seconds);
+
+    let drain_pool = pool.clone();
+    let drain_embedder = embedder.clone();
+    let drain_cancel = cancel.clone();
     set.spawn(async move {
         embed_drainer_loop(drain_pool, drain_embedder, interval, batch_size, drain_cancel).await;
     });
 
-    // Reflector task is opt-in. Build the extractor only when enabled so
-    // `engram worker` with `reflector.enabled = false` doesn't require vLLM
-    // (or even an `[extractor]` block validating cleanly).
-    let reflector_enabled = config.reflector.enabled;
-    let reflector_summary = if reflector_enabled {
-        let extractor = build_extractor(&config.extractor)?;
-        let reflector_pool = pool.clone();
-        let reflector_cancel = cancel.clone();
-        let reflector_options = config.reflector.clone();
-        let schedule = reflector_options.schedule.clone();
-        let model_id = extractor.model_id().to_string();
-        let embedder_model_id_for_reflector = config.embedder.model_id.clone();
-        set.spawn(async move {
-            if let Err(err) =
-                reflector_loop(
-                reflector_pool,
-                extractor,
-                embedder_model_id_for_reflector,
-                reflector_options,
-                reflector_cancel,
-            )
-                    .await
-            {
-                tracing::error!(error = ?err, "reflector loop exited with error");
-            }
-        });
-        format!("reflector enabled (schedule={schedule:?}, model={model_id})")
-    } else {
-        "reflector disabled".to_string()
+    // Tag drainer is silent-disabled when [tagger] isn't configured —
+    // mirrors the capture-side enqueue gate. No tag rows can exist in the
+    // queue if no captures enqueued them, so even spinning the loop would
+    // be wasted ticks; just don't spawn it.
+    let tagger_summary = match tagger {
+        Some(t) => {
+            let tag_pool = pool.clone();
+            let tag_tagger = t.clone();
+            let tag_cancel = cancel.clone();
+            let model_id = t.model_id().to_string();
+            set.spawn(async move {
+                tag_drainer_loop(tag_pool, tag_tagger, interval, batch_size, tag_cancel).await;
+            });
+            format!("enabled ({model_id})")
+        }
+        None => "disabled".to_string(),
     };
 
     tracing::info!(
@@ -358,7 +400,8 @@ async fn run_worker(config: Config) -> anyhow::Result<()> {
         batch_size,
         embedder_endpoint = %config.embedder.endpoint,
         model_id = %config.embedder.model_id,
-        reflector = %reflector_summary,
+        tagger = %tagger_summary,
+        tagger_model_id = ?tagger_model_id,
         "engram worker started"
     );
 
@@ -380,59 +423,6 @@ async fn run_worker(config: Config) -> anyhow::Result<()> {
             set.abort_all();
         }
     }
-    Ok(())
-}
-
-async fn reflector_loop(
-    pool: sqlx::PgPool,
-    extractor: Arc<dyn Extractor>,
-    embedder_model_id: String,
-    options: ReflectorOptions,
-    cancel: CancellationToken,
-) -> anyhow::Result<()> {
-    let mut sched = JobScheduler::new()
-        .await
-        .context("constructing JobScheduler")?;
-
-    let pool_for_job = pool.clone();
-    let extractor_for_job = extractor.clone();
-    let options_for_job = options.clone();
-    let embedder_model_id_for_job = embedder_model_id.clone();
-    let job = Job::new_async(options.schedule.as_str(), move |_uuid, _l| {
-        let pool = pool_for_job.clone();
-        let extractor = extractor_for_job.clone();
-        let options = options_for_job.clone();
-        let embedder_model_id = embedder_model_id_for_job.clone();
-        Box::pin(async move {
-            match engram_mcp::run_reflector_once(
-                &pool,
-                extractor.as_ref(),
-                &embedder_model_id,
-                &options,
-            )
-            .await
-            {
-                Ok(r) => tracing::info!(
-                    run_id = %r.run_id,
-                    processed = r.n_thoughts_processed,
-                    committed = r.n_facts_committed,
-                    review = r.n_review_queue,
-                    failures = r.n_extractor_failures,
-                    "reflector run complete",
-                ),
-                Err(err) => tracing::error!(error = ?err, "reflector run failed"),
-            }
-        })
-    })
-    .with_context(|| format!("parsing cron schedule {:?}", options.schedule))?;
-
-    sched.add(job).await.context("registering reflector job")?;
-    sched.start().await.context("starting JobScheduler")?;
-    tracing::info!(schedule = %options.schedule, "reflector scheduler started");
-
-    cancel.cancelled().await;
-    tracing::info!("reflector shutting down");
-    let _ = sched.shutdown().await;
     Ok(())
 }
 
@@ -471,22 +461,40 @@ async fn embed_drainer_loop(
     }
 }
 
-/// CLI-side mirror of `engram_mcp::BackfillTarget` with `clap::ValueEnum`
-/// derive so it can serve as a `--target` flag. Converted to the engram-mcp
-/// shape at the call site (one-line `From` impl below).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum BackfillTarget {
-    Thoughts,
-    Facts,
-    All,
-}
+/// Tag drainer mirror of `embed_drainer_loop`. Same cadence (`[worker]
+/// tick_interval_seconds`) + batch size (`[worker] batch_size`) — Q1 of
+/// the M4 spec settled on "one cadence number for the operator to reason
+/// about." Only spawned when `[tagger]` is configured.
+async fn tag_drainer_loop(
+    pool: sqlx::PgPool,
+    tagger: std::sync::Arc<dyn Tagger>,
+    interval: Duration,
+    batch_size: i64,
+    cancel: CancellationToken,
+) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    ticker.tick().await;
 
-impl From<BackfillTarget> for engram_mcp::BackfillTarget {
-    fn from(t: BackfillTarget) -> Self {
-        match t {
-            BackfillTarget::Thoughts => engram_mcp::BackfillTarget::Thoughts,
-            BackfillTarget::Facts => engram_mcp::BackfillTarget::Facts,
-            BackfillTarget::All => engram_mcp::BackfillTarget::All,
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                tracing::info!("tag drainer shutting down");
+                return;
+            }
+            _ = ticker.tick() => {
+                match engram_mcp::drain_pending_tags(&pool, tagger.as_ref(), batch_size).await {
+                    Ok(report) if report.processed > 0 => tracing::info!(
+                        processed = report.processed,
+                        completed = report.completed,
+                        failed_transient = report.failed_transient,
+                        failed_permanent = report.failed_permanent,
+                        "tag drain tick",
+                    ),
+                    Ok(_) => {} // idle tick; stay quiet
+                    Err(err) => tracing::error!(error = ?err, "tag drain tick failed"),
+                }
+            }
         }
     }
 }
@@ -495,7 +503,6 @@ async fn run_embed_backfill(
     config: Config,
     scope: Option<String>,
     limit: i64,
-    target: BackfillTarget,
 ) -> anyhow::Result<()> {
     let pool = PgPoolOptions::new()
         .max_connections(config.database.max_connections)
@@ -506,7 +513,7 @@ async fn run_embed_backfill(
     let embedder = build_embedder(&config.embedder)?;
 
     // Treat `--scope ""` as "no filter" (same empty-string normalisation
-    // applied on the reflector / config side).
+    // applied elsewhere on the config side).
     let scope_filter = scope.filter(|s| !s.is_empty());
 
     let report = engram_mcp::embed_backfill(
@@ -514,7 +521,6 @@ async fn run_embed_backfill(
         embedder.as_ref(),
         scope_filter.as_deref(),
         limit,
-        target.into(),
     )
     .await?;
 
@@ -536,17 +542,20 @@ async fn run_embed_backfill(
     Ok(())
 }
 
-async fn run_reflect(
+/// `engram tag` — one-shot tag run. Mirrors `engram reflect`'s M3 surface:
+/// walks the candidate set returned by
+/// `engram_storage::find_untagged_or_stale_thoughts`, calls
+/// `tagger.tag(content)` on each, persists via `update_thought_tags`. No
+/// queue interaction — `pending_tags` is the worker-tick path, not this
+/// one. Hard-fails when `[tagger]` is unconfigured (matches `engram bench
+/// rerank`'s "configured reranker required" stance).
+async fn run_tag(
     config: Config,
     scope: Option<String>,
-    limit: Option<i64>,
+    limit: i64,
     rerun: bool,
     since: Option<String>,
 ) -> anyhow::Result<()> {
-    if since.is_some() && !rerun {
-        anyhow::bail!("--since is only meaningful with --rerun");
-    }
-
     let parsed_since = match since {
         Some(s) => Some(
             time::OffsetDateTime::parse(&s, &time::format_description::well_known::Rfc3339)
@@ -560,61 +569,90 @@ async fn run_reflect(
         .connect(&config.database.url)
         .await
         .with_context(|| format!("connecting to {}", config.database.url))?;
-    let extractor = build_extractor(&config.extractor)?;
-    let embedder_model_id = config.embedder.model_id.clone();
 
-    // CLI flags override config defaults. Treat `--scope ""` as "no
-    // filter" (matches the empty-string-as-None normalisation on the
-    // config side; without it, a literal `--scope ""` silently matched
-    // zero rows).
-    let mut options = config.reflector.clone();
-    if let Some(s) = scope {
-        options.scope_filter = if s.is_empty() { None } else { Some(s) };
-    }
-    if let Some(l) = limit {
-        options.max_thoughts_per_run = l;
-    }
+    let ResolvedTagger {
+        tagger,
+        model_id: _,
+        version: tagger_version,
+    } = build_tagger(&config.tagger)?;
+    let tagger = tagger.context(
+        "`engram tag` requires a configured `[tagger]` section; see DEVELOPMENT.md",
+    )?;
 
-    let report = if rerun {
-        tracing::info!(
-            scope = ?options.scope_filter,
-            limit = options.max_thoughts_per_run,
-            since = ?parsed_since,
-            "engram reflect --rerun starting",
-        );
-        engram_mcp::run_reflector_rerun(
-            &pool,
-            extractor.as_ref(),
-            &embedder_model_id,
-            &options,
-            parsed_since,
-        )
-        .await?
-    } else {
-        tracing::info!(
-            scope = ?options.scope_filter,
-            limit = options.max_thoughts_per_run,
-            "engram reflect starting",
-        );
-        engram_mcp::run_reflector_once(&pool, extractor.as_ref(), &embedder_model_id, &options)
-            .await?
-    };
+    // Treat `--scope ""` as "no filter" (matches the empty-string-as-None
+    // normalisation applied elsewhere).
+    let scope_filter = scope.filter(|s| !s.is_empty());
 
     tracing::info!(
-        run_id = %report.run_id,
-        processed = report.n_thoughts_processed,
-        committed = report.n_facts_committed,
-        review = report.n_review_queue,
-        failures = report.n_extractor_failures,
-        "reflect complete",
+        scope = ?scope_filter,
+        limit,
+        rerun,
+        since = ?parsed_since,
+        target_version = tagger_version,
+        "engram tag starting",
     );
 
-    if report.n_extractor_failures > 0 {
+    let candidates = engram_storage::find_untagged_or_stale_thoughts(
+        &pool,
+        tagger_version,
+        rerun,
+        scope_filter.as_deref(),
+        parsed_since,
+        limit,
+    )
+    .await
+    .context("walking untagged-or-stale thoughts")?;
+
+    let n_candidates = candidates.len();
+    let mut tagged = 0usize;
+    let mut failed = 0usize;
+    let model_id = tagger.model_id().to_string();
+
+    for t in candidates {
+        match tagger.tag(&t.content).await {
+            Ok(tags) => {
+                if let Err(err) = engram_storage::update_thought_tags(
+                    &pool,
+                    t.id,
+                    &tags,
+                    &model_id,
+                    tagger_version,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        thought_id = %t.id,
+                        error = ?err,
+                        "engram tag: storage write failed; continuing",
+                    );
+                    failed += 1;
+                } else {
+                    tagged += 1;
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    thought_id = %t.id,
+                    error = ?err,
+                    "engram tag: tagger call failed; continuing",
+                );
+                failed += 1;
+            }
+        }
+    }
+
+    tracing::info!(
+        n_candidates,
+        tagged,
+        failed,
+        "engram tag complete",
+    );
+
+    if failed > 0 {
         anyhow::bail!(
-            "{} thoughts failed extraction (see logs); {} committed, {} routed to review",
-            report.n_extractor_failures,
-            report.n_facts_committed,
-            report.n_review_queue,
+            "{} thoughts failed tagging (see logs); {} tagged successfully",
+            failed,
+            tagged,
         );
     }
     Ok(())
@@ -630,14 +668,13 @@ async fn main() -> anyhow::Result<()> {
         Command::Serve => run_serve(config).await,
         Command::Migrate => run_migrate(config).await,
         Command::Worker => run_worker(config).await,
-        Command::EmbedBackfill {
+        Command::EmbedBackfill { scope, limit } => run_embed_backfill(config, scope, limit).await,
+        Command::Tag {
             scope,
             limit,
-            target,
-        } => run_embed_backfill(config, scope, limit, target).await,
-        Command::Reflect { scope, limit, rerun, since } => {
-            run_reflect(config, scope, limit, rerun, since).await
-        }
+            rerun,
+            since,
+        } => run_tag(config, scope, limit, rerun, since).await,
         Command::Bench { action } => match action {
             BenchAction::Rerank { corpus } => run_bench_rerank(config, corpus).await,
         },

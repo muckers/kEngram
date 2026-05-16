@@ -11,7 +11,7 @@ use figment::{
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-// PathBuf is referenced from ExtractorConfig::system_prompt_file below.
+// PathBuf is referenced from TaggerConfig::system_prompt_file below.
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -20,8 +20,12 @@ pub struct Config {
     pub database: DatabaseConfig,
     pub embedder: EmbedderConfig,
     pub worker: WorkerConfig,
-    pub extractor: ExtractorConfig,
-    pub reflector: engram_mcp::ReflectorOptions,
+    /// M4: renamed from `[extractor]`. The tagger is a metadata-tagging
+    /// sidecar on the thoughts pipeline (people, action_items, topics,
+    /// dates_mentioned, kind). Empty `provider` silent-disables — capture
+    /// proceeds, no tag jobs enqueue, the worker doesn't spawn a tag
+    /// drainer task. Flip `provider = "openai-compatible"` to enable.
+    pub tagger: TaggerConfig,
     pub reranker: RerankerConfig,
 }
 
@@ -144,11 +148,24 @@ impl Default for WorkerConfig {
     }
 }
 
+/// `[tagger]` — M4-replacement of the M3 `[extractor]` section. Same
+/// provider/endpoint/model_name/model_id/temperature/timeout/api_key shape,
+/// minus `max_facts_per_thought` (the tagger emits one tags object per
+/// thought, no per-thought cap). `model_version` resets to `1` (the tagger
+/// prompt is v1; separate version line from the M3 extractor's v4).
+///
+/// Empty `provider` is the silent-disable sentinel — matches `[reranker]`'s
+/// pattern. `engram serve`'s capture path checks the resolved tagger model
+/// id; when `None`, no `pending_tags` row is enqueued and the worker's
+/// tag-drainer task doesn't spawn. The operator can flip
+/// `provider = "openai-compatible"` later and run
+/// `engram tag --rerun --since 1970-01-01T00:00:00Z` to catch the backlog.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
-pub struct ExtractorConfig {
-    /// `"openai-compatible"` (vLLM, etc.) or `"openrouter"`. Other providers
-    /// can be added later by extending the `build_extractor` match.
+pub struct TaggerConfig {
+    /// `""` (default) = disabled; `"openai-compatible"` (vLLM, etc.) or
+    /// `"openrouter"`. Other providers can be added later by extending the
+    /// `build_tagger` match.
     pub provider: String,
     /// `/v1` base URL. For vLLM: `"http://localhost:8000/v1"`. For
     /// OpenRouter: `"https://openrouter.ai/api/v1"`.
@@ -156,43 +173,38 @@ pub struct ExtractorConfig {
     /// Backend model name. For vLLM: the deployed model (`"qwen2.5-7b-instruct"`).
     /// For OpenRouter: a model slug (`"anthropic/claude-haiku-4.5"`).
     pub model_name: String,
-    /// Engram-side stable identity written into `facts.extractor_model`.
+    /// Engram-side stable identity written into `thoughts.tags_extractor_model`.
     /// Conventionally `<vendor>/<model>`. Defaults to `"vllm/qwen2.5-7b-instruct"`.
     pub model_id: String,
-    /// Schema-version for `facts.extractor_version`. Bump when the prompt
-    /// or schema changes such that prior facts are no longer comparable.
+    /// Schema-version for `thoughts.tags_extractor_version`. Starts at `1`
+    /// for the v1 tagger prompt; bump when the prompt or schema changes
+    /// such that prior tags shouldn't be considered comparable.
     pub model_version: i32,
     pub api_key: Option<String>,
     pub timeout_seconds: u64,
     pub temperature: f32,
-    pub max_facts_per_thought: usize,
-    /// Path to a file containing the extractor system prompt. `None` means
-    /// use `engram_extract::openai_compatible::BUNDLED_SYSTEM_PROMPT`
-    /// (recommended). Operators who supply a custom prompt are responsible
-    /// for also bumping `model_version` so `facts.extractor_version`
-    /// remains meaningful provenance. The file's contents must contain the
-    /// `{MAX_FACTS}` placeholder; the extractor refuses to construct
-    /// otherwise.
+    /// Path to a file containing the tagger system prompt. `None` means
+    /// use `engram_extract::BUNDLED_TAGGER_PROMPT` (recommended). Operators
+    /// who supply a custom prompt are responsible for also bumping
+    /// `model_version` so `thoughts.tags_extractor_version` remains
+    /// meaningful provenance.
     pub system_prompt_file: Option<PathBuf>,
 }
 
-impl Default for ExtractorConfig {
+impl Default for TaggerConfig {
     fn default() -> Self {
         Self {
-            provider: "openai-compatible".to_string(),
+            // Empty default → silent-disable. The operator must opt in by
+            // setting provider = "openai-compatible" (or "openrouter").
+            provider: String::new(),
             endpoint: "http://localhost:8000/v1".to_string(),
             model_name: "qwen2.5-7b-instruct".to_string(),
             model_id: "vllm/qwen2.5-7b-instruct".to_string(),
-            // v4 = relations rule + reinforced SPO few-shots for leak set
-            // (Bazel/Make, Nix/Make, Redis conditional, SIMD self-reference)
-            // + flagged-band confidence framing + "no same-statement-different-
-            // SPO" rule (2026-05-15, M3 Phase C). See
-            // crates/engram-extract/src/openai_compatible.rs.
-            model_version: 4,
+            // v1 of the tagger prompt; separate from the M3 extractor's v4.
+            model_version: 1,
             api_key: None,
             timeout_seconds: 60,
             temperature: 0.2,
-            max_facts_per_thought: 8,
             system_prompt_file: None,
         }
     }
@@ -255,111 +267,41 @@ mod tests {
         assert_eq!(c.worker.batch_size, 16);
     }
 
+    /// M4: tagger defaults to silent-disabled (empty `provider`). The
+    /// operator opts in by setting `provider = "openai-compatible"` (or
+    /// `"openrouter"`) in `[tagger]`. Other fields default to a local-vLLM
+    /// shape so flipping `provider` is the only required change on a stock
+    /// dev box with vLLM running on 8000.
     #[test]
-    fn default_extractor_targets_vllm_localhost() {
+    fn default_tagger_is_silent_disabled() {
         let c = Config::default();
-        assert_eq!(c.extractor.provider, "openai-compatible");
-        assert_eq!(c.extractor.endpoint, "http://localhost:8000/v1");
-        assert_eq!(c.extractor.model_name, "qwen2.5-7b-instruct");
-        assert_eq!(c.extractor.model_id, "vllm/qwen2.5-7b-instruct");
-        // Bumped to 4 on 2026-05-15 (M3 Phase C) when the system prompt
-        // gained the relations rule, reinforced SPO few-shots for the
-        // Phase A + Phase B step 2 leak set, and flagged-band confidence
-        // framing. (v3 = 2026-05-14, M3 Phase A: SPO decomposition rules
-        // + tighter confidence rubric + episodic-skip negatives.)
-        assert_eq!(c.extractor.model_version, 4);
-        assert!(c.extractor.api_key.is_none());
-        assert_eq!(c.extractor.max_facts_per_thought, 8);
+        assert_eq!(c.tagger.provider, "");
+        assert_eq!(c.tagger.endpoint, "http://localhost:8000/v1");
+        assert_eq!(c.tagger.model_name, "qwen2.5-7b-instruct");
+        assert_eq!(c.tagger.model_id, "vllm/qwen2.5-7b-instruct");
+        // v1 of the tagger prompt — fresh version line; not comparable to
+        // the M3 extractor's v4.
+        assert_eq!(c.tagger.model_version, 1);
+        assert!(c.tagger.api_key.is_none());
         // Default is the bundled prompt — no file override.
-        assert!(c.extractor.system_prompt_file.is_none());
+        assert!(c.tagger.system_prompt_file.is_none());
     }
 
+    /// Operator opt-in: setting `[tagger].provider = "openai-compatible"`
+    /// round-trips through figment without disturbing the other defaults.
     #[test]
-    fn default_reflector_is_disabled() {
-        let c = Config::default();
-        assert!(!c.reflector.enabled, "reflector must default to off — opt-in");
-    }
-
-    #[test]
-    fn default_reflector_schedule_is_3am_daily() {
-        let c = Config::default();
-        assert_eq!(c.reflector.schedule, "0 0 3 * * *");
-    }
-
-    #[test]
-    fn default_reflector_review_queue_below_is_0_7() {
-        let c = Config::default();
-        assert!((c.reflector.review_queue_below - 0.7).abs() < f32::EPSILON);
-    }
-
-    /// M3 Phase C: middle confidence band defaults to 0.85, matching the
-    /// design-doc §10 framing. Subsumption-keep defaults to `Specific`.
-    #[test]
-    fn reflector_config_loads_min_confidence_and_subsumption_keep() {
-        // Defaults.
-        let c = Config::default();
-        assert!((c.reflector.min_confidence_to_store - 0.85).abs() < f32::EPSILON);
-        assert_eq!(
-            c.reflector.subsumption_keep,
-            engram_mcp::SubsumptionKeep::Specific,
-        );
-
-        // TOML override round-trips both fields.
+    fn tagger_provider_round_trips_from_toml() {
         let toml = r#"
-            [reflector]
-            min_confidence_to_store = 0.9
-            subsumption_keep = "general"
+            [tagger]
+            provider = "openai-compatible"
         "#;
         let c: Config = Figment::new()
             .merge(Serialized::defaults(Config::default()))
             .merge(Toml::string(toml))
             .extract()
             .unwrap();
-        assert!((c.reflector.min_confidence_to_store - 0.9).abs() < f32::EPSILON);
-        assert_eq!(
-            c.reflector.subsumption_keep,
-            engram_mcp::SubsumptionKeep::General,
-        );
-    }
-
-    /// Phase D dogfood 2026-05-16: `scope_filter = ""` in TOML used to
-    /// deserialize to `Some("")`, which the SQL predicate then matched
-    /// against zero rows (every scope is non-empty). The custom
-    /// deserializer normalizes `""` to `None` so the example TOML's
-    /// "leave blank for all scopes" comment is retroactively accurate.
-    #[test]
-    fn scope_filter_empty_string_normalizes_to_none() {
-        // Explicit empty string in TOML → None.
-        let toml = r#"
-            [reflector]
-            scope_filter = ""
-        "#;
-        let c: Config = Figment::new()
-            .merge(Serialized::defaults(Config::default()))
-            .merge(Toml::string(toml))
-            .extract()
-            .unwrap();
-        assert!(c.reflector.scope_filter.is_none());
-
-        // A non-empty value still round-trips intact.
-        let toml = r#"
-            [reflector]
-            scope_filter = "work"
-        "#;
-        let c: Config = Figment::new()
-            .merge(Serialized::defaults(Config::default()))
-            .merge(Toml::string(toml))
-            .extract()
-            .unwrap();
-        assert_eq!(c.reflector.scope_filter.as_deref(), Some("work"));
-
-        // Field omitted → default (None).
-        let toml = "[reflector]\nenabled = true\n";
-        let c: Config = Figment::new()
-            .merge(Serialized::defaults(Config::default()))
-            .merge(Toml::string(toml))
-            .extract()
-            .unwrap();
-        assert!(c.reflector.scope_filter.is_none());
+        assert_eq!(c.tagger.provider, "openai-compatible");
+        assert_eq!(c.tagger.endpoint, "http://localhost:8000/v1");
+        assert_eq!(c.tagger.model_version, 1);
     }
 }

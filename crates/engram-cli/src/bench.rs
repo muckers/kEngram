@@ -3,6 +3,8 @@
 //! fixture corpus. Closes M3 success criterion 1 by turning the
 //! qualitative "rerank feels better" signal into nDCG@10 / MRR numbers.
 //!
+//! M4: thoughts-only. The `target` field on each query (and the
+//! `BenchTarget` enum it selected) is gone — facts no longer exist.
 //! See `tests/fixtures/bench-rerank.example.json` for the corpus schema.
 
 use std::{
@@ -14,7 +16,7 @@ use std::{
 use anyhow::Context;
 use engram_core::{Embedder, Scope, ScopeError, ndcg_at_k, reciprocal_rank};
 use engram_embed::Reranker;
-use engram_mcp::{SearchFactsRequest, SearchRequest, search};
+use engram_mcp::{SearchRequest, search};
 use serde::Deserialize;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -25,26 +27,9 @@ const NDCG_K: usize = 10;
 /// harness scores against is the same the consumer would see.
 const SEARCH_LIMIT: usize = NDCG_K;
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum BenchTarget {
-    Thoughts,
-    Facts,
-}
-
-impl BenchTarget {
-    fn label(&self) -> &'static str {
-        match self {
-            Self::Thoughts => "thoughts",
-            Self::Facts => "facts",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Deserialize)]
 pub struct BenchQuery {
     pub query: String,
-    pub target: BenchTarget,
     #[serde(default)]
     pub scope: Option<String>,
     pub relevant_ids: Vec<Uuid>,
@@ -64,7 +49,6 @@ pub struct BenchRerankCorpus {
 #[derive(Debug, Clone)]
 struct QueryRow {
     query: String,
-    target: BenchTarget,
     n_relevant: usize,
     ndcg_rrf: f32,
     ndcg_rerank: f32,
@@ -96,7 +80,6 @@ pub async fn run_bench_rerank(
         if row.no_match {
             tracing::warn!(
                 query = %q.query,
-                target = q.target.label(),
                 "bench: no relevant_ids found in either ranking — fixture may be stale",
             );
         }
@@ -127,48 +110,25 @@ async fn run_pair(
         None => None,
     };
 
-    match q.target {
-        BenchTarget::Thoughts => {
-            let mk = |rerank: bool| SearchRequest {
-                query: q.query.clone(),
-                scope: scope.clone(),
-                limit: Some(SEARCH_LIMIT),
-                recency_half_life_days: None,
-                rerank: Some(rerank),
-                candidate_pool: None,
-            };
-            let r_rrf = search::search_thoughts(pool, embedder, None, mk(false))
-                .await
-                .context("search_thoughts (rrf-only) failed")?;
-            let r_rerank = search::search_thoughts(pool, embedder, Some(reranker), mk(true))
-                .await
-                .context("search_thoughts (reranked) failed")?;
-            Ok((
-                r_rrf.results.into_iter().map(|h| h.thought_id.into_uuid()).collect(),
-                r_rerank.results.into_iter().map(|h| h.thought_id.into_uuid()).collect(),
-            ))
-        }
-        BenchTarget::Facts => {
-            let mk = |rerank: bool| SearchFactsRequest {
-                query: q.query.clone(),
-                scope: scope.clone(),
-                limit: Some(SEARCH_LIMIT),
-                recency_half_life_days: None,
-                rerank: Some(rerank),
-                candidate_pool: None,
-            };
-            let r_rrf = search::search_facts(pool, embedder, None, mk(false))
-                .await
-                .context("search_facts (rrf-only) failed")?;
-            let r_rerank = search::search_facts(pool, embedder, Some(reranker), mk(true))
-                .await
-                .context("search_facts (reranked) failed")?;
-            Ok((
-                r_rrf.results.into_iter().map(|h| h.fact_id).collect(),
-                r_rerank.results.into_iter().map(|h| h.fact_id).collect(),
-            ))
-        }
-    }
+    let mk = |rerank: bool| SearchRequest {
+        query: q.query.clone(),
+        scope: scope.clone(),
+        limit: Some(SEARCH_LIMIT),
+        recency_half_life_days: None,
+        rerank: Some(rerank),
+        candidate_pool: None,
+        tag_filter: None,
+    };
+    let r_rrf = search::search_thoughts(pool, embedder, None, mk(false))
+        .await
+        .context("search_thoughts (rrf-only) failed")?;
+    let r_rerank = search::search_thoughts(pool, embedder, Some(reranker), mk(true))
+        .await
+        .context("search_thoughts (reranked) failed")?;
+    Ok((
+        r_rrf.results.into_iter().map(|h| h.thought_id.into_uuid()).collect(),
+        r_rerank.results.into_iter().map(|h| h.thought_id.into_uuid()).collect(),
+    ))
 }
 
 /// Pure scorer: takes a query + its two rankings and produces the row.
@@ -188,7 +148,6 @@ fn score_query(q: &BenchQuery, ranking_rrf: &[Uuid], ranking_rerank: &[Uuid]) ->
 
     QueryRow {
         query: q.query.clone(),
-        target: q.target.clone(),
         n_relevant: q.relevant_ids.len(),
         ndcg_rrf,
         ndcg_rerank,
@@ -211,13 +170,11 @@ fn resolve_graded(q: &BenchQuery) -> HashMap<Uuid, f32> {
 fn print_table(rows: &[QueryRow]) {
     // Column headers.
     println!(
-        "| {q:<54} | {t:<8} | rel | nDCG@10 (rrf) | nDCG@10 (rerank) | Δ      | MRR (rrf) | MRR (rerank) | Δ      |",
+        "| {q:<54} | rel | nDCG@10 (rrf) | nDCG@10 (rerank) | Δ      | MRR (rrf) | MRR (rerank) | Δ      |",
         q = "query",
-        t = "target",
     );
-    println!("|{q}|{t}|-----|---------------|------------------|--------|-----------|--------------|--------|",
+    println!("|{q}|-----|---------------|------------------|--------|-----------|--------------|--------|",
         q = "-".repeat(56),
-        t = "-".repeat(10),
     );
 
     let mut sum_ndcg_rrf = 0.0;
@@ -230,9 +187,8 @@ fn print_table(rows: &[QueryRow]) {
         let d_ndcg = row.ndcg_rerank - row.ndcg_rrf;
         let d_mrr = row.mrr_rerank - row.mrr_rrf;
         println!(
-            "| {q:<54} | {t:<8} | {rel:>3} | {nr:>13.3} | {nk:>16.3} | {dn:>+6.3} | {mr:>9.3} | {mk:>12.3} | {dm:>+6.3} |",
+            "| {q:<54} | {rel:>3} | {nr:>13.3} | {nk:>16.3} | {dn:>+6.3} | {mr:>9.3} | {mk:>12.3} | {dm:>+6.3} |",
             q = q_trunc,
-            t = row.target.label(),
             rel = row.n_relevant,
             nr = row.ndcg_rrf,
             nk = row.ndcg_rerank,
@@ -253,14 +209,12 @@ fn print_table(rows: &[QueryRow]) {
     let avg_mrr_rrf = sum_mrr_rrf / n;
     let avg_mrr_rerank = sum_mrr_rerank / n;
 
-    println!("|{q}|{t}|-----|---------------|------------------|--------|-----------|--------------|--------|",
+    println!("|{q}|-----|---------------|------------------|--------|-----------|--------------|--------|",
         q = "-".repeat(56),
-        t = "-".repeat(10),
     );
     println!(
-        "| {q:<54} | {t:<8} | {rel:>3} | {nr:>13.3} | {nk:>16.3} | {dn:>+6.3} | {mr:>9.3} | {mk:>12.3} | {dm:>+6.3} |",
+        "| {q:<54} | {rel:>3} | {nr:>13.3} | {nk:>16.3} | {dn:>+6.3} | {mr:>9.3} | {mk:>12.3} | {dm:>+6.3} |",
         q = "AVERAGE",
-        t = "-",
         rel = "-",
         nr = avg_ndcg_rrf,
         nk = avg_ndcg_rerank,
@@ -298,7 +252,6 @@ mod tests {
             "queries": [
                 {
                     "query": "tooling for compiling codebases reproducibly",
-                    "target": "facts",
                     "scope": null,
                     "relevant_ids": [
                         "00000000-0000-0000-0000-000000000001",
@@ -311,17 +264,14 @@ mod tests {
                 },
                 {
                     "query": "what does Engram use as a vector store",
-                    "target": "thoughts",
                     "relevant_ids": ["00000000-0000-0000-0000-000000000003"]
                 }
             ]
         }"#;
         let corpus: BenchRerankCorpus = serde_json::from_str(json).unwrap();
         assert_eq!(corpus.queries.len(), 2);
-        assert_eq!(corpus.queries[0].target, BenchTarget::Facts);
         assert_eq!(corpus.queries[0].relevant_ids.len(), 2);
         assert!(corpus.queries[0].graded_relevance.is_some());
-        assert_eq!(corpus.queries[1].target, BenchTarget::Thoughts);
         assert!(corpus.queries[1].graded_relevance.is_none());
         assert!(corpus.queries[1].scope.is_none());
     }
@@ -332,7 +282,6 @@ mod tests {
         let b = Uuid::from_u128(2);
         let q = BenchQuery {
             query: "x".into(),
-            target: BenchTarget::Thoughts,
             scope: None,
             relevant_ids: vec![a, b],
             graded_relevance: None,
@@ -345,7 +294,6 @@ mod tests {
         // Explicit graded_relevance wins when present.
         let q2 = BenchQuery {
             query: "x".into(),
-            target: BenchTarget::Thoughts,
             scope: None,
             relevant_ids: vec![a, b],
             graded_relevance: Some(HashMap::from([(a, 0.7)])),
@@ -370,11 +318,8 @@ mod tests {
         let corpus: BenchRerankCorpus = serde_json::from_str(&raw)
             .unwrap_or_else(|e| panic!("parsing {}: {e}", path.display()));
         assert!(!corpus.queries.is_empty());
-        // Schema-coverage assertions: at least one query of each target,
-        // at least one with graded_relevance and one without, at least
-        // one with a non-null scope.
-        assert!(corpus.queries.iter().any(|q| q.target == BenchTarget::Thoughts));
-        assert!(corpus.queries.iter().any(|q| q.target == BenchTarget::Facts));
+        // Schema-coverage assertions: at least one with graded_relevance and
+        // one without, at least one with a non-null scope.
         assert!(corpus.queries.iter().any(|q| q.graded_relevance.is_some()));
         assert!(corpus.queries.iter().any(|q| q.graded_relevance.is_none()));
         assert!(corpus.queries.iter().any(|q| q.scope.is_some()));
@@ -387,7 +332,6 @@ mod tests {
         let c = Uuid::from_u128(3);
         let q = BenchQuery {
             query: "stale fixture".into(),
-            target: BenchTarget::Facts,
             scope: None,
             relevant_ids: vec![a],
             graded_relevance: None,

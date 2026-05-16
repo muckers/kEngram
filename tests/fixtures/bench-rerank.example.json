@@ -1,10 +1,9 @@
 {
-  "_comment": "Example fixture for `engram bench rerank --corpus <path>`. UUIDs are placeholders — running this against any live DB will emit one 'no relevant_ids found' warning per query and report 0.000 nDCG / MRR across the board. Operators should copy this file and replace the UUIDs with real thought_ids / fact_ids drawn from their captured corpus. The bench command compares RRF-only vs cross-encoder-reranked retrieval orderings.",
+  "_comment": "Example fixture for `engram bench rerank --corpus <path>`. UUIDs are placeholders — running this against any live DB will emit one 'no relevant_ids found' warning per query and report 0.000 nDCG / MRR across the board. Operators should copy this file and replace the UUIDs with real thought_ids drawn from their captured corpus. The bench command compares RRF-only vs cross-encoder-reranked retrieval orderings against thoughts (M4 collapsed the facts target).",
   "queries": [
     {
-      "_comment": "Phase B step 2 regression target — verifies rerank surfaces Nix-reproducibility facts above Redis. Graded relevance: the Nix/Make comparative is weight 1.0; the secondary fact is weight 0.7.",
+      "_comment": "M3 Phase B step 2 regression target — verifies rerank surfaces Nix-reproducibility thoughts above Redis. Graded relevance: the Nix/Make comparative is weight 1.0; the secondary thought is weight 0.7.",
       "query": "tooling for compiling codebases reproducibly",
-      "target": "facts",
       "scope": null,
       "relevant_ids": [
         "00000000-0000-0000-0000-000000000001",
@@ -16,17 +15,15 @@
       }
     },
     {
-      "_comment": "Binary-relevance example (no `graded_relevance` block) — every id in `relevant_ids` is promoted to weight 1.0. Use this shape when grading isn't worth the authoring cost.",
-      "query": "what does Engram use as a vector store",
-      "target": "thoughts",
+      "_comment": "Binary-relevance example (no `graded_relevance` block) — every id in `relevant_ids` is promoted to weight 1.0. Use this shape when grading isn't worth the authoring cost. The query mentions a person, which exercises the v1 tagger's `people` field when running against a tagged corpus.",
+      "query": "Sarah's notes on the async runtime decision",
       "relevant_ids": [
         "00000000-0000-0000-0000-000000000003"
       ]
     },
     {
-      "_comment": "Scope-filtered query — passed through to `search_facts`'s scope filter. Note: scope is exact-match in M3; no prefix matching.",
+      "_comment": "Scope-filtered query — passed through to `search_thoughts`'s scope filter. Note: scope is exact-match in M3+; no prefix matching.",
       "query": "Postgres tuning notes",
-      "target": "facts",
       "scope": "work",
       "relevant_ids": [
         "00000000-0000-0000-0000-000000000004",
@@ -34,9 +31,8 @@
       ]
     },
     {
-      "_comment": "Thought-target with multiple relevant items — exercises the multi-hit nDCG path. Graded weights distinguish primary vs supporting evidence.",
+      "_comment": "Multi-relevant query with graded weights — exercises the multi-hit nDCG path. Use distinct grades to distinguish primary vs supporting evidence.",
       "query": "Rust async runtime tradeoffs",
-      "target": "thoughts",
       "relevant_ids": [
         "00000000-0000-0000-0000-000000000006",
         "00000000-0000-0000-0000-000000000007",
