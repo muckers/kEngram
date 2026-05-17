@@ -177,11 +177,12 @@ pub struct TaggerConfig {
     /// Conventionally `<vendor>/<model>`. Defaults to `"vllm/qwen2.5-7b-instruct"`.
     pub model_id: String,
     /// Schema-version for `thoughts.tags_extractor_version`. Default tracks
-    /// `engram_extract::BUNDLED_TAGGER_VERSION` (currently 3 — the M4.1 v3
-    /// prompt iteration: tightened entities + anti-padding + kind isolation).
-    /// Bump when the prompt or schema changes such that prior tags shouldn't
-    /// be considered comparable; `engram tag --rerun --since 1970-01-01T00:00:00Z`
-    /// then backfills.
+    /// `engram_extract::BUNDLED_TAGGER_VERSION` (currently 4 — the M4.1 v4
+    /// prompt iteration: lead-with-empty entities + structural NAME/DESCRIBE
+    /// test + entities maxItems lowered 5→3 + vocab section softened to
+    /// tie-break). Bump when the prompt or schema changes such that prior
+    /// tags shouldn't be considered comparable; `engram tag --rerun --since
+    /// 1970-01-01T00:00:00Z` then backfills.
     pub model_version: i32,
     pub api_key: Option<String>,
     pub timeout_seconds: u64,
@@ -214,9 +215,10 @@ impl Default for TaggerConfig {
             model_name: "qwen2.5-7b-instruct".to_string(),
             model_id: "vllm/qwen2.5-7b-instruct".to_string(),
             // Tracks engram_extract::BUNDLED_TAGGER_VERSION; M4.1 shipped at
-            // v2, bumped to v3 in the M4.1 prompt iteration (entities
-            // anti-padding + kind isolation).
-            model_version: 3,
+            // v2, bumped to v3 (entities anti-padding + kind isolation),
+            // bumped to v4 (lead-with-empty entities + vocab softening) after
+            // dogfood revealed the v3 negative-example list backfired.
+            model_version: 4,
             api_key: None,
             timeout_seconds: 60,
             temperature: 0.2,
@@ -297,8 +299,9 @@ mod tests {
         assert_eq!(c.tagger.model_name, "qwen2.5-7b-instruct");
         assert_eq!(c.tagger.model_id, "vllm/qwen2.5-7b-instruct");
         // Tracks engram_extract::BUNDLED_TAGGER_VERSION; M4.1 shipped at
-        // v2; the v3 prompt iteration bumped to 3.
-        assert_eq!(c.tagger.model_version, 3);
+        // v2; v3 added entities anti-padding + kind isolation; v4 restructured
+        // entities to lead-with-empty + softened vocab to tie-break.
+        assert_eq!(c.tagger.model_version, 4);
         assert!(c.tagger.api_key.is_none());
         // Default is the bundled prompt — no file override.
         assert!(c.tagger.system_prompt_file.is_none());
@@ -322,7 +325,7 @@ mod tests {
             .unwrap();
         assert_eq!(c.tagger.provider, "openai-compatible");
         assert_eq!(c.tagger.endpoint, "http://localhost:8000/v1");
-        assert_eq!(c.tagger.model_version, 3);
+        assert_eq!(c.tagger.model_version, 4);
     }
 
     /// Operator can disable scope-vocabulary injection or tune its size via

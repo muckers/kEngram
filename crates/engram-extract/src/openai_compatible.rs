@@ -90,8 +90,14 @@ impl OpenAICompatibleConfig {
 /// controlled-vocabulary section; v3 (M4.1 prompt iteration) tightened
 /// entities to canonical proper names only with an explicit anti-padding
 /// rule, and added a kind-isolation clause forbidding the controlled
-/// vocabulary from influencing kind classification.
-pub const BUNDLED_TAGGER_VERSION: i32 = 3;
+/// vocabulary from influencing kind classification; v4 (M4.1 prompt
+/// iteration, second pass) restructured the entities description to lead
+/// with the empty case and a structural NAME-vs-DESCRIBE test (the v3
+/// negative-example list backfired — the model emitted those exact phrases
+/// from `047d0ce8`), dropped entities maxItems 5→3, and softened the
+/// scope-vocabulary section from "vocab dominates" to "vocab tie-breaks"
+/// (precision over consistency).
+pub const BUNDLED_TAGGER_VERSION: i32 = 4;
 
 #[derive(Debug, Clone)]
 pub struct OpenAICompatibleTagger {
@@ -179,7 +185,7 @@ You are a tagging assistant. Given a single thought from a memory service, retur
 
 # Field semantics
 - people: bare names of people mentioned. Empty array if none.
-- entities: canonical proper names of specific named things explicitly mentioned in the thought — projects, products, libraries, tools, technologies, organizations. These must be recognizable as named entities to someone outside the conversation (e.g., \"engram\", \"pgvector\", \"vLLM\", \"PostgreSQL\", \"MCP\", \"TCGplayer\", \"Cap'n Proto\"). Preserve the casing the thought uses, or the canonical casing if the thought is inconsistent. RETURN [] IF THE THOUGHT CONTAINS NO SUCH NAMED ENTITIES. Do not pad this field with descriptive noun phrases. The following are NOT entities — they are descriptive phrases or generic technical concepts and belong (if anywhere) in `topics`: \"agent memory protocol\", \"cross-encoder\", \"embedding-based\", \"lexical signals\", \"vector search\", \"rollout coordinator\", \"serialization format\".
+- entities: default to []. Only add an item if the thought explicitly names a specific entity by its canonical name — a project, product, library, tool, technology, or organization that exists by that name outside this thought. Examples of valid entities: \"engram\", \"pgvector\", \"PostgreSQL\", \"MCP\", \"TCGplayer\", \"Cap'n Proto\", \"Rust\", \"Hummingbird\". Test before including any phrase: does this phrase NAME a specific thing that has its own canonical identity (yes → entity), or does the thought DESCRIBE an action or concept using a noun phrase (no → belongs in topics if anywhere)? Preserve the thought's casing, or use canonical casing if the thought is inconsistent. If you are unsure whether a phrase qualifies, omit it.
 - action_items: short imperative phrases describing tasks the thought commits to or implies (e.g., \"fix the login bug\", \"review the migration plan\"). Empty array if none.
 - topics: 1-3 short tag-like subject categories, lowercase, hyphen-separated, no punctuation. What broad SUBJECT AREA is this thought about? Examples: \"rust\", \"build-systems\", \"team-management\", \"memory-systems\". Distinct from entities: a topic is a category the thought falls under; an entity is a specific named thing the thought mentions. A thought naming \"engram\" and \"pgvector\" might have entities [\"engram\", \"pgvector\"] and topics [\"memory-systems\", \"databases\"].
 - dates_mentioned: any dates or temporal references appearing in the prose (\"next Thursday\", \"Q3\", \"2026-05-15\", \"before the release\"). Free-form strings, copied roughly as they appear. Empty array if none.
@@ -222,7 +228,7 @@ fn render_vocab_section(vocab: Option<&ScopeVocab>) -> String {
         out.push_str(".\n");
     }
     out.push_str(
-        "When a concept in the thought matches one of these established terms, prefer the established form. Coin a new term only when the prose introduces something genuinely unseen.",
+        "These are terms other thoughts in this scope have used. Use one when it accurately describes the thought's subject. Use a more specific or different term when no vocab term is a close fit — precision over consistency.",
     );
     out
 }
@@ -342,8 +348,9 @@ impl Tagger for OpenAICompatibleTagger {
 
 /// The `response_format` JSON object sent to the chat completions API. The
 /// schema constrains the model to the `Tags` wire shape with six required
-/// fields; `topics` is capped at 3 items, `entities` at 5, and `kind` is
-/// nullable with an enum of `TagKind` snake_case variants.
+/// fields; `topics` is capped at 3 items, `entities` at 3 (lowered from 5
+/// in the v4 prompt iteration to force selectivity), and `kind` is nullable
+/// with an enum of `TagKind` snake_case variants.
 fn tags_response_format() -> serde_json::Value {
     serde_json::json!({
         "type": "json_schema",
@@ -356,7 +363,7 @@ fn tags_response_format() -> serde_json::Value {
                 "required": ["people", "entities", "action_items", "topics", "dates_mentioned", "kind"],
                 "properties": {
                     "people": { "type": "array", "items": { "type": "string" } },
-                    "entities": { "type": "array", "items": { "type": "string" }, "maxItems": 5 },
+                    "entities": { "type": "array", "items": { "type": "string" }, "maxItems": 3 },
                     "action_items": { "type": "array", "items": { "type": "string" } },
                     "topics": { "type": "array", "items": { "type": "string" }, "maxItems": 3 },
                     "dates_mentioned": { "type": "array", "items": { "type": "string" } },
@@ -624,17 +631,18 @@ mod tests {
         assert!(!sys.contains("Field semantics"));
     }
 
-    /// v3 prompt content pin: the tagger prompt must mention field semantics,
-    /// list each of the six fields, surface the M4.1 entities-vs-topics
-    /// distinction, the M4.1-v3 entities anti-padding rule, and the M4.1-v3
-    /// kind-isolation clause. Catches accidental deletions or regressions
-    /// during downstream edits.
+    /// v4 prompt content pin: the tagger prompt must mention field semantics,
+    /// list each of the six fields, preserve the entities/topics distinction
+    /// and kind-isolation clauses from earlier versions, and surface the v4
+    /// entities restructuring (lead-with-empty + NAME-vs-DESCRIBE structural
+    /// test) without regressing to the v3 negative-example list (which
+    /// backfired in dogfood — the model emitted the listed phrases verbatim).
     #[test]
-    fn tagger_v3_prompt_contains_field_semantics_anti_padding_and_kind_isolation() {
+    fn tagger_v4_prompt_contains_field_semantics_lead_with_empty_and_kind_isolation() {
         let p = BUNDLED_TAGGER_PROMPT;
         assert!(
             p.contains("Field semantics"),
-            "v3 prompt must contain a 'Field semantics' section"
+            "v4 prompt must contain a 'Field semantics' section"
         );
         for field in [
             "people",
@@ -644,36 +652,47 @@ mod tests {
             "dates_mentioned",
             "kind",
         ] {
-            assert!(p.contains(field), "v3 prompt must mention field {field}");
+            assert!(p.contains(field), "v4 prompt must mention field {field}");
         }
         // The entities/topics distinction must be explicit (kept from v2).
         assert!(
             p.contains("Distinct from entities"),
-            "v3 prompt must explicitly distinguish entities from topics"
+            "v4 prompt must explicitly distinguish entities from topics"
         );
-        // v3 anti-padding rule: the all-caps RETURN [] clause + at least one
-        // negative-example phrase that was a v2 padding offender in dogfood.
+        // v4 entities lead-with-empty framing: the description must open
+        // with the default-empty case rather than burying it as a constraint.
         assert!(
-            p.contains("RETURN [] IF THE THOUGHT CONTAINS NO SUCH NAMED ENTITIES"),
-            "v3 prompt must contain the all-caps entities anti-padding clause"
+            p.contains("entities: default to []"),
+            "v4 prompt must lead the entities description with the empty case"
+        );
+        // v4 structural NAME-vs-DESCRIBE test replaces the v3 negative-example
+        // list (which backfired — the model emitted listed phrases verbatim).
+        assert!(
+            p.contains("NAME a specific thing"),
+            "v4 prompt must include the structural NAME-vs-DESCRIBE entities test"
         );
         assert!(
-            p.contains("agent memory protocol"),
-            "v3 prompt must call out the canonical v2-padding negative example"
+            p.contains("DESCRIBE an action"),
+            "v4 prompt must include the structural NAME-vs-DESCRIBE entities test"
         );
-        // v3 kind-isolation clause: the kind field description must frame
-        // kind as intrinsic-shape and the Rules section must forbid vocab
-        // from influencing kind.
+        // v3's negative-example list must be gone — its presence reinforced
+        // the very phrases it was trying to exclude (047d0ce8 dogfood case).
+        assert!(
+            !p.contains("The following are NOT entities"),
+            "v4 prompt must NOT contain the v3 negative-example list lead-in"
+        );
+        // v3 kind-isolation clause remains: kind framed as intrinsic-shape
+        // and the Rules section forbids vocab from influencing kind.
         assert!(
             p.contains("intrinsic shape"),
-            "v3 prompt must frame kind as intrinsic-shape classification"
+            "v4 prompt must frame kind as intrinsic-shape classification"
         );
         assert!(
             p.contains("not from the scope's typical content"),
-            "v3 prompt must explicitly isolate kind from scope-typical content"
+            "v4 prompt must explicitly isolate kind from scope-typical content"
         );
-        // Presets pinned to the bundled version (3 as of M4.1's v3 iteration).
-        assert_eq!(BUNDLED_TAGGER_VERSION, 3);
+        // Presets pinned to the bundled version (4 as of M4.1's v4 iteration).
+        assert_eq!(BUNDLED_TAGGER_VERSION, 4);
         let cfg = OpenAICompatibleConfig::vllm_local();
         assert_eq!(cfg.model_version, BUNDLED_TAGGER_VERSION);
         let cfg = OpenAICompatibleConfig::open_router("k".into(), "m".into());
@@ -698,7 +717,7 @@ mod tests {
             ]
         );
         assert_eq!(schema["properties"]["topics"]["maxItems"], 3);
-        assert_eq!(schema["properties"]["entities"]["maxItems"], 5);
+        assert_eq!(schema["properties"]["entities"]["maxItems"], 3);
         // `kind` must allow null on the wire.
         let kind_type = &schema["properties"]["kind"]["type"];
         assert!(
@@ -723,7 +742,15 @@ mod tests {
         assert!(rendered.contains("Controlled vocabulary"));
         assert!(rendered.contains("rust, memory-systems"));
         assert!(rendered.contains("engram, pgvector"));
-        assert!(rendered.contains("prefer the established form"));
+        // v4: vocab is a tie-breaker, not a hard preference.
+        assert!(
+            rendered.contains("precision over consistency"),
+            "v4 vocab section must frame vocab as tie-breaker, not dominator"
+        );
+        assert!(
+            !rendered.contains("prefer the established form"),
+            "v4 vocab section must not preserve the v2/v3 'prefer established form' framing"
+        );
     }
 
     #[test]
