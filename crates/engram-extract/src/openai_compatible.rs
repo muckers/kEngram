@@ -87,8 +87,11 @@ impl OpenAICompatibleConfig {
 /// History: v1 was the initial M4 thoughts-only tagger; v2 (M4.1) split
 /// `topics` into `entities` (proper-noun-style identifiers) + `topics`
 /// (subject categories) and added the optional scope-vocabulary
-/// controlled-vocabulary section.
-pub const BUNDLED_TAGGER_VERSION: i32 = 2;
+/// controlled-vocabulary section; v3 (M4.1 prompt iteration) tightened
+/// entities to canonical proper names only with an explicit anti-padding
+/// rule, and added a kind-isolation clause forbidding the controlled
+/// vocabulary from influencing kind classification.
+pub const BUNDLED_TAGGER_VERSION: i32 = 3;
 
 #[derive(Debug, Clone)]
 pub struct OpenAICompatibleTagger {
@@ -176,21 +179,22 @@ You are a tagging assistant. Given a single thought from a memory service, retur
 
 # Field semantics
 - people: bare names of people mentioned. Empty array if none.
-- entities: named, proper-noun-style identifiers explicitly mentioned in the thought — projects, products, libraries, tools, technologies, named concepts (e.g., \"engram\", \"pgvector\", \"vLLM\", \"PostgreSQL\", \"MCP\"). Preserve the casing the thought uses, or the canonical casing if the thought is inconsistent. Empty array if none.
+- entities: canonical proper names of specific named things explicitly mentioned in the thought — projects, products, libraries, tools, technologies, organizations. These must be recognizable as named entities to someone outside the conversation (e.g., \"engram\", \"pgvector\", \"vLLM\", \"PostgreSQL\", \"MCP\", \"TCGplayer\", \"Cap'n Proto\"). Preserve the casing the thought uses, or the canonical casing if the thought is inconsistent. RETURN [] IF THE THOUGHT CONTAINS NO SUCH NAMED ENTITIES. Do not pad this field with descriptive noun phrases. The following are NOT entities — they are descriptive phrases or generic technical concepts and belong (if anywhere) in `topics`: \"agent memory protocol\", \"cross-encoder\", \"embedding-based\", \"lexical signals\", \"vector search\", \"rollout coordinator\", \"serialization format\".
 - action_items: short imperative phrases describing tasks the thought commits to or implies (e.g., \"fix the login bug\", \"review the migration plan\"). Empty array if none.
 - topics: 1-3 short tag-like subject categories, lowercase, hyphen-separated, no punctuation. What broad SUBJECT AREA is this thought about? Examples: \"rust\", \"build-systems\", \"team-management\", \"memory-systems\". Distinct from entities: a topic is a category the thought falls under; an entity is a specific named thing the thought mentions. A thought naming \"engram\" and \"pgvector\" might have entities [\"engram\", \"pgvector\"] and topics [\"memory-systems\", \"databases\"].
 - dates_mentioned: any dates or temporal references appearing in the prose (\"next Thursday\", \"Q3\", \"2026-05-15\", \"before the release\"). Free-form strings, copied roughly as they appear. Empty array if none.
-- kind: a single classification. Use null if uncertain. Categories:
+- kind: a single classification of the thought's intrinsic shape — not its subject area, and not influenced by what other thoughts in this scope tend to be classified as. Classify from the writing's structural form (factual claim → observation; imperative → task; proposal → idea; pointer to a resource → reference; statement about a person → person_note; transient narrative → session). Use null if genuinely ambiguous. Categories:
   - observation: a factual claim about the world (\"Rust has stronger memory safety than C\").
   - task: a thing the writer or someone else needs to do (\"fix the login bug\").
   - idea: a proposal or hypothesis (\"we could use Bloom filters here\").
-  - reference: a pointer to an external resource (a URL, a paper, a tool).
+  - reference: a pointer to an external resource (a URL, a paper, a tool, or a definition of a named thing).
   - person_note: a fact about a specific person (\"Sarah prefers async meetings\").
   - session: transient session/test narrative (\"the search returned 3 results\", \"I just ran the migration\"). These should also have otherwise-empty arrays.
 
 # Rules
-- Entities require explicit mention by name in the thought. Do not invent entities.
+- Entities require explicit mention by name in the thought. Do not invent entities. Do not pad entities with descriptive phrases when no named entities are present — empty array is correct.
 - Topics may be inferred from prose context when the subject is clear, even if the exact topic word doesn't appear.
+- Kind is classified from the thought's intrinsic shape, not from the scope's typical content or any controlled-vocabulary hints below. The vocabulary section, when present, informs topic and entity term choice only.
 - Empty arrays are correct for any field that has no content.
 - One classification only; pick the most-load-bearing category. If genuinely ambiguous, return null.
 - This is a tagging pass, not a paraphrase or rewrite. Do not rephrase the thought's content; only emit metadata.";
@@ -620,15 +624,17 @@ mod tests {
         assert!(!sys.contains("Field semantics"));
     }
 
-    /// v2 prompt content pin: the tagger prompt must mention field semantics
-    /// and list each of the six fields, including the new `entities` field
-    /// added in M4.1. Catches accidental deletions during downstream edits.
+    /// v3 prompt content pin: the tagger prompt must mention field semantics,
+    /// list each of the six fields, surface the M4.1 entities-vs-topics
+    /// distinction, the M4.1-v3 entities anti-padding rule, and the M4.1-v3
+    /// kind-isolation clause. Catches accidental deletions or regressions
+    /// during downstream edits.
     #[test]
-    fn tagger_v2_prompt_contains_field_semantics_and_entities() {
+    fn tagger_v3_prompt_contains_field_semantics_anti_padding_and_kind_isolation() {
         let p = BUNDLED_TAGGER_PROMPT;
         assert!(
             p.contains("Field semantics"),
-            "v2 prompt must contain a 'Field semantics' section"
+            "v3 prompt must contain a 'Field semantics' section"
         );
         for field in [
             "people",
@@ -638,16 +644,36 @@ mod tests {
             "dates_mentioned",
             "kind",
         ] {
-            assert!(p.contains(field), "v2 prompt must mention field {field}");
+            assert!(p.contains(field), "v3 prompt must mention field {field}");
         }
-        // The entities/topics distinction must be explicit in the prompt so
-        // the model can disambiguate the two open-vocabulary slots.
+        // The entities/topics distinction must be explicit (kept from v2).
         assert!(
             p.contains("Distinct from entities"),
-            "v2 prompt must explicitly distinguish entities from topics"
+            "v3 prompt must explicitly distinguish entities from topics"
         );
-        // Presets pinned to the bundled version (2 as of M4.1).
-        assert_eq!(BUNDLED_TAGGER_VERSION, 2);
+        // v3 anti-padding rule: the all-caps RETURN [] clause + at least one
+        // negative-example phrase that was a v2 padding offender in dogfood.
+        assert!(
+            p.contains("RETURN [] IF THE THOUGHT CONTAINS NO SUCH NAMED ENTITIES"),
+            "v3 prompt must contain the all-caps entities anti-padding clause"
+        );
+        assert!(
+            p.contains("agent memory protocol"),
+            "v3 prompt must call out the canonical v2-padding negative example"
+        );
+        // v3 kind-isolation clause: the kind field description must frame
+        // kind as intrinsic-shape and the Rules section must forbid vocab
+        // from influencing kind.
+        assert!(
+            p.contains("intrinsic shape"),
+            "v3 prompt must frame kind as intrinsic-shape classification"
+        );
+        assert!(
+            p.contains("not from the scope's typical content"),
+            "v3 prompt must explicitly isolate kind from scope-typical content"
+        );
+        // Presets pinned to the bundled version (3 as of M4.1's v3 iteration).
+        assert_eq!(BUNDLED_TAGGER_VERSION, 3);
         let cfg = OpenAICompatibleConfig::vllm_local();
         assert_eq!(cfg.model_version, BUNDLED_TAGGER_VERSION);
         let cfg = OpenAICompatibleConfig::open_router("k".into(), "m".into());
@@ -791,5 +817,408 @@ mod tests {
         // We can't assert specific tags (model output varies) but the call
         // must succeed and parse.
         let _ = tags;
+    }
+
+    /// Common fixtures for both kind-stability diagnostics (vocab-off and
+    /// vocab-on). Six fixture thoughts pulled from the post-M4.1 corpus.
+    /// Format: (short_id, scope, current_v2_kind, descriptor, content).
+    #[cfg(feature = "integration")]
+    fn diagnostic_fixtures() -> Vec<(
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+    )> {
+        vec![
+            (
+                "8a533e15",
+                "engram.m3.dogfood",
+                "observation",
+                "Mission/setup (drift candidate: was task in v1, observation in v2)",
+                "Mission for the engram.m3.dogfood scope: We are testing the Engram agent memory system via its MCP toolset. We are testing for accuracy, making sure that facts don't drift negatively, and that searches return expected information.\n\nWhen scope is a parameter, we will use \"engram.m3.dogfood\".\n\nFor any of our conversations, the agent will always consult the facts and thoughts in that scope, giving more weight to facts than thoughts. The agent will add any interesting thought that it or the operator comes up with during the conversation. If unsure, the agent will ask the operator whether it should be stored.",
+            ),
+            (
+                "047d0ce8",
+                "engram.m3.dogfood",
+                "observation",
+                "Probe 2B definitional (drift candidate: was reference in v1, observation in v2)",
+                "The agent memory protocol provides five operations: writing notes, querying them by similarity or recency, fetching by id, and marking notes untrusted. Querying combines embedding-based and lexical signals, optionally re-scored by a cross-encoder.",
+            ),
+            (
+                "22bccb3a",
+                "engram.test",
+                "reference",
+                "Clean definitional/reference control (Cap'n Proto)",
+                "Cap'n Proto is a serialization format that uses the same memory layout in-memory and on-the-wire, eliminating parse and encode steps. Compared to Protocol Buffers, it offers zero-copy reads but at the cost of more rigid schema evolution. For very high-throughput RPC workloads, it can outperform Protobuf by an order of magnitude.",
+            ),
+            (
+                "5aacd2d8",
+                "engram.m3.dogfood",
+                "reference",
+                "Short definitional/reference control (Hummingbird)",
+                "Hummingbird is our internal rollout coordinator. It exposes a percentage knob per cohort and a kill-switch endpoint. Currently used by the privacy-sensitive code paths only.",
+            ),
+            (
+                "b67db532",
+                "work.tcgplayer",
+                "person_note",
+                "Closed-enum person_note control (Ron / Python)",
+                "Ron (CTO of TCGplayer) does not like Python or JavaScript, particularly for enterprise software.",
+            ),
+            (
+                "86c3392f",
+                "engram.test",
+                "observation",
+                "Session-shaped narrative control (benchmark run)",
+                "I ran a benchmark this morning comparing serde_json and simd-json for parsing 100MB of test JSON. simd-json was 3.2x faster on this hardware (M2 Pro, 16GB). The general finding holds across many tests in the community: SIMD-accelerated JSON parsing significantly outperforms scalar implementations for documents over roughly 1MB. For smaller documents the SIMD setup overhead can negate the benefit.",
+            ),
+        ]
+    }
+
+    /// Top-50 scope vocab for each fixture scope, frozen from the live DB at
+    /// 2026-05-17. Lets the vocab-on diagnostic faithfully reproduce what the
+    /// worker tick / `engram tag --rerun` actually passes to the tagger,
+    /// without taking a sqlx dependency in this crate.
+    #[cfg(feature = "integration")]
+    fn diagnostic_scope_vocab(scope: &str) -> ScopeVocab {
+        match scope {
+            "engram.m3.dogfood" => ScopeVocab {
+                topics: vec![
+                    "tagging-systems".into(),
+                    "information-retrieval".into(),
+                    "memory-systems".into(),
+                    "agent-memory".into(),
+                    "concept-mapping".into(),
+                    "embedding-models".into(),
+                    "search".into(),
+                    "fact-management".into(),
+                    "internal-tools".into(),
+                    "metadata".into(),
+                    "privacy".into(),
+                    "rollout".into(),
+                    "topic-extraction".into(),
+                ],
+                entities: vec![
+                    "Engram".into(),
+                    "engram.m3.dogfood".into(),
+                    "MCP".into(),
+                    "agent memory protocol".into(),
+                    "cross-encoder".into(),
+                    "embedding-based".into(),
+                    "Hummingbird".into(),
+                    "lexical signals".into(),
+                    "ollama/qwen3-coder:30b v1".into(),
+                ],
+            },
+            "engram.test" => ScopeVocab {
+                topics: vec![
+                    "performance".into(),
+                    "database".into(),
+                    "serialization".into(),
+                    "storage".into(),
+                    "benchmarking".into(),
+                    "build-systems".into(),
+                    "development-environment".into(),
+                    "go".into(),
+                    "real-time-updates".into(),
+                    "rpc".into(),
+                    "rust".into(),
+                    "server-sent-events".into(),
+                    "tool-comparison".into(),
+                    "websockets".into(),
+                    "zig".into(),
+                ],
+                entities: vec![
+                    "PostgreSQL".into(),
+                    "100MB".into(),
+                    "1MB".into(),
+                    "Bazel".into(),
+                    "C".into(),
+                    "Cap'n Proto".into(),
+                    "Cassandra".into(),
+                    "Go".into(),
+                    "long-polling".into(),
+                    "M2 Pro".into(),
+                    "Make".into(),
+                    "MVCC".into(),
+                    "Nix".into(),
+                    "Protobuf".into(),
+                    "Protocol Buffers".into(),
+                    "Redis".into(),
+                    "Rust".into(),
+                    "serde_json".into(),
+                    "Server-Sent Events".into(),
+                    "simd-json".into(),
+                    "SSE".into(),
+                    "VACUUM".into(),
+                    "WebSockets".into(),
+                    "Zig".into(),
+                ],
+            },
+            "work.tcgplayer" => ScopeVocab {
+                topics: vec![
+                    "programming-languages".into(),
+                    "software-development".into(),
+                    "technology-preferences".into(),
+                    "engram".into(),
+                    "enterprise-software".into(),
+                    "scope-convention".into(),
+                    "scope-design".into(),
+                    "search".into(),
+                    "thought-management".into(),
+                ],
+                entities: vec![
+                    "TCGplayer".into(),
+                    "engram".into(),
+                    "Go".into(),
+                    "Rust".into(),
+                ],
+            },
+            other => panic!("no frozen scope vocab for scope {other:?}"),
+        }
+    }
+
+    /// Build the OpenAI-compatible config matching Ron's runtime tagger:
+    /// Ollama on :11434 with qwen3-coder:30b, bundled v2 prompt, temperature
+    /// 0.2, model_version = BUNDLED_TAGGER_VERSION.
+    #[cfg(feature = "integration")]
+    fn diagnostic_tagger() -> OpenAICompatibleTagger {
+        let cfg = OpenAICompatibleConfig {
+            endpoint: "http://localhost:11434/v1".to_string(),
+            model_name: "qwen3-coder:30b".to_string(),
+            model_id: "ollama/qwen3-coder:30b".to_string(),
+            model_version: BUNDLED_TAGGER_VERSION,
+            api_key: None,
+            timeout: Duration::from_secs(180),
+            temperature: 0.2,
+            system_prompt: None,
+        };
+        OpenAICompatibleTagger::new(cfg).expect("OpenAICompatibleTagger::new should succeed")
+    }
+
+    /// M4.1 dogfood diagnostic: measure within-tagger `kind` stability by
+    /// running N=10 tag passes on each of six fixture thoughts pulled from the
+    /// operator's local corpus (two drift-candidates Ron cited plus four
+    /// controls). Prints a markdown distribution table; does not assert.
+    ///
+    /// Configured for Ron's current setup: Ollama on `http://localhost:11434/v1`
+    /// with `qwen3-coder:30b`, bundled v2 prompt, temperature 0.2, vocab=None
+    /// to isolate from scope-vocab effects.
+    ///
+    /// Run with:
+    /// `cargo test -p engram-extract --features integration --release -- kind_stability_diagnostic --nocapture --ignored`
+    ///
+    /// `--ignored` because each call is ~5-20s on a 30B Ollama model; 6×10=60
+    /// calls means 5-20 minutes wallclock. Not appropriate for the default
+    /// integration suite.
+    #[cfg(feature = "integration")]
+    #[tokio::test]
+    #[ignore]
+    async fn kind_stability_diagnostic() {
+        // Six fixture thoughts pulled from the post-M4.1 corpus. Format:
+        // (short_id, current_v2_kind, descriptor, content).
+        let fixtures: Vec<(&str, &str, &str, &str)> = vec![
+            (
+                "8a533e15",
+                "observation",
+                "Mission/setup (drift candidate: was task in v1, observation in v2)",
+                "Mission for the engram.m3.dogfood scope: We are testing the Engram agent memory system via its MCP toolset. We are testing for accuracy, making sure that facts don't drift negatively, and that searches return expected information.\n\nWhen scope is a parameter, we will use \"engram.m3.dogfood\".\n\nFor any of our conversations, the agent will always consult the facts and thoughts in that scope, giving more weight to facts than thoughts. The agent will add any interesting thought that it or the operator comes up with during the conversation. If unsure, the agent will ask the operator whether it should be stored.",
+            ),
+            (
+                "047d0ce8",
+                "observation",
+                "Probe 2B definitional (drift candidate: was reference in v1, observation in v2)",
+                "The agent memory protocol provides five operations: writing notes, querying them by similarity or recency, fetching by id, and marking notes untrusted. Querying combines embedding-based and lexical signals, optionally re-scored by a cross-encoder.",
+            ),
+            (
+                "22bccb3a",
+                "reference",
+                "Clean definitional/reference control (Cap'n Proto)",
+                "Cap'n Proto is a serialization format that uses the same memory layout in-memory and on-the-wire, eliminating parse and encode steps. Compared to Protocol Buffers, it offers zero-copy reads but at the cost of more rigid schema evolution. For very high-throughput RPC workloads, it can outperform Protobuf by an order of magnitude.",
+            ),
+            (
+                "5aacd2d8",
+                "reference",
+                "Short definitional/reference control (Hummingbird)",
+                "Hummingbird is our internal rollout coordinator. It exposes a percentage knob per cohort and a kill-switch endpoint. Currently used by the privacy-sensitive code paths only.",
+            ),
+            (
+                "b67db532",
+                "person_note",
+                "Closed-enum person_note control (Ron / Python)",
+                "Ron (CTO of TCGplayer) does not like Python or JavaScript, particularly for enterprise software.",
+            ),
+            (
+                "86c3392f",
+                "observation",
+                "Session-shaped narrative control (benchmark run)",
+                "I ran a benchmark this morning comparing serde_json and simd-json for parsing 100MB of test JSON. simd-json was 3.2x faster on this hardware (M2 Pro, 16GB). The general finding holds across many tests in the community: SIMD-accelerated JSON parsing significantly outperforms scalar implementations for documents over roughly 1MB. For smaller documents the SIMD setup overhead can negate the benefit.",
+            ),
+        ];
+        const N_RUNS: usize = 10;
+
+        // Match the operator's actual runtime config: Ollama on :11434, the
+        // qwen3-coder:30b model, bundled v2 prompt, temperature 0.2, version 2.
+        let cfg = OpenAICompatibleConfig {
+            endpoint: "http://localhost:11434/v1".to_string(),
+            model_name: "qwen3-coder:30b".to_string(),
+            model_id: "ollama/qwen3-coder:30b".to_string(),
+            model_version: BUNDLED_TAGGER_VERSION,
+            api_key: None,
+            timeout: Duration::from_secs(180),
+            temperature: 0.2,
+            system_prompt: None,
+        };
+        let t =
+            OpenAICompatibleTagger::new(cfg).expect("OpenAICompatibleTagger::new should succeed");
+
+        // Per-fixture results: short_id -> (descriptor, current_kind, [observed_kinds; N]).
+        type Observed = (String, String, Vec<String>);
+        let mut results: Vec<(String, Observed)> = Vec::new();
+
+        for (short_id, current_kind, descriptor, content) in &fixtures {
+            let mut observed: Vec<String> = Vec::with_capacity(N_RUNS);
+            for run in 0..N_RUNS {
+                eprintln!("[diagnostic] {short_id} run {}/{} ...", run + 1, N_RUNS);
+                match t.tag(content, None).await {
+                    Ok(tags) => {
+                        let k = tags
+                            .kind
+                            .map(|k| format!("{k:?}").to_lowercase())
+                            .unwrap_or_else(|| "null".to_string());
+                        observed.push(k);
+                    }
+                    Err(e) => {
+                        eprintln!("[diagnostic] {short_id} run {} ERR: {e}", run + 1);
+                        observed.push(format!("ERR({e})"));
+                    }
+                }
+            }
+            results.push((
+                short_id.to_string(),
+                (descriptor.to_string(), current_kind.to_string(), observed),
+            ));
+        }
+
+        // Render results as a markdown table on stderr.
+        eprintln!();
+        eprintln!("## v2 kind-stability diagnostic results (N={N_RUNS} per thought)");
+        eprintln!();
+        eprintln!(
+            "Tagger: ollama/qwen3-coder:30b @ http://localhost:11434/v1, bundled v2 prompt, temperature 0.2, vocab=None."
+        );
+        eprintln!();
+        eprintln!(
+            "| short_id | current kind (v2 stored) | descriptor | kind distribution (N=10) |"
+        );
+        eprintln!("|---|---|---|---|");
+        for (short_id, (descriptor, current_kind, observed)) in &results {
+            let mut counts: std::collections::BTreeMap<&str, usize> =
+                std::collections::BTreeMap::new();
+            for k in observed {
+                *counts.entry(k.as_str()).or_insert(0) += 1;
+            }
+            let dist = counts
+                .iter()
+                .map(|(k, v)| format!("{k}: {v}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            eprintln!("| `{short_id}` | `{current_kind}` | {descriptor} | {dist} |");
+        }
+        eprintln!();
+        eprintln!("Raw observations (one row per fixture):");
+        for (short_id, (_, _, observed)) in &results {
+            eprintln!("- {short_id}: {observed:?}");
+        }
+    }
+
+    /// M4.1 dogfood diagnostic, vocab-ON variant. Same six fixtures, same
+    /// tagger config, N=10 — but each call is made with `vocab=Some(<frozen
+    /// scope vocab>)` matching what the worker tick / `engram tag --rerun`
+    /// would pass at runtime. Tests the hypothesis that scope-vocab injection
+    /// is the lever causing the stored-vs-vocab-off kind divergence.
+    ///
+    /// Hypothesis: under vocab-on, each fixture's diagnostic kind matches its
+    /// stored kind (i.e. vocab is the differentiator, not some unknown drift).
+    /// Confirmation supports v3 adding an explicit kind-isolation clause to
+    /// the prompt; refutation means a third mechanism is at play and v3 needs
+    /// more investigation.
+    ///
+    /// Run with:
+    /// `cargo test -p engram-extract --features integration --release -- kind_stability_diagnostic_with_vocab --nocapture --ignored`
+    #[cfg(feature = "integration")]
+    #[tokio::test]
+    #[ignore]
+    async fn kind_stability_diagnostic_with_vocab() {
+        let fixtures = diagnostic_fixtures();
+        const N_RUNS: usize = 10;
+
+        let t = diagnostic_tagger();
+
+        type Observed = (String, String, String, Vec<String>);
+        let mut results: Vec<(String, Observed)> = Vec::new();
+
+        for (short_id, scope, current_kind, descriptor, content) in &fixtures {
+            let vocab = diagnostic_scope_vocab(scope);
+            let mut observed: Vec<String> = Vec::with_capacity(N_RUNS);
+            for run in 0..N_RUNS {
+                eprintln!(
+                    "[diagnostic-vocab] {short_id} ({scope}) run {}/{} ...",
+                    run + 1,
+                    N_RUNS
+                );
+                match t.tag(content, Some(&vocab)).await {
+                    Ok(tags) => {
+                        let k = tags
+                            .kind
+                            .map(|k| format!("{k:?}").to_lowercase())
+                            .unwrap_or_else(|| "null".to_string());
+                        observed.push(k);
+                    }
+                    Err(e) => {
+                        eprintln!("[diagnostic-vocab] {short_id} run {} ERR: {e}", run + 1);
+                        observed.push(format!("ERR({e})"));
+                    }
+                }
+            }
+            results.push((
+                short_id.to_string(),
+                (
+                    scope.to_string(),
+                    descriptor.to_string(),
+                    current_kind.to_string(),
+                    observed,
+                ),
+            ));
+        }
+
+        eprintln!();
+        eprintln!("## v2 kind-stability diagnostic results — VOCAB-ON (N={N_RUNS} per thought)");
+        eprintln!();
+        eprintln!(
+            "Tagger: ollama/qwen3-coder:30b @ http://localhost:11434/v1, bundled v2 prompt, temperature 0.2, vocab=Some(<frozen scope vocab>)."
+        );
+        eprintln!();
+        eprintln!("| short_id | scope | stored kind | descriptor | kind distribution (N=10) |");
+        eprintln!("|---|---|---|---|---|");
+        for (short_id, (scope, descriptor, current_kind, observed)) in &results {
+            let mut counts: std::collections::BTreeMap<&str, usize> =
+                std::collections::BTreeMap::new();
+            for k in observed {
+                *counts.entry(k.as_str()).or_insert(0) += 1;
+            }
+            let dist = counts
+                .iter()
+                .map(|(k, v)| format!("{k}: {v}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            eprintln!("| `{short_id}` | `{scope}` | `{current_kind}` | {descriptor} | {dist} |");
+        }
+        eprintln!();
+        eprintln!("Raw observations (one row per fixture):");
+        for (short_id, (_, _, _, observed)) in &results {
+            eprintln!("- {short_id}: {observed:?}");
+        }
     }
 }

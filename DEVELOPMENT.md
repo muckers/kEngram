@@ -153,16 +153,26 @@ cargo run --bin engram -- tag --scope work --limit 100
 cargo run --bin engram -- tag --rerun --scope work
 cargo run --bin engram -- tag --rerun --since 2026-04-01T00:00:00Z
 
-# M4.1 backfill recipe: after deploying v2, refresh the entire corpus
-# under the new schema. The new `entities` field starts empty on v1-tagged
-# rows; this run populates it.
+# M4.1 backfill recipe: after deploying a v3 (or v2) prompt, refresh the
+# entire corpus under the new schema. The same command applies to either
+# bump — the drainer walks rows where tags_extractor_version < the
+# configured target.
+#
+# IMPORTANT: if you've pinned `model_version` in your local
+# `~/.config/engram/engram.toml`, bump it manually — the new bundled
+# default (3) only applies when the field is absent from your TOML. The
+# log line at startup reports the resolved value: look for
+# `target_version=3`. If it says `target_version=2`, your config still
+# overrides; either update the line or delete it.
 cargo run --bin engram -- tag --rerun --since 1970-01-01T00:00:00Z
 
 # Caveat: agents that hardcoded tag_filter queries against v1's shape
-# (e.g. {"topics": ["engram"]}) may need updating to use the new
-# {"entities": [...]} field once a term gets reclassified. The v1 query
-# still matches v1-tagged rows but misses v2-tagged rows once the
-# tagger moves a term into entities.
+# (e.g. {"topics": ["engram"]}) may need updating to use {"entities": [...]}
+# once a term gets reclassified. The v3 iteration further tightens entities
+# to canonical proper names only — descriptive phrases like "agent memory
+# protocol" or "cross-encoder" that v2 sometimes landed in entities are
+# now forbidden there; expect those queries to start missing thoughts.
+# Migrate `tag_filter` to use topics for descriptive-phrase searches.
 
 # A/B-benchmark the reranker against RRF-only on an operator-curated
 # fixture corpus. Prints a markdown table to stdout with per-query
@@ -204,14 +214,14 @@ provider = "openai-compatible"           # also "openrouter"; "" = disabled
 endpoint = "http://localhost:8000/v1"    # vLLM default; OpenRouter is https://openrouter.ai/api/v1
 model_name = "qwen2.5-7b-instruct"       # the model the backend serves
 model_id = "vllm/qwen2.5-7b-instruct"    # provenance written into thoughts.tags_extractor_model
-model_version = 2                        # tagger prompt/schema version (M4.1 bumped to 2 for the entities split + vocab v2 prompt); bump on change and `engram tag --rerun` to re-tag rows whose stored version is older.
+model_version = 3                        # tagger prompt/schema version (M4.1 shipped at 2 for the entities split + vocab v2 prompt; v3 iteration tightened entities to canonical proper names + added kind-isolation clause). Bump on change and `engram tag --rerun` to re-tag rows whose stored version is older.
 api_key = ""                             # bearer token for hosted endpoints (OpenRouter, etc.)
 timeout_seconds = 60                     # vLLM JSON-Schema responses can run long
 temperature = 0.2
 scope_vocab_enabled = true               # M4.1: inject the top topic + entity terms from the thought's scope into the tagger prompt as a controlled-vocabulary hint. Encourages consistent term reuse across captures.
 scope_vocab_size = 50                    # M4.1: top-N established terms (each for topics and entities) fed to the tagger. Larger = more vocabulary stability; smaller = faster emergence of new terms.
 # system_prompt_file = "~/.config/engram/tagger-prompt.txt"
-# When set, the file's contents replace the bundled v2 tagger prompt.
+# When set, the file's contents replace the bundled v3 tagger prompt.
 # Operator is responsible for bumping model_version when the prompt changes.
 
 [reranker]                                              # M3 Phase B step 2; opt-in
