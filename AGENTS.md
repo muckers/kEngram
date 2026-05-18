@@ -28,6 +28,14 @@ Scopes are exact-match string labels. Call `list_scopes` (optionally with a `pre
 
 Set `source` on capture to identify yourself: `agent:claude-code`, `agent:claude-desktop`, etc. Use the `for_audience` metadata key when a thought is aimed at a specific future agent class.
 
+## Tagger output is best-effort
+
+The LLM-extracted `tags` fields (especially `entities`) are best-effort, not strict claims. The v7 prompt's structural NAME-vs-DESCRIBE test has a known ceiling — see the design-v0 revision history for the four-iteration arc and structural diagnosis. In practice the `entities` field may include adjectival or descriptive phrases (e.g. `embedding-based`) alongside legitimate names (e.g. `engram`). Treat `tag_filter: {"entities": [...]}` as a positive signal — "thoughts the tagger associated with this term" — not a strict membership claim.
+
+When a tagger-emitted edge in `get_related_thoughts` targets a clearly-wrong entity, `unlink_thoughts(from, relation, {to_entity|to_person|to_url})` soft-deletes it (audit trail preserved). The entities field on the thought itself is corrected by re-tag cycles or direct psql edit — both operator-initiated, neither blocking your normal flow.
+
 ## Honesty
 
 If you didn't search engram, don't claim to. If you searched and found nothing relevant, say so. Misrepresenting the corpus costs me trust in the tool.
+
+Negative findings about engram (or any subsystem you're driving via MCP tools) need out-of-band verification before capture. "I called X with parameter P and the response came back as if P were ignored" is empirically indistinguishable between (a) X is broken, (b) P was stripped client-side, (c) P never reached the wire. Don't publish "engram has a regression" findings into the corpus without corroborating via a different tool, agent, or transport — false-positives that land in memory become authoritative-looking to future readers.

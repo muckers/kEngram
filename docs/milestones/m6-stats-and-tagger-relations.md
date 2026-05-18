@@ -163,3 +163,22 @@ This makes the long-standing v4 behavior explicit. The stale claims in `6d2ef58e
 Bundled into the v7 commit because it surfaced from the same dogfood: claude.ai's MCP client silently strips fields whose schema declarations lack a concrete `type`. Engram's `SearchThoughtsArgs.tag_filter: Option<serde_json::Value>` and `CaptureArgs.metadata: Option<serde_json::Value>` produced schemas with only `description` (no `type`). Wire-tested with raw curl: the orchestrator filters correctly when the field arrives. Audited with the claude.ai client: the field never arrives. Fix: change both Rust types to `Option<serde_json::Map<String, serde_json::Value>>` so schemars renders `type: ["object", "null"]`. New regression test `tool_args_object_fields_have_concrete_schema_type` pins the shape so a regression to `Option<Value>` fails CI before ship.
 
 The diagnostic that surfaced this is `tag_filter-strip-diagnostic.md` in the repo root (operator-supplied; not committed).
+
+
+---
+
+# v8 decision: accept the entities adjectival regression, document the structural ceiling
+
+**Status:** shipped 2026-05-18. Doc-only change; no prompt iteration, no version bump, no re-tag.
+
+A 2026-05-18 dogfood pass after the v6+v7 ship confirmed the adjectival entities regression persists on `047d0ce8` even after v7's pure-structural NAME-vs-DESCRIBE prompt framing. The thought, tagged at `tags_extractor_version: 7`, emits entities `["agent memory protocol", "embedding-based", "lexical signals"]` — only the first is a fair name; the latter two are adjectival/descriptive.
+
+**Why prompt iterations have diminishing returns here:** the NAME-vs-DESCRIBE test asks the model to verify "does this phrase have its own canonical identity outside this thought" — a world-knowledge check the model cannot reliably perform. When uncertain, the model errs toward inclusion. Reinforcing biases (surface-pattern over-generalization, definite-article-as-name, coordination spillover) compound the failure. v3 → v4 → v6 → v7 each explored the prompt space; v7 is approximately the cleanest the prompt can get without dropping entities entirely. The ceiling is structural, not a prompt-engineering deficit.
+
+**v8 decision:** accept the residual imperfection. Lowering `entities.maxItems` (3→2) was rejected — drops legitimate 3-entity cases as collateral. Engram's M5+ machinery (`unlink_thoughts` soft-delete on `thought_links`, `link_source` discriminator on `get_related_thoughts` responses, the `agent` / `tagger` source split) was designed for operator correction of tagger output. The imperfect tagger feeding into that correction layer is by design.
+
+**What v8 ships:** documentation only. design-v0 revision history captures the four-iteration arc + structural diagnosis + methodology lesson ("when prompt-engineering hits a structural ceiling, the next lever is architectural — closed vocabulary, two-pass verify, model swap — not another prompt iteration"). AGENTS.md adds an operator-facing paragraph: tagger-emitted entities are best-effort; `tag_filter` consumers should treat results as positive signal not strict membership; `unlink_thoughts` is the correction path for bad tagger edges.
+
+**Escalation path:** if continued dogfood reveals the residual imperfection is intolerable, the next levers in priority order are: (a) closed-vocabulary mode (promote `tagger.scope_vocab` from tie-breaker to gate; the model becomes a classifier over a known set rather than a free-form extractor); (b) model swap (larger model or specialized entity-extraction model). Each is a significant design surface and would get its own plan-mode conversation. Not committing today.
+
+**The v8 lesson recorded for posterity:** four prompt iterations in one milestone cycle isn't indecision; it's the prompt-engineering ceiling discovery process. Future similar problems (any closed-vocabulary or surface-discrimination LLM task where the prompt asks the model to verify a fact it can't reliably check) should run a similar arc with awareness of the ceiling, and architectural levers should be considered before the fifth prompt iteration.
