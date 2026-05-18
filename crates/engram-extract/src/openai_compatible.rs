@@ -96,8 +96,12 @@ impl OpenAICompatibleConfig {
 /// negative-example list backfired — the model emitted those exact phrases
 /// from `047d0ce8`), dropped entities maxItems 5→3, and softened the
 /// scope-vocabulary section from "vocab dominates" to "vocab tie-breaks"
-/// (precision over consistency).
-pub const BUNDLED_TAGGER_VERSION: i32 = 4;
+/// (precision over consistency); **v5 (M6.1) adds tagger-extracted
+/// relations** — the LLM emits closed-vocabulary `(relation, to_kind,
+/// to_value)` edges for explicit relational claims in prose. v1 ships
+/// non-thought targets only (entity / person / url); thought-target
+/// extraction requires entity resolution and is deferred.
+pub const BUNDLED_TAGGER_VERSION: i32 = 5;
 
 #[derive(Debug, Clone)]
 pub struct OpenAICompatibleTagger {
@@ -181,7 +185,7 @@ pub const BUNDLED_TAGGER_PROMPT: &str = "\
 You are a tagging assistant. Given a single thought from a memory service, return its metadata tags as JSON.
 
 # Output shape
-{ \"people\": [...], \"entities\": [...], \"action_items\": [...], \"topics\": [...], \"dates_mentioned\": [...], \"kind\": \"...\" }
+{ \"people\": [...], \"entities\": [...], \"action_items\": [...], \"topics\": [...], \"dates_mentioned\": [...], \"kind\": \"...\", \"relations\": [...] }
 
 # Field semantics
 - people: bare names of people mentioned. Empty array if none.
@@ -196,11 +200,30 @@ You are a tagging assistant. Given a single thought from a memory service, retur
   - reference: a pointer to an external resource (a URL, a paper, a tool, or a definition of a named thing).
   - person_note: a fact about a specific person (\"Sarah prefers async meetings\").
   - session: transient session/test narrative (\"the search returned 3 results\", \"I just ran the migration\"). These should also have otherwise-empty arrays.
+- relations: default to []. Closed-vocabulary edges from this thought to non-thought targets. Emit an entry ONLY when the prose makes an explicit relational claim — not when something is merely mentioned, adjacent, or vaguely alluded to. Each entry has three required fields: `relation` (closed vocabulary), `to_kind` (one of `entity`, `person`, `url`), and `to_value` (the canonical name / URL string). Optional `note` for a short rationale phrase.
+  - relation vocabulary (pick exactly one per edge):
+    - references: this thought cites or points at the target for context (passive mention). Use for prose-level citation: \"see [URL]\", \"per [Author]\", \"following [Project]'s convention\".
+    - supports: this thought makes a claim that ACTIVELY CONFIRMS the target. The prose must contain a confirming claim, not just a citation. Use for evidential / corroborative relationships: \"our results match [Paper]'s findings\", \"data confirms [Hypothesis]\". If the prose is just a citation without endorsement, use `references`.
+    - decided_by: this thought attributes a decision to the target. The target is the decision-maker. Use only with explicit attribution: \"the team decided X\" → decided_by team; \"per Ron, we'll do Y\" → decided_by Ron. Do not use for general influence (\"research suggests X\" is `supports`, not `decided_by`).
+    - belongs_to: this thought is a sub-element or member of the target. Use when the prose explicitly grounds this thought under a parent (e.g. \"a finding under Probe 2 experiment\" → belongs_to entity \"Probe 2\"; \"during the 2026-05-15 design session\" → belongs_to entity \"design session 2026-05-15\").
+    - requires: this thought depends on the target. Use for explicit prerequisites.
+    - refines: deprecated for non-thought targets in v1 (refines targets another thought, which v1 cannot resolve). Skip.
+    - replaces: deprecated for non-thought targets in v1 (replaces targets another thought). Skip.
+  - to_kind values:
+    - url: an http:// or https:// URL appearing in the prose. Copy the URL verbatim.
+    - entity: a named non-person thing the relation targets (a project, experiment, paper title, session anchor). Use the same canonical name you'd put in the `entities` array.
+    - person: a named individual. Same name shape as the `people` array.
+  - Selectivity guidance:
+    - Default to []. The relation surface is a high-precision low-recall signal; over-emission creates graph noise.
+    - Require an explicit relational verb or construction in the prose. \"X uses Y\" is not a relation by itself; \"X is built on Y\" or \"X refines Y's approach\" is.
+    - Emit at most 5 relations per thought. Pick the most load-bearing ones.
+    - Do not emit a `references` edge for a URL that's not explicitly cited (e.g., a URL that appears only in a code block as configuration). Cited URLs are URLs the prose surrounding them treats as a referent.
 
 # Rules
 - Entities require explicit mention by name in the thought. Do not invent entities. Do not pad entities with descriptive phrases when no named entities are present — empty array is correct.
 - Topics may be inferred from prose context when the subject is clear, even if the exact topic word doesn't appear.
 - Kind is classified from the thought's intrinsic shape, not from the scope's typical content or any controlled-vocabulary hints below. The vocabulary section, when present, informs topic and entity term choice only.
+- Relations require an explicit relational claim — a verb or construction in the prose that asserts the relationship. Mere mention is not a relation.
 - Empty arrays are correct for any field that has no content.
 - One classification only; pick the most-load-bearing category. If genuinely ambiguous, return null.
 - This is a tagging pass, not a paraphrase or rewrite. Do not rephrase the thought's content; only emit metadata.";
@@ -360,7 +383,10 @@ fn tags_response_format() -> serde_json::Value {
             "schema": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["people", "entities", "action_items", "topics", "dates_mentioned", "kind"],
+                "required": [
+                    "people", "entities", "action_items", "topics", "dates_mentioned",
+                    "kind", "relations"
+                ],
                 "properties": {
                     "people": { "type": "array", "items": { "type": "string" } },
                     "entities": { "type": "array", "items": { "type": "string" }, "maxItems": 3 },
@@ -370,6 +396,30 @@ fn tags_response_format() -> serde_json::Value {
                     "kind": {
                         "type": ["string", "null"],
                         "enum": ["observation", "task", "idea", "reference", "person_note", "session", null]
+                    },
+                    "relations": {
+                        "type": "array",
+                        "maxItems": 5,
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["relation", "to_kind", "to_value", "note"],
+                            "properties": {
+                                "relation": {
+                                    "type": "string",
+                                    "enum": [
+                                        "replaces", "requires", "references", "supports",
+                                        "belongs_to", "decided_by", "refines"
+                                    ]
+                                },
+                                "to_kind": {
+                                    "type": "string",
+                                    "enum": ["entity", "person", "url"]
+                                },
+                                "to_value": { "type": "string", "maxLength": 2048 },
+                                "note": { "type": ["string", "null"] }
+                            }
+                        }
                     }
                 }
             }
@@ -440,7 +490,8 @@ mod tests {
                     "action_items": ["fix the login bug"],
                     "topics": ["rust", "build-systems"],
                     "dates_mentioned": ["next Thursday"],
-                    "kind": "task"
+                    "kind": "task",
+                    "relations": []
                 }))),
             )
             .mount(&server)
@@ -461,6 +512,80 @@ mod tests {
         );
         assert_eq!(tags.dates_mentioned, vec!["next Thursday".to_string()]);
         assert_eq!(tags.kind, Some(TagKind::Task));
+        assert!(tags.relations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn valid_response_with_relations_parses_to_tags() {
+        use engram_core::{ExtractedTarget, RelationKind};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(chat_response_with_tags(json!({
+                    "people": [],
+                    "entities": ["engram"],
+                    "action_items": [],
+                    "topics": ["memory-systems"],
+                    "dates_mentioned": [],
+                    "kind": "reference",
+                    "relations": [
+                        {
+                            "relation": "references",
+                            "to_kind": "url",
+                            "to_value": "https://arxiv.org/abs/2004.04906",
+                            "note": "explicit citation"
+                        },
+                        {
+                            "relation": "belongs_to",
+                            "to_kind": "entity",
+                            "to_value": "Probe 2 experiment",
+                            "note": null
+                        }
+                    ]
+                }))),
+            )
+            .mount(&server)
+            .await;
+
+        let t =
+            OpenAICompatibleTagger::new(config_for(format!("{}/v1", server.uri()), None)).unwrap();
+        let tags = t.tag("anything", None).await.unwrap();
+        assert_eq!(tags.relations.len(), 2);
+        assert_eq!(tags.relations[0].relation, RelationKind::References);
+        assert_eq!(
+            tags.relations[0].target,
+            ExtractedTarget::Url("https://arxiv.org/abs/2004.04906".into())
+        );
+        assert_eq!(tags.relations[0].note.as_deref(), Some("explicit citation"));
+        assert_eq!(tags.relations[1].relation, RelationKind::BelongsTo);
+        assert_eq!(
+            tags.relations[1].target,
+            ExtractedTarget::Entity("Probe 2 experiment".into())
+        );
+        assert_eq!(tags.relations[1].note, None);
+    }
+
+    #[test]
+    fn tags_response_format_includes_relations_array() {
+        let schema = tags_response_format();
+        let props = &schema["json_schema"]["schema"]["properties"];
+        assert!(props.get("relations").is_some(), "relations missing");
+        assert_eq!(props["relations"]["type"], "array");
+        assert_eq!(props["relations"]["maxItems"], 5);
+        let item_props = &props["relations"]["items"]["properties"];
+        assert!(item_props.get("relation").is_some());
+        assert!(item_props.get("to_kind").is_some());
+        assert!(item_props.get("to_value").is_some());
+        // Closed enums on relation + to_kind — pin them so a careless edit
+        // doesn't open the vocabulary.
+        let relation_enum = item_props["relation"]["enum"].as_array().unwrap();
+        assert_eq!(relation_enum.len(), 7);
+        let kind_enum = item_props["to_kind"]["enum"].as_array().unwrap();
+        assert_eq!(kind_enum.len(), 3);
+        for k in ["entity", "person", "url"] {
+            assert!(kind_enum.iter().any(|v| v == k));
+        }
     }
 
     #[tokio::test]
@@ -638,7 +763,7 @@ mod tests {
     /// test) without regressing to the v3 negative-example list (which
     /// backfired in dogfood — the model emitted the listed phrases verbatim).
     #[test]
-    fn tagger_v4_prompt_contains_field_semantics_lead_with_empty_and_kind_isolation() {
+    fn tagger_v5_prompt_contains_field_semantics_lead_with_empty_kind_isolation_and_relations() {
         let p = BUNDLED_TAGGER_PROMPT;
         assert!(
             p.contains("Field semantics"),
@@ -691,16 +816,45 @@ mod tests {
             p.contains("not from the scope's typical content"),
             "v4 prompt must explicitly isolate kind from scope-typical content"
         );
-        // Presets pinned to the bundled version (4 as of M4.1's v4 iteration).
-        assert_eq!(BUNDLED_TAGGER_VERSION, 4);
+        // Presets pinned to the bundled version (5 as of M6.1's tagger-extracted relations).
+        assert_eq!(BUNDLED_TAGGER_VERSION, 5);
         let cfg = OpenAICompatibleConfig::vllm_local();
         assert_eq!(cfg.model_version, BUNDLED_TAGGER_VERSION);
         let cfg = OpenAICompatibleConfig::open_router("k".into(), "m".into());
         assert_eq!(cfg.model_version, BUNDLED_TAGGER_VERSION);
+        // v5 adds the Relations section to the prompt body. Pin the
+        // load-bearing rules so a careless prompt edit doesn't silently
+        // open the relation vocabulary or relax the selectivity framing.
+        assert!(
+            p.contains("relations: default to []"),
+            "v5 prompt must lead the relations description with the empty case"
+        );
+        assert!(
+            p.contains("explicit relational claim"),
+            "v5 prompt must require explicit relational claims (no over-emission)"
+        );
+        for kind in ["url", "entity", "person"] {
+            assert!(
+                p.contains(kind),
+                "v5 prompt must enumerate target kind {kind:?}"
+            );
+        }
+        // Relations vocabulary is closed — all 7 names must appear in the prompt.
+        for r in [
+            "replaces",
+            "requires",
+            "references",
+            "supports",
+            "belongs_to",
+            "decided_by",
+            "refines",
+        ] {
+            assert!(p.contains(r), "v5 prompt must enumerate relation `{r}`");
+        }
     }
 
     #[test]
-    fn tags_response_format_pins_v2_shape() {
+    fn tags_response_format_pins_v5_shape() {
         let v = tags_response_format();
         let schema = &v["json_schema"]["schema"];
         let required = schema["required"].as_array().unwrap();
@@ -713,17 +867,29 @@ mod tests {
                 "action_items",
                 "topics",
                 "dates_mentioned",
-                "kind"
+                "kind",
+                "relations"
             ]
         );
         assert_eq!(schema["properties"]["topics"]["maxItems"], 3);
         assert_eq!(schema["properties"]["entities"]["maxItems"], 3);
+        assert_eq!(schema["properties"]["relations"]["maxItems"], 5);
         // `kind` must allow null on the wire.
         let kind_type = &schema["properties"]["kind"]["type"];
         assert!(
             kind_type.as_array().unwrap().iter().any(|x| x == "null"),
             "kind must be nullable: {kind_type:?}"
         );
+        // relations items pin to the closed vocabularies.
+        let item_props = &schema["properties"]["relations"]["items"]["properties"];
+        assert_eq!(item_props["relation"]["enum"].as_array().unwrap().len(), 7);
+        let to_kind_enum: Vec<&str> = item_props["to_kind"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_str().unwrap())
+            .collect();
+        assert_eq!(to_kind_enum, vec!["entity", "person", "url"]);
     }
 
     #[test]

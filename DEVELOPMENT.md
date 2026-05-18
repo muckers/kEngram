@@ -98,6 +98,8 @@ cargo test --workspace --features integration   # adds a live-Ollama round-trip 
 
 cargo run --bin engram -- serve              # starts the MCP server on 127.0.0.1:8080
 cargo run --bin engram -- worker             # in a second shell — drains pending_embeddings
+cargo run --bin engram -- stats              # corpus + storage telemetry (M6+; operator-facing)
+cargo run --bin engram -- audit migrations   # per-migration audit log (M5.2+)
 ```
 
 Point an MCP-capable client (Claude Code, Claude Desktop, `mcp-inspector`) at `http://127.0.0.1:8080/mcp` (streamable-HTTP transport, per the current MCP spec). Five tools are exposed:

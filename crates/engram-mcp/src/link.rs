@@ -203,7 +203,7 @@ pub async fn unlink_thoughts(
     }
 }
 
-fn validate_target(target: &LinkTarget) -> Result<(), LinkError> {
+pub(crate) fn validate_target(target: &LinkTarget) -> Result<(), LinkError> {
     match target {
         LinkTarget::Thought(_) => Ok(()),
         LinkTarget::Entity(name) | LinkTarget::Person(name) => {

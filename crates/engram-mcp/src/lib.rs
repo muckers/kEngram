@@ -20,8 +20,8 @@ pub mod server;
 pub use backfill::{BackfillError, BackfillReport, embed_backfill};
 pub use capture::{CaptureError, CaptureRequest, CaptureResponse, MAX_CONTENT_LEN, capture};
 pub use drain::{
-    DrainError, DrainReport, DrainTagsReport, MAX_TAG_ATTEMPTS, drain_pending_embeddings,
-    drain_pending_tags,
+    DrainError, DrainReport, DrainTagsReport, MAX_TAG_ATTEMPTS, apply_tagger_relations,
+    drain_pending_embeddings, drain_pending_tags,
 };
 pub use link::{
     LinkError, LinkThoughtsRequest, LinkThoughtsResponse, MAX_LINK_NOTE_LEN, MAX_TARGET_NAME_LEN,

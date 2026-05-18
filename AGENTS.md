@@ -16,6 +16,8 @@ Capture autonomously when something is worth keeping — findings, decisions, re
 
 Link autonomously when the relational structure is obvious (you captured a refinement of a thought you found; a finding that confirms a prior claim). Report the link. **Don't link speculatively** — adjacency isn't a relation. When the natural target of a relation isn't itself a thought (an experiment, a project, a person, a URL), use the typed target fields on `link_thoughts` — `to_entity`, `to_person`, `to_url` — rather than capturing a placeholder thought.
 
+Some edges in `get_related_thoughts` responses have `link_source: "tagger"` — the v5 tagger emits relations from prose automatically (M6.1). Treat them as advisory: useful signal, but lower confidence than `agent`-source edges. If a tagger-emitted edge is wrong, `unlink_thoughts` will soft-delete it. On the next re-tag cycle it may re-emerge; if it keeps doing so the prompt needs iteration (Ron's call, not yours).
+
 Thoughts are immutable. If I tell you a thought is wrong, retract it; don't try to modify.
 
 ## Scopes

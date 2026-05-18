@@ -13,7 +13,10 @@
 //! `insert_thought_embedding` and `mark_embedded`, the next tick re-claims
 //! the row, re-embeds, re-inserts (no-op), and marks embedded — clean.
 
-use engram_core::{Embedder, EmbedderError, Embedding, EmbeddingError, Tagger, ThoughtId};
+use engram_core::{
+    Embedder, EmbedderError, Embedding, EmbeddingError, ExtractedRelation, LinkSource, Tagger,
+    ThoughtId,
+};
 use sqlx::PgPool;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -282,6 +285,10 @@ async fn process_tag_job(
                 let _ = engram_storage::increment_tag_job_attempts(pool, job.thought_id).await;
                 return TagJobOutcome::Transient;
             }
+            // Emit tagger-extracted relations (M6.1). Soft-delete prior
+            // tagger edges first so re-tag cycles produce a clean replacement;
+            // agent-supplied edges are untouched.
+            apply_tagger_relations(pool, job.thought_id, &tags.relations).await;
             if let Err(e) = engram_storage::complete_tag_job(pool, job.thought_id).await {
                 tracing::warn!(
                     thought_id = %job.thought_id,
@@ -317,11 +324,84 @@ async fn process_tag_job(
     }
 }
 
+/// Apply tagger-extracted relations to `thought_links` for a single
+/// thought. Soft-deletes prior tagger-emitted edges from this thought
+/// first (so a re-tag cycle replaces them cleanly without accumulation),
+/// then inserts each emitted relation with `source = 'tagger'`.
+///
+/// Bypass-on-error: a malformed individual emission (e.g., a URL that
+/// fails the `^https?://` CHECK) is logged and skipped — it does not fail
+/// the whole tag job. Operator-visibility for malformed emissions comes
+/// from the warn log.
+pub async fn apply_tagger_relations(
+    pool: &PgPool,
+    from_thought_id: ThoughtId,
+    relations: &[ExtractedRelation],
+) {
+    // Always soft-delete prior tagger edges, even when `relations` is empty,
+    // so removing a previously-emitted edge (the prompt iteration decided
+    // it was a false positive) propagates through on the next re-tag.
+    match engram_storage::soft_delete_tagger_edges_for_thought(pool, from_thought_id).await {
+        Ok(n) if n > 0 => {
+            tracing::debug!(
+                thought_id = %from_thought_id,
+                soft_deleted = n,
+                "tag-drain: soft-deleted prior tagger edges before re-emit",
+            );
+        }
+        Ok(_) => {}
+        Err(err) => {
+            // Don't fail the whole drain on the cleanup step — log and
+            // continue. Subsequent inserts may dedupe or create duplicates
+            // in the worst case; operator sees the warn.
+            tracing::warn!(
+                thought_id = %from_thought_id,
+                error = %err,
+                "tag-drain: failed to soft-delete prior tagger edges; continuing",
+            );
+        }
+    }
+
+    for rel in relations {
+        let target = rel.target.clone().into_link_target();
+        if let Err(err) = crate::link::validate_target(&target) {
+            tracing::warn!(
+                thought_id = %from_thought_id,
+                relation = rel.relation.as_str(),
+                to_kind = target.kind_str(),
+                error = %err,
+                "tag-drain: tagger emitted invalid target; skipping",
+            );
+            continue;
+        }
+        if let Err(err) = engram_storage::insert_link(
+            pool,
+            from_thought_id,
+            rel.relation,
+            &target,
+            LinkSource::Tagger,
+            rel.note.as_deref(),
+        )
+        .await
+        {
+            tracing::warn!(
+                thought_id = %from_thought_id,
+                relation = rel.relation.as_str(),
+                to_kind = target.kind_str(),
+                error = %err,
+                "tag-drain: tagger edge insert failed; continuing",
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::capture::{CaptureRequest, capture};
-    use engram_core::{EmbeddingModel, Scope, Source, TagKind, Tags};
+    use engram_core::{
+        EmbeddingModel, ExtractedTarget, LinkTarget, RelationKind, Scope, Source, TagKind, Tags,
+    };
     use engram_embed::{FakeBehavior, FakeEmbedder};
     use engram_extract::{FakeBehavior as TaggerFakeBehavior, FakeTagger};
 
@@ -659,6 +739,195 @@ mod tests {
         assert!(
             rec.vocab.is_none(),
             "empty vocab should be normalized to None"
+        );
+    }
+
+    // -- M6.1: tagger-extracted relations ---------------------------------
+
+    fn tags_with_relations(rels: Vec<ExtractedRelation>) -> Tags {
+        Tags {
+            kind: Some(TagKind::Reference),
+            relations: rels,
+            ..Tags::default()
+        }
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn drain_tags_inserts_emitted_relations_with_source_tagger(pool: PgPool) {
+        let id = capture_and_enqueue_tag(&pool, "thought citing https://example.com").await;
+        let canned = tags_with_relations(vec![
+            ExtractedRelation {
+                relation: RelationKind::References,
+                target: ExtractedTarget::Url("https://example.com".into()),
+                note: Some("explicit citation".into()),
+            },
+            ExtractedRelation {
+                relation: RelationKind::BelongsTo,
+                target: ExtractedTarget::Entity("Probe 2".into()),
+                note: None,
+            },
+        ]);
+        let tagger = FakeTagger::with_canned(canned);
+        let report = drain_pending_tags(&pool, &tagger, 10, None).await.unwrap();
+        assert_eq!(report.completed, 1);
+
+        let related = engram_storage::fetch_related_thoughts(
+            &pool,
+            id,
+            None,
+            None,
+            engram_core::LinkDirection::Outbound,
+        )
+        .await
+        .unwrap();
+        assert_eq!(related.len(), 2);
+        // All inserted edges have source = Tagger.
+        for r in &related {
+            assert_eq!(r.link_source, LinkSource::Tagger);
+        }
+        let kinds: Vec<&'static str> = related.iter().map(|r| r.target.kind_str()).collect();
+        assert!(kinds.contains(&"url"));
+        assert!(kinds.contains(&"entity"));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn drain_tags_re_run_soft_deletes_prior_tagger_edges_then_inserts_fresh(pool: PgPool) {
+        let id = capture_and_enqueue_tag(&pool, "first pass").await;
+
+        // First drain: emit one URL relation.
+        let first = tags_with_relations(vec![ExtractedRelation {
+            relation: RelationKind::References,
+            target: ExtractedTarget::Url("https://old.example".into()),
+            note: None,
+        }]);
+        let tagger = FakeTagger::with_canned(first);
+        drain_pending_tags(&pool, &tagger, 10, None).await.unwrap();
+
+        let after_first = engram_storage::fetch_related_thoughts(
+            &pool,
+            id,
+            None,
+            None,
+            engram_core::LinkDirection::Outbound,
+        )
+        .await
+        .unwrap();
+        assert_eq!(after_first.len(), 1);
+        assert_eq!(
+            after_first[0].target,
+            LinkTarget::Url("https://old.example".into())
+        );
+
+        // Re-enqueue and re-drain with a different emission.
+        engram_storage::enqueue_tag_job(&pool, id, "fake/tagger")
+            .await
+            .unwrap();
+        let second = tags_with_relations(vec![ExtractedRelation {
+            relation: RelationKind::References,
+            target: ExtractedTarget::Url("https://new.example".into()),
+            note: None,
+        }]);
+        let tagger = FakeTagger::with_canned(second);
+        drain_pending_tags(&pool, &tagger, 10, None).await.unwrap();
+
+        let after_second = engram_storage::fetch_related_thoughts(
+            &pool,
+            id,
+            None,
+            None,
+            engram_core::LinkDirection::Outbound,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            after_second.len(),
+            1,
+            "old edge soft-deleted, new edge inserted; fetch excludes soft-deleted"
+        );
+        assert_eq!(
+            after_second[0].target,
+            LinkTarget::Url("https://new.example".into())
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn drain_tags_preserves_agent_edges_during_retag(pool: PgPool) {
+        let a = capture_and_enqueue_tag(&pool, "thought A").await;
+        let b = capture_and_enqueue_tag(&pool, "thought B").await;
+
+        // Agent-supplied edge from a to b.
+        engram_storage::insert_link(
+            &pool,
+            a,
+            RelationKind::Refines,
+            &LinkTarget::Thought(b),
+            LinkSource::Agent,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Tagger-supplied URL edge from a, then drain re-runs with different relations.
+        let canned = tags_with_relations(vec![ExtractedRelation {
+            relation: RelationKind::References,
+            target: ExtractedTarget::Url("https://new.example".into()),
+            note: None,
+        }]);
+        let tagger = FakeTagger::with_canned(canned);
+        drain_pending_tags(&pool, &tagger, 10, None).await.unwrap();
+
+        let related = engram_storage::fetch_related_thoughts(
+            &pool,
+            a,
+            None,
+            None,
+            engram_core::LinkDirection::Outbound,
+        )
+        .await
+        .unwrap();
+        // The agent edge survives the tag drain.
+        assert!(related.iter().any(|r| r.link_source == LinkSource::Agent));
+        // And the tagger edge is present.
+        assert!(related.iter().any(|r| r.link_source == LinkSource::Tagger));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn drain_tags_skips_invalid_target_continues_others(pool: PgPool) {
+        let id = capture_and_enqueue_tag(&pool, "thought with mixed-validity relations").await;
+        // First emission has a non-http URL (DB + validate_target reject).
+        // Second is well-formed; should still land.
+        let canned = tags_with_relations(vec![
+            ExtractedRelation {
+                relation: RelationKind::References,
+                target: ExtractedTarget::Url("ftp://bad.example".into()),
+                note: None,
+            },
+            ExtractedRelation {
+                relation: RelationKind::References,
+                target: ExtractedTarget::Url("https://good.example".into()),
+                note: None,
+            },
+        ]);
+        let tagger = FakeTagger::with_canned(canned);
+        let report = drain_pending_tags(&pool, &tagger, 10, None).await.unwrap();
+        // Drain itself doesn't fail — the bad emission is logged & skipped.
+        assert_eq!(report.completed, 1);
+        assert_eq!(report.failed_transient, 0);
+        assert_eq!(report.failed_permanent, 0);
+
+        let related = engram_storage::fetch_related_thoughts(
+            &pool,
+            id,
+            None,
+            None,
+            engram_core::LinkDirection::Outbound,
+        )
+        .await
+        .unwrap();
+        assert_eq!(related.len(), 1);
+        assert_eq!(
+            related[0].target,
+            LinkTarget::Url("https://good.example".into())
         );
     }
 }

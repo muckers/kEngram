@@ -1137,6 +1137,33 @@ pub async fn delete_link(
     Ok(row.map(|r| LinkId::from(r.id)))
 }
 
+/// Soft-delete all live (`deleted_at IS NULL`) edges where this thought is
+/// the `from` side AND `source = 'tagger'`. Used by the tag drainer (M6.1)
+/// to invalidate prior tagger-emitted edges before inserting fresh ones on
+/// re-tag. Returns the count of soft-deleted rows for observability.
+///
+/// Agent-supplied edges (`source = 'agent'`) are unaffected — the operator
+/// has explicit authority over those, and a tagger-prompt iteration must
+/// not silently erase them.
+pub async fn soft_delete_tagger_edges_for_thought(
+    pool: &PgPool,
+    from_thought_id: ThoughtId,
+) -> Result<i64, StorageError> {
+    let result = sqlx::query!(
+        r#"
+        UPDATE thought_links
+        SET deleted_at = NOW()
+        WHERE from_thought_id = $1
+          AND source = 'tagger'
+          AND deleted_at IS NULL
+        "#,
+        from_thought_id.into_uuid(),
+    )
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() as i64)
+}
+
 /// Walk edges from a given thought. `direction` selects whether to
 /// traverse outbound (where `thought_id` is `from`), inbound (where
 /// `thought_id` is `to`), or both. `relations`, when supplied, restricts
@@ -1467,6 +1494,266 @@ struct VectorSearchRow {
     tags_extractor_version: Option<i32>,
     tags_extracted_at: Option<OffsetDateTime>,
     distance: f64,
+}
+
+// -- M6.0: corpus stats (operator-facing telemetry) ---------------------
+//
+// `corpus_stats` aggregates counts, byte totals, and per-table storage
+// sizes into a single CorpusStats struct for the `engram stats` CLI
+// subcommand. Postgres-specific: uses pg_class / pg_relation_size /
+// pg_database_size, which means corpus_stats can't move out of the
+// Postgres-only storage layer.
+
+#[derive(Debug, Clone)]
+pub struct CorpusStats {
+    pub thoughts: ThoughtStats,
+    pub embeddings: Vec<EmbeddingModelCount>,
+    pub links: LinkStats,
+    pub queues: QueueStats,
+    pub scopes: Vec<ScopeSummary>,
+    pub storage: Vec<TableSize>,
+    pub database_total_bytes: i64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ThoughtStats {
+    pub live: i64,
+    pub retracted: i64,
+    pub untagged: i64,
+    pub content_bytes_total: i64,
+    pub content_bytes_avg: i64,
+    pub tags_bytes_total: i64,
+    pub metadata_bytes_total: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddingModelCount {
+    pub model_id: String,
+    pub model_version: i32,
+    pub dimensions: i32,
+    pub count: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct LinkStats {
+    pub live: i64,
+    pub soft_deleted: i64,
+    pub by_relation: Vec<(String, i64)>,
+    pub by_kind: Vec<(String, i64)>,
+    pub by_source: Vec<(String, i64)>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct QueueStats {
+    pub pending_embeddings: i64,
+    pub pending_tags: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableSize {
+    pub table: String,
+    pub heap_bytes: i64,
+    pub indexes_bytes: i64,
+    pub total_bytes: i64,
+}
+
+/// Count of rows currently in `pending_tags`. Sibling of `count_pending`
+/// (which covers `pending_embeddings`).
+pub async fn count_pending_tags(pool: &PgPool) -> Result<i64, StorageError> {
+    let row = sqlx::query!(r#"SELECT COUNT(*) AS "count!" FROM pending_tags"#)
+        .fetch_one(pool)
+        .await?;
+    Ok(row.count)
+}
+
+/// Aggregate corpus + storage telemetry. `scope_prefix` only filters the
+/// `scopes` summary section (passed through to `list_scopes(prefix)`);
+/// all other counts and byte totals are corpus-global.
+///
+/// Postgres-specific: uses `pg_class`, `pg_relation_size`,
+/// `pg_indexes_size`, `pg_total_relation_size`, and `pg_database_size`
+/// from the Postgres system catalogs. These can't be checked via
+/// `sqlx::query!` (the macro doesn't introspect system catalogs), so the
+/// table-size query uses the runtime-checked `sqlx::query()` form —
+/// matches the `insert_embedding` precedent for pgvector binds.
+pub async fn corpus_stats(
+    pool: &PgPool,
+    scope_prefix: Option<&str>,
+) -> Result<CorpusStats, StorageError> {
+    // 1. Thoughts aggregates (one query, FILTER aggregates).
+    let t_row = sqlx::query!(
+        r#"
+        SELECT
+            COUNT(*) FILTER (WHERE retracted_at IS NULL)             AS "live!",
+            COUNT(*) FILTER (WHERE retracted_at IS NOT NULL)         AS "retracted!",
+            COUNT(*) FILTER (WHERE tags_extractor_version IS NULL
+                              AND retracted_at IS NULL)              AS "untagged!",
+            COALESCE(SUM(LENGTH(content))         FILTER (WHERE retracted_at IS NULL), 0)::bigint
+                AS "content_bytes_total!",
+            COALESCE(AVG(LENGTH(content))         FILTER (WHERE retracted_at IS NULL), 0)::bigint
+                AS "content_bytes_avg!",
+            COALESCE(SUM(LENGTH(tags::text))      FILTER (WHERE retracted_at IS NULL), 0)::bigint
+                AS "tags_bytes_total!",
+            COALESCE(SUM(LENGTH(metadata::text))  FILTER (WHERE retracted_at IS NULL), 0)::bigint
+                AS "metadata_bytes_total!"
+        FROM thoughts
+        "#,
+    )
+    .fetch_one(pool)
+    .await?;
+    let thoughts = ThoughtStats {
+        live: t_row.live,
+        retracted: t_row.retracted,
+        untagged: t_row.untagged,
+        content_bytes_total: t_row.content_bytes_total,
+        content_bytes_avg: t_row.content_bytes_avg,
+        tags_bytes_total: t_row.tags_bytes_total,
+        metadata_bytes_total: t_row.metadata_bytes_total,
+    };
+
+    // 2. Embeddings by model. Vector dims are constant within a model id;
+    // sample one row per group to recover the dimension.
+    let e_rows = sqlx::query!(
+        r#"
+        SELECT
+            model_id,
+            model_version,
+            COUNT(*) AS "count!",
+            (vector_dims((SELECT vector FROM embeddings e2
+                          WHERE e2.model_id = e.model_id
+                            AND e2.model_version = e.model_version
+                          LIMIT 1))) AS "dimensions!"
+        FROM embeddings e
+        GROUP BY model_id, model_version
+        ORDER BY model_id, model_version
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+    let embeddings: Vec<EmbeddingModelCount> = e_rows
+        .into_iter()
+        .map(|r| EmbeddingModelCount {
+            model_id: r.model_id,
+            model_version: r.model_version,
+            dimensions: r.dimensions,
+            count: r.count,
+        })
+        .collect();
+
+    // 3. Link stats — live/soft-deleted counts + group-by aggregates.
+    let l_row = sqlx::query!(
+        r#"
+        SELECT
+            COUNT(*) FILTER (WHERE deleted_at IS NULL)     AS "live!",
+            COUNT(*) FILTER (WHERE deleted_at IS NOT NULL) AS "soft_deleted!"
+        FROM thought_links
+        "#,
+    )
+    .fetch_one(pool)
+    .await?;
+    let by_relation = sqlx::query!(
+        r#"
+        SELECT relation, COUNT(*) AS "count!"
+        FROM thought_links
+        WHERE deleted_at IS NULL
+        GROUP BY relation
+        ORDER BY COUNT(*) DESC, relation ASC
+        "#,
+    )
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|r| (r.relation, r.count))
+    .collect();
+    let by_kind = sqlx::query!(
+        r#"
+        SELECT to_kind, COUNT(*) AS "count!"
+        FROM thought_links
+        WHERE deleted_at IS NULL
+        GROUP BY to_kind
+        ORDER BY COUNT(*) DESC, to_kind ASC
+        "#,
+    )
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|r| (r.to_kind, r.count))
+    .collect();
+    let by_source = sqlx::query!(
+        r#"
+        SELECT source, COUNT(*) AS "count!"
+        FROM thought_links
+        WHERE deleted_at IS NULL
+        GROUP BY source
+        ORDER BY COUNT(*) DESC, source ASC
+        "#,
+    )
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|r| (r.source, r.count))
+    .collect();
+    let links = LinkStats {
+        live: l_row.live,
+        soft_deleted: l_row.soft_deleted,
+        by_relation,
+        by_kind,
+        by_source,
+    };
+
+    // 4. Queue depths.
+    let queues = QueueStats {
+        pending_embeddings: count_pending(pool).await?,
+        pending_tags: count_pending_tags(pool).await?,
+    };
+
+    // 5. Scopes summary (reuses list_scopes; scope_prefix only applies here).
+    let scopes = list_scopes(pool, scope_prefix).await?;
+
+    // 6. Per-table sizes via pg_class system catalog. Restricted to public
+    // schema regular tables (`relkind='r'`) so we don't surface pg_catalog
+    // or sqlx's _sqlx_migrations table cruft. Runtime-checked query (the
+    // macro doesn't introspect system catalogs).
+    let storage_rows: Vec<(String, i64, i64, i64)> = sqlx::query_as(
+        r#"
+        SELECT
+            c.relname::text AS table_name,
+            pg_relation_size(c.oid)::bigint AS heap_bytes,
+            pg_indexes_size(c.oid)::bigint AS indexes_bytes,
+            pg_total_relation_size(c.oid)::bigint AS total_bytes
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'public' AND c.relkind = 'r'
+        ORDER BY pg_total_relation_size(c.oid) DESC
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+    let storage = storage_rows
+        .into_iter()
+        .map(
+            |(table, heap_bytes, indexes_bytes, total_bytes)| TableSize {
+                table,
+                heap_bytes,
+                indexes_bytes,
+                total_bytes,
+            },
+        )
+        .collect();
+
+    let db_row: (i64,) = sqlx::query_as("SELECT pg_database_size(current_database())::bigint")
+        .fetch_one(pool)
+        .await?;
+
+    Ok(CorpusStats {
+        thoughts,
+        embeddings,
+        links,
+        queues,
+        scopes,
+        storage,
+        database_total_bytes: db_row.0,
+    })
 }
 
 // -- tests -------------------------------------------------------------------
@@ -1945,6 +2232,7 @@ mod tests {
             topics: vec!["meetings".into()],
             dates_mentioned: vec!["Thursday".into()],
             kind: Some(TagKind::Task),
+            relations: vec![],
         };
         update_thought_tags(&pool, id, &tags, "vllm/qwen2.5-7b-instruct", 1)
             .await
@@ -2830,6 +3118,68 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../../migrations")]
+    async fn soft_delete_tagger_edges_for_thought_only_touches_tagger_source(pool: PgPool) {
+        let a = insert_test_thought(&pool, "A", "global").await;
+        let b = insert_test_thought(&pool, "B", "global").await;
+        // One agent-supplied edge and one tagger-supplied edge from the same thought.
+        insert_link(
+            &pool,
+            a,
+            RelationKind::Refines,
+            &t(b),
+            LinkSource::Agent,
+            None,
+        )
+        .await
+        .unwrap();
+        insert_link(
+            &pool,
+            a,
+            RelationKind::References,
+            &LinkTarget::Url("https://example.com".into()),
+            LinkSource::Tagger,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let n = soft_delete_tagger_edges_for_thought(&pool, a)
+            .await
+            .unwrap();
+        assert_eq!(n, 1, "only the tagger edge should be soft-deleted");
+
+        let live = fetch_related_thoughts(&pool, a, None, None, LinkDirection::Outbound)
+            .await
+            .unwrap();
+        assert_eq!(live.len(), 1, "agent edge survives; tagger edge gone");
+        assert_eq!(live[0].link_source, LinkSource::Agent);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn soft_delete_tagger_edges_for_thought_idempotent_on_already_deleted(pool: PgPool) {
+        let a = insert_test_thought(&pool, "A", "global").await;
+        insert_link(
+            &pool,
+            a,
+            RelationKind::References,
+            &LinkTarget::Url("https://example.com".into()),
+            LinkSource::Tagger,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let first = soft_delete_tagger_edges_for_thought(&pool, a)
+            .await
+            .unwrap();
+        assert_eq!(first, 1);
+        let second = soft_delete_tagger_edges_for_thought(&pool, a)
+            .await
+            .unwrap();
+        assert_eq!(second, 0, "second call finds no live tagger edges");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
     async fn migration_audit_rows_present_for_0009_and_0010(pool: PgPool) {
         let rows = query_migration_audit(&pool, None, 100).await.unwrap();
         let names: Vec<&str> = rows.iter().map(|r| r.migration.as_str()).collect();
@@ -2850,6 +3200,94 @@ mod tests {
         for pair in rows.windows(2) {
             assert!(pair[0].ran_at >= pair[1].ran_at, "expect descending order");
         }
+    }
+
+    // -- M6.0: corpus stats -----------------------------------------------
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn corpus_stats_returns_aggregate_counts(pool: PgPool) {
+        let a = insert_test_thought(&pool, "alpha bravo", "global").await;
+        let b = insert_test_thought(&pool, "charlie delta echo", "global").await;
+        // Retract one so the live/retracted split has both branches.
+        retract_thought(&pool, b, Some("test")).await.unwrap();
+        // Insert a tagger edge + an agent edge to test by_source split.
+        insert_link(
+            &pool,
+            a,
+            RelationKind::References,
+            &LinkTarget::Url("https://example.com".into()),
+            LinkSource::Tagger,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let stats = corpus_stats(&pool, None).await.unwrap();
+        assert_eq!(stats.thoughts.live, 1);
+        assert_eq!(stats.thoughts.retracted, 1);
+        // Live thought's content is "alpha bravo" (11 bytes).
+        assert!(stats.thoughts.content_bytes_total >= 11);
+        assert_eq!(stats.links.live, 1);
+        // One link from a tagger source.
+        assert!(
+            stats
+                .links
+                .by_source
+                .iter()
+                .any(|(s, n)| s == "tagger" && *n == 1)
+        );
+        assert!(
+            stats
+                .links
+                .by_kind
+                .iter()
+                .any(|(k, n)| k == "url" && *n == 1)
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn corpus_stats_scope_prefix_filters_scopes_section_only(pool: PgPool) {
+        insert_test_thought(&pool, "a", "rjf.work").await;
+        insert_test_thought(&pool, "b", "rjf.personal").await;
+        insert_test_thought(&pool, "c", "other.scope").await;
+
+        let stats = corpus_stats(&pool, Some("rjf.")).await.unwrap();
+        // Aggregate counts are corpus-global — all 3 thoughts.
+        assert_eq!(stats.thoughts.live, 3);
+        // But the scopes section is prefix-filtered.
+        assert_eq!(stats.scopes.len(), 2);
+        for s in &stats.scopes {
+            assert!(s.scope.as_str().starts_with("rjf."));
+        }
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn corpus_stats_table_sizes_include_thoughts_and_embeddings(pool: PgPool) {
+        let stats = corpus_stats(&pool, None).await.unwrap();
+        let names: Vec<&str> = stats.storage.iter().map(|t| t.table.as_str()).collect();
+        // These two tables always exist and always have non-zero index sizes
+        // (btree pkey at minimum) even on an empty corpus.
+        assert!(names.contains(&"thoughts"));
+        assert!(names.contains(&"embeddings"));
+        assert!(names.contains(&"thought_links"));
+        // Database total is positive.
+        assert!(stats.database_total_bytes > 0);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn corpus_stats_empty_corpus_returns_zeros(pool: PgPool) {
+        let stats = corpus_stats(&pool, None).await.unwrap();
+        assert_eq!(stats.thoughts.live, 0);
+        assert_eq!(stats.thoughts.retracted, 0);
+        assert_eq!(stats.thoughts.content_bytes_total, 0);
+        assert_eq!(stats.thoughts.content_bytes_avg, 0);
+        assert!(stats.embeddings.is_empty());
+        assert_eq!(stats.links.live, 0);
+        assert_eq!(stats.queues.pending_embeddings, 0);
+        assert_eq!(stats.queues.pending_tags, 0);
+        assert!(stats.scopes.is_empty());
+        // pg_class still returns the table list even on an empty corpus.
+        assert!(!stats.storage.is_empty());
     }
 
     // -- M5.x: scope discoverability (list_scopes + scope_prefix) -----------

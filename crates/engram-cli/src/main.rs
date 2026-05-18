@@ -109,6 +109,19 @@ enum Command {
         #[command(subcommand)]
         resource: AuditResource,
     },
+    /// Print corpus + storage telemetry: thought counts, embeddings,
+    /// links, per-scope summary, per-table heap/index/total sizes.
+    /// Operator-facing snapshot of "how much am I storing?" without psql.
+    Stats {
+        /// Optional scope prefix. Only filters which scopes appear in the
+        /// scopes summary section; corpus-global counts stay global.
+        #[arg(long)]
+        scope_prefix: Option<String>,
+        /// Limit the scopes summary section to the N most-recently-used
+        /// scopes. Defaults to 20.
+        #[arg(long, default_value_t = 20)]
+        top_scopes: usize,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -742,6 +755,10 @@ async fn run_tag(
                     );
                     failed += 1;
                 } else {
+                    // M6.1: apply tagger-extracted relations after tags
+                    // persist. Mirrors the worker drainer path so synchronous
+                    // `engram tag` and async drainer behave identically.
+                    engram_mcp::apply_tagger_relations(&pool, t.id, &tags.relations).await;
                     tagged += 1;
                 }
             }
@@ -798,6 +815,10 @@ async fn main() -> anyhow::Result<()> {
                 run_audit_migrations(config, since, limit).await
             }
         },
+        Command::Stats {
+            scope_prefix,
+            top_scopes,
+        } => run_stats(config, scope_prefix, top_scopes).await,
     }
 }
 
@@ -860,4 +881,202 @@ async fn run_bench_rerank(config: Config, corpus: PathBuf) -> anyhow::Result<()>
     let reranker = build_reranker(&config.reranker)?
         .context("bench rerank requires a configured [reranker] section; see DEVELOPMENT.md")?;
     bench::run_bench_rerank(&pool, embedder, reranker, &corpus).await
+}
+
+/// `engram stats` — corpus + storage telemetry snapshot. Read-only; reads
+/// from the live DB and prints a sectional plain-text report. Designed for
+/// "operator wants to know what's stored" without a psql session.
+async fn run_stats(
+    config: Config,
+    scope_prefix: Option<String>,
+    top_scopes: usize,
+) -> anyhow::Result<()> {
+    let pool = PgPoolOptions::new()
+        .max_connections(config.database.max_connections)
+        .connect(&config.database.url)
+        .await
+        .with_context(|| format!("connecting to {}", config.database.url))?;
+
+    let scope_prefix = scope_prefix.filter(|s| !s.is_empty());
+    let stats = engram_storage::corpus_stats(&pool, scope_prefix.as_deref())
+        .await
+        .context("querying corpus_stats")?;
+
+    let now = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| "<now>".into());
+    println!("engram corpus — {now}");
+    println!();
+
+    // -- Corpus section --
+    let retracted_pct = if stats.thoughts.live + stats.thoughts.retracted > 0 {
+        100 * stats.thoughts.retracted / (stats.thoughts.live + stats.thoughts.retracted)
+    } else {
+        0
+    };
+    println!(
+        "  Thoughts:    {} live, {} retracted ({}%), {} untagged",
+        stats.thoughts.live, stats.thoughts.retracted, retracted_pct, stats.thoughts.untagged
+    );
+    println!(
+        "  Content:     {} total (avg {}/thought)",
+        humanize_bytes(stats.thoughts.content_bytes_total),
+        humanize_bytes(stats.thoughts.content_bytes_avg)
+    );
+    if stats.embeddings.is_empty() {
+        println!("  Embeddings:  none");
+    } else {
+        let parts: Vec<String> = stats
+            .embeddings
+            .iter()
+            .map(|e| {
+                format!(
+                    "{} × {} ({}-dim, v{})",
+                    e.count, e.model_id, e.dimensions, e.model_version
+                )
+            })
+            .collect();
+        println!("  Embeddings:  {}", parts.join("; "));
+    }
+    println!(
+        "  Links:       {} live, {} soft-deleted",
+        stats.links.live, stats.links.soft_deleted
+    );
+    if !stats.links.by_relation.is_empty() {
+        let parts: Vec<String> = stats
+            .links
+            .by_relation
+            .iter()
+            .map(|(k, n)| format!("{k} {n}"))
+            .collect();
+        println!("    by relation:   {}", parts.join(", "));
+    }
+    if !stats.links.by_kind.is_empty() {
+        let parts: Vec<String> = stats
+            .links
+            .by_kind
+            .iter()
+            .map(|(k, n)| format!("{k} {n}"))
+            .collect();
+        println!("    by kind:       {}", parts.join(", "));
+    }
+    if !stats.links.by_source.is_empty() {
+        let parts: Vec<String> = stats
+            .links
+            .by_source
+            .iter()
+            .map(|(k, n)| format!("{k} {n}"))
+            .collect();
+        println!("    by source:     {}", parts.join(", "));
+    }
+    println!(
+        "  Queues:      embeddings: {} pending, tags: {} pending",
+        stats.queues.pending_embeddings, stats.queues.pending_tags
+    );
+
+    // -- Scopes section --
+    println!();
+    if stats.scopes.is_empty() {
+        let suffix = scope_prefix
+            .as_deref()
+            .map(|p| format!(" matching prefix {p:?}"))
+            .unwrap_or_default();
+        println!("Scopes (0){suffix}: (no scopes)");
+    } else {
+        let shown = stats.scopes.iter().take(top_scopes).collect::<Vec<_>>();
+        let truncated = stats.scopes.len().saturating_sub(shown.len());
+        let suffix = scope_prefix
+            .as_deref()
+            .map(|p| format!(" matching prefix {p:?}"))
+            .unwrap_or_default();
+        println!(
+            "Scopes ({}){}:{}",
+            stats.scopes.len(),
+            suffix,
+            if truncated > 0 {
+                format!("  (showing top {top_scopes}, {truncated} more hidden)")
+            } else {
+                String::new()
+            }
+        );
+        let max_scope_w = shown
+            .iter()
+            .map(|s| s.scope.as_str().len())
+            .max()
+            .unwrap_or(0);
+        for s in shown {
+            let last_date = s
+                .last_activity_at
+                .format(&time::format_description::well_known::Iso8601::DATE)
+                .unwrap_or_else(|_| "?".into());
+            println!(
+                "  {scope:<width$}  {n} thoughts  last {last}",
+                scope = s.scope.as_str(),
+                width = max_scope_w,
+                n = s.thought_count,
+                last = last_date,
+            );
+        }
+    }
+
+    // -- On-disk tables section --
+    println!();
+    println!(
+        "On-disk tables ({} total):",
+        humanize_bytes(stats.database_total_bytes)
+    );
+    let max_table_w = stats
+        .storage
+        .iter()
+        .map(|t| t.table.len())
+        .max()
+        .unwrap_or(0);
+    for t in &stats.storage {
+        println!(
+            "  {table:<width$}  {total:>9}  (heap {heap}, indexes {idx})",
+            table = t.table,
+            width = max_table_w,
+            total = humanize_bytes(t.total_bytes),
+            heap = humanize_bytes(t.heap_bytes),
+            idx = humanize_bytes(t.indexes_bytes),
+        );
+    }
+
+    Ok(())
+}
+
+/// Format a byte count as a human-readable string using kibi-base units
+/// (1 KB = 1024 bytes; matches what operators see in `du -h` / `psql`'s
+/// `pg_size_pretty`). One decimal place for MB+ to keep precision useful
+/// at small corpus sizes without overwhelming the eye.
+fn humanize_bytes(n: i64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    let n_f = n as f64;
+    if n_f < KB {
+        format!("{n} B")
+    } else if n_f < MB {
+        format!("{:.0} KB", n_f / KB)
+    } else if n_f < GB {
+        format!("{:.1} MB", n_f / MB)
+    } else {
+        format!("{:.2} GB", n_f / GB)
+    }
+}
+
+#[cfg(test)]
+mod stats_tests {
+    use super::*;
+
+    #[test]
+    fn humanize_bytes_renders_unit_scale() {
+        assert_eq!(humanize_bytes(0), "0 B");
+        assert_eq!(humanize_bytes(999), "999 B");
+        assert_eq!(humanize_bytes(1024), "1 KB");
+        assert_eq!(humanize_bytes(40 * 1024), "40 KB");
+        assert_eq!(humanize_bytes(1024 * 1024), "1.0 MB");
+        assert_eq!(humanize_bytes(12 * 1024 * 1024), "12.0 MB");
+        assert_eq!(humanize_bytes(1024_i64.pow(3)), "1.00 GB");
+    }
 }

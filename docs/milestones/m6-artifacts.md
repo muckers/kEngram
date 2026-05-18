@@ -1,4 +1,14 @@
-# M5 — Artifacts
+# M6 — Artifacts (SUPERSEDED)
+
+> **Status:** dropped 2026-05-17. The original M6 (artifacts) was reshaped after a live-corpus measurement and dogfood conversation; engram occupies a high-signal-density "sweet spot" between transcripts and tags, and storing arbitrary long-form documents would dilute that. M5.2's `to_url` link target already covers the "this thought references that external doc" case.
+>
+> The new M6 ships corpus stats CLI + tagger-extracted relations. See `m6-stats-and-tagger-relations.md`.
+>
+> This file is kept as historical reference for the original artifacts design and is no longer the active milestone plan.
+
+---
+
+## (Original) M5 — Artifacts
 
 ## Goal
 
