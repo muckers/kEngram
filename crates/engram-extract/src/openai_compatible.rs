@@ -416,7 +416,16 @@ fn tags_response_format() -> serde_json::Value {
                                     "type": "string",
                                     "enum": ["entity", "person", "url"]
                                 },
-                                "to_value": { "type": "string", "maxLength": 2048 },
+                                // No maxLength — Ollama/llama.cpp's GBNF
+                                // grammar generation chokes on string-length
+                                // caps for some models (e.g.
+                                // qwen3-coder:30b → "failed to load model
+                                // vocabulary required for format"). The
+                                // app-side `link::validate_target` enforces
+                                // 2048-char URL / 200-char name caps anyway,
+                                // so the schema constraint was redundant
+                                // defense-in-depth.
+                                "to_value": { "type": "string" },
                                 "note": { "type": ["string", "null"] }
                             }
                         }
