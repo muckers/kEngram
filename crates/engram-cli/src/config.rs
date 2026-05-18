@@ -206,10 +206,10 @@ pub struct TaggerConfig {
     /// Conventionally `<vendor>/<model>`. Defaults to `"vllm/qwen2.5-7b-instruct"`.
     pub model_id: String,
     /// Schema-version for `thoughts.tags_extractor_version`. Default tracks
-    /// `engram_extract::BUNDLED_TAGGER_VERSION` (currently 4 — the M4.1 v4
-    /// prompt iteration: lead-with-empty entities + structural NAME/DESCRIBE
-    /// test + entities maxItems lowered 5→3 + vocab section softened to
-    /// tie-break). Bump when the prompt or schema changes such that prior
+    /// `engram_extract::BUNDLED_TAGGER_VERSION` (currently 5 — the M6.1
+    /// tagger-extracted-relations addition: prompt + schema gain a
+    /// `relations` field emitting closed-vocabulary edges to non-thought
+    /// targets). Bump when the prompt or schema changes such that prior
     /// tags shouldn't be considered comparable; `engram tag --rerun --since
     /// 1970-01-01T00:00:00Z` then backfills.
     pub model_version: i32,
@@ -246,8 +246,9 @@ impl Default for TaggerConfig {
             // Tracks engram_extract::BUNDLED_TAGGER_VERSION; M4.1 shipped at
             // v2, bumped to v3 (entities anti-padding + kind isolation),
             // bumped to v4 (lead-with-empty entities + vocab softening) after
-            // dogfood revealed the v3 negative-example list backfired.
-            model_version: 4,
+            // dogfood revealed the v3 negative-example list backfired, bumped
+            // to v5 (M6.1) adding tagger-extracted relations.
+            model_version: 5,
             api_key: None,
             timeout_seconds: 60,
             temperature: 0.2,
@@ -358,8 +359,9 @@ mod tests {
         assert_eq!(c.tagger.model_id, "vllm/qwen2.5-7b-instruct");
         // Tracks engram_extract::BUNDLED_TAGGER_VERSION; M4.1 shipped at
         // v2; v3 added entities anti-padding + kind isolation; v4 restructured
-        // entities to lead-with-empty + softened vocab to tie-break.
-        assert_eq!(c.tagger.model_version, 4);
+        // entities to lead-with-empty + softened vocab to tie-break; v5 (M6.1)
+        // added tagger-extracted relations.
+        assert_eq!(c.tagger.model_version, 5);
         assert!(c.tagger.api_key.is_none());
         // Default is the bundled prompt — no file override.
         assert!(c.tagger.system_prompt_file.is_none());
@@ -383,7 +385,7 @@ mod tests {
             .unwrap();
         assert_eq!(c.tagger.provider, "openai-compatible");
         assert_eq!(c.tagger.endpoint, "http://localhost:8000/v1");
-        assert_eq!(c.tagger.model_version, 4);
+        assert_eq!(c.tagger.model_version, 5);
     }
 
     /// Operator can disable scope-vocabulary injection or tune its size via
