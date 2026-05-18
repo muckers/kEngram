@@ -241,7 +241,16 @@ pub async fn search_thoughts(
     if let Some(filter) = request.tag_filter.as_ref()
         && !is_empty_filter(filter)
     {
+        let before = fused.len();
         fused.retain(|h| tags_match_filter(&h.thought.tags, filter));
+        tracing::info!(
+            tag_filter = %filter,
+            retained = fused.len(),
+            removed = before - fused.len(),
+            "search_thoughts: tag_filter applied",
+        );
+    } else if request.tag_filter.is_some() {
+        tracing::debug!("search_thoughts: tag_filter present but empty-object — no-op");
     }
 
     // Optional rerank stage.
