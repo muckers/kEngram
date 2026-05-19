@@ -14,8 +14,27 @@ For design rationale see [`DESIGN.md`](DESIGN.md); per-milestone scope and progr
 
 ## Quick start
 
+### Prereqs
+
+Install once if you don't already have them. See [DEVELOPMENT.md](DEVELOPMENT.md#install-prerequisites) for notes on each.
+
 ```bash
-# 1. Bring up Postgres (see DEVELOPMENT.md for first-time setup)
+# Docker Desktop — https://www.docker.com/products/docker-desktop/
+
+# Rust toolchain (latest stable):
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# sqlx-cli matching the workspace's sqlx 0.8 + Postgres + rustls stack:
+cargo install sqlx-cli --no-default-features --features rustls,postgres
+
+# Ollama (macOS):
+brew install ollama   # or: download from https://ollama.com/
+```
+
+### Run
+
+```bash
+# 1. Bring up Postgres
 docker compose up -d postgres
 
 # 2. Bring up the embedding backend. Ollama runs as a background daemon on
@@ -23,9 +42,9 @@ docker compose up -d postgres
 #    running in a terminal. Then pull the 1024-dim BGE-M3 model:
 ollama pull bge-m3
 
-# 3. Apply migrations
+# 3. Apply migrations (uses sqlx-cli directly; no compilation needed)
 export DATABASE_URL='postgres://engram:engram@localhost:5432/engram'
-cargo run --bin engram -- migrate
+sqlx migrate run
 
 # 4. Terminal 1: the MCP server (binds 127.0.0.1:8080, MCP endpoint at /mcp)
 cargo run --bin engram -- serve
