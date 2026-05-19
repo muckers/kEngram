@@ -103,6 +103,31 @@ stdio-only, so a bridge process is required. The community-standard `mcp-remote`
 }
 ```
 
+**Pointing at a Tailnet (or any non-localhost) host:** add `--allow-http` to the args. `mcp-remote` rejects non-HTTPS URLs by default for anything other than `localhost`; on a Tailnet the mesh is the security boundary, so plain HTTP is the intended Tier 1 deployment. Field-tested working config:
+
+```jsonc
+{
+  "mcpServers": {
+    "engram": {
+      "command": "/opt/homebrew/bin/npx",
+      "args": [
+        "-y",
+        "mcp-remote",
+        "http://<tailnet-host>:8081/mcp",
+        "--allow-http"
+      ]
+    }
+  }
+}
+```
+
+Two gotchas worth knowing:
+
+- **Absolute path to `npx`.** Claude Desktop on macOS doesn't inherit your shell's PATH, so bare `npx` resolves to nothing and the bridge silently fails to start. Use the absolute path (`/opt/homebrew/bin/npx` for Homebrew on Apple Silicon, `/usr/local/bin/npx` on Intel Macs, `which npx` to confirm yours).
+- **Port collisions.** If you're running TEI on `:8080` you've probably moved engram to `:8081` — match that in the URL.
+
+Server-side, the host running engram needs `[server].bind` set to a non-loopback address (`0.0.0.0:<port>` or the Tailscale interface IP) AND `[server].allowed_hosts` populated with the hostnames / IPs the client uses — see [DEVELOPMENT.md Configuration reference](DEVELOPMENT.md#configuration-reference) for the `[server]` table and a worked allowlist example.
+
 Restart Claude Desktop after editing the config.
 
 ### claude.ai (web)
