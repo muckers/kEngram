@@ -542,6 +542,68 @@ Heal-then-drain: finds thoughts missing an embedding row for the active model, e
 
 Exit code is non-zero on partial failure (`failed > 0`), suitable for cron-style retry.
 
+### Migrating between machines
+
+`engram backup` and `engram restore` wrap `pg_dump` / `pg_restore` with a `manifest.json` sidecar (engram version, schema head version, embedder model, tagger version, corpus counts). Restore validates the manifest against the target before touching anything destructive.
+
+**Prereq:** Postgres client tools on PATH on both source and target (`brew install postgresql@16` on macOS; `apt install postgresql-client-16` on Debian/Ubuntu). `pg_dump` and `pg_restore` are the same binaries the Postgres server ships; the client-only package suffices.
+
+**Source machine.** Back up the corpus:
+
+```bash
+cargo run --bin engram -- backup
+# → ./engram-backup-2026-05-19T01-02-46-Z.tar.gz (308.3 KiB)
+#   schema:    11_drop_tags_relations
+#   thoughts:  42 live, 10 retracted
+#   embeddings: 52
+#   links:     96 live
+#   scopes:    5
+#   embedder:  bge-m3:1024 (1024d)
+#   tagger:    vllm/qwen2.5-7b-instruct v7
+```
+
+Defaults to `./engram-backup-<timestamp>.tar.gz`; override with `--to <path>`. Use `--skip-embeddings` to drop embedding rows from the archive (smaller backup; restore requires `engram embed-backfill` to repopulate vectors; HNSW index survives an empty table).
+
+**Transfer.** Plain file move. Over Tailnet:
+
+```bash
+rsync -avP ./engram-backup-*.tar.gz ron@target.tailnet.ts.net:/tmp/
+```
+
+**Target machine.** Prereqs (per the [Install prerequisites](#install-prerequisites) section). On a fresh box: install Docker / Rust / sqlx-cli / Ollama, clone the repo, `docker compose up -d postgres`, then bring the schema to head:
+
+```bash
+sqlx migrate run
+```
+
+Then restore. On an empty target the `--force` flag is unnecessary; on a target with existing thoughts, `--force` is required and the command first prints a dry-run summary:
+
+```bash
+cargo run --bin engram -- restore --from /tmp/engram-backup-*.tar.gz
+# Empty target → proceeds; prints "restored from ... Run `engram stats` to verify."
+
+cargo run --bin engram -- restore --from /tmp/engram-backup-*.tar.gz --force
+# Non-empty target → required; replaces existing data.
+```
+
+**Compatibility checks** run before any destructive operation (skip with `--skip-version-check` only when you understand the implications):
+
+| Mismatch | Outcome |
+|---|---|
+| Target schema head < source | Refuses. Run `sqlx migrate run` on target first. |
+| Target schema head > source | Refuses. Restore on a matching engram version, or use `--skip-version-check`. |
+| Embedder `model_id` / dimensions differ | Warns only — embeddings restore as-is; run `engram embed-backfill` after if you want to recompute under the new model. |
+| Tagger `model_id` or `version` differs | Warns only — tags restore as-is; `engram tag --rerun --since 1970-01-01T00:00:00Z` to refresh. |
+
+**Verify after restore:**
+
+```bash
+cargo run --bin engram -- stats
+# Counts should match the manifest summary printed by `engram backup`.
+```
+
+**Docker-Postgres vs systemd-Postgres** on the target — no practical difference for backup/restore. Both speak the same network Postgres protocol that `pg_dump` and `pg_restore` use; the only thing that has to match is the `DATABASE_URL` (or `ENGRAM_DATABASE__URL` env override).
+
 ## Configuration presets and troubleshooting
 
 ### Preset: vLLM-local tagger (dev)

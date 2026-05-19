@@ -1,0 +1,32 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT target_kind, target_id, model_id FROM pending_embeddings",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "target_kind",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "target_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "model_id",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "b996d9119b60203900b7b755be2fd680a69c4104ce00d7c73f3f10b74193e93c"
+}

@@ -1,4 +1,4 @@
-# M6 — Operational maturity
+# M7 — Operational maturity
 
 ## Goal
 
@@ -10,7 +10,7 @@ This milestone is omnibus by design. It bundles the operational concerns that ea
 
 - **Prometheus `/metrics` endpoint.** Exposed on the same axum server. Metrics: capture-rate, search-latency P50/P95/P99 (per tool), embedding-queue depth, embedder failure count, tagger-queue depth, tagger failure count.
 - **Tier 2 auth.** Bearer tokens validated against a hashed allowlist in a new `engram_tokens` table. Per-token scope-list — a token can be locked to `work.*` and not see `personal.*`. Audit log records `(token_id, tool, args_hash, ts)` for every call. Allow/deny is enforced at the MCP handler layer.
-- **Backup tooling.** Scripts (likely systemd timers + small shell wrappers; the operator's preference) for nightly `pg_dump --format=custom` to a separate disk, weekly off-site copy (Backblaze B2 / rsync.net). A new CLI subcommand `engram restore --from <dump>` for disaster-recovery validation.
+- **Backup tooling.** **`engram backup` / `engram restore` subcommands shipped at M7.0** — wrap `pg_dump`/`pg_restore` with a `manifest.json` sidecar (engram version, schema head version, embedder model, tagger version, corpus counts). Restore validates the manifest against the target before proceeding: numeric schema-head compare (refuses on mismatch), embedder/tagger drift surfaced as warnings, `--force` required only when the target has existing thoughts. Single-file `.tar.gz` archive containing the dump + manifest. The nightly/weekly retention story (systemd timers + off-site copy to Backblaze B2 / rsync.net) is the remaining piece of this scope item.
 - **Eval suite.** Three suites per design doc §13 — capture-recall, cross-model retrieval consistency, LongMemEval-style. Runs via `engram eval --suite <name>`; emits a JSON report. Fixture corpus is a small, version-controlled set of seeded conversations and target queries.
 - **`stats` MCP tool.** Per-scope counts, last activity timestamp, embedding model id and version, tagger model id and version, queue depths.
 - **Tier 1 → Tier 2 deployment guide.** A short ops doc covering the steps to expose engram outside the Tailnet (Cloudflare Tunnel or Caddy + Let's Encrypt; token issuance; revocation).
@@ -66,3 +66,8 @@ No other tool's signature changes; auth is enforced at the MCP-handler level and
 - **Metrics cardinality.** Per-scope metrics are useful but explode cardinality if scopes proliferate. Cap, sample, or aggregate?
 - **Reranker eval integration.** Should the eval suite run cross-model both with and without reranker, to track that as a separate axis?
 - **Tunnel vs. reverse proxy.** Cloudflare Tunnel is the lower-config option; Caddy + Let's Encrypt is the more-portable one. Both, with the tunnel as default in the docs?
+
+## History
+
+- **2026-05-18 — M7.0 ship: backup/restore subcommands.** First M7 surface to land. New `crates/engram-cli/src/backup.rs` (~580 LOC including tests); two new `Command` variants (`Backup` / `Restore`); manifest sidecar (`BackupManifest` struct, version 1) with engram version, RFC3339 created_at, schema head (numeric `head_version` + display `head_name`), all migrations list, full `migration_audit` journal, embedder model_id+dimensions, tagger model_id+version, corpus counts. Restore compatibility model: refuses on schema-head mismatch (numeric compare to avoid "11" vs "9" lex-sort bugs), warns on embedder/tagger drift, requires `--force` only when target has existing thoughts. Smoke-tested end-to-end: backup of live corpus (42 live + 10 retracted thoughts, 52 embeddings, 96 links, 5 scopes) into a fresh `engram_test` database round-tripped with exact-match counts. Postgres client tools (`pg_dump` / `pg_restore`) added as a runtime dependency, documented in DEVELOPMENT.md. Remaining M7 scope: Prometheus /metrics, Tier 2 auth, eval suite, retention cron, tunnel deployment guide.
+

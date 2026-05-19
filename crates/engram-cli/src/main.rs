@@ -5,6 +5,7 @@
 //! worker drops its reflector cron in favour of a plain tag drainer that
 //! runs on the same tick as the embed drainer.
 
+mod backup;
 mod bench;
 mod config;
 
@@ -121,6 +122,40 @@ enum Command {
         /// scopes. Defaults to 20.
         #[arg(long, default_value_t = 20)]
         top_scopes: usize,
+    },
+    /// Back up the database to a portable archive (pg_dump + manifest
+    /// sidecar). Pair with `restore` for machine-to-machine migration.
+    Backup {
+        /// Output archive path. Defaults to
+        /// `./engram-backup-<timestamp>.tar.gz` in the current directory.
+        #[arg(long, value_name = "PATH")]
+        to: Option<PathBuf>,
+        /// Exclude embeddings table data from the archive. Smaller
+        /// backup; restore will require `engram embed-backfill` to
+        /// repopulate vectors. The HNSW index and table definition
+        /// survive empty.
+        #[arg(long)]
+        skip_embeddings: bool,
+    },
+    /// Restore the database from a backup archive. DESTRUCTIVE — replaces
+    /// existing schema and data on the target. Refuses without `--force`
+    /// when the target already has thoughts. Validates the manifest
+    /// against the target's schema head and embedder/tagger config before
+    /// proceeding.
+    Restore {
+        /// Input archive path. Required.
+        #[arg(long, value_name = "PATH")]
+        from: PathBuf,
+        /// Confirm replacement of existing data. Required when the
+        /// target's `thoughts` table is non-empty; unnecessary on a
+        /// freshly-migrated empty database.
+        #[arg(long)]
+        force: bool,
+        /// Skip the manifest compatibility check (schema head, embedder,
+        /// tagger). Advanced — use only when you understand the
+        /// implications.
+        #[arg(long)]
+        skip_version_check: bool,
     },
 }
 
@@ -822,6 +857,15 @@ async fn main() -> anyhow::Result<()> {
             scope_prefix,
             top_scopes,
         } => run_stats(config, scope_prefix, top_scopes).await,
+        Command::Backup {
+            to,
+            skip_embeddings,
+        } => backup::run_backup(config, to, skip_embeddings).await,
+        Command::Restore {
+            from,
+            force,
+            skip_version_check,
+        } => backup::run_restore(config, from, force, skip_version_check).await,
     }
 }
 

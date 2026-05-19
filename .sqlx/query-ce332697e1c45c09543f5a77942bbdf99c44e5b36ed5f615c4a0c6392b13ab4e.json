@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM pending_embeddings",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "ce332697e1c45c09543f5a77942bbdf99c44e5b36ed5f615c4a0c6392b13ab4e"
+}
