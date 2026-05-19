@@ -1,0 +1,25 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE thought_links\n        SET deleted_at = NOW()\n        WHERE from_thought_id = $1\n          AND relation = $2\n          AND to_kind = $3\n          AND to_value = $4\n          AND deleted_at IS NULL\n        RETURNING id\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "e40ff532807865f1f2dcf824567f0d06520a9b60dbad9b0f3957ce2e0cccbecf"
+}

@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            scope AS \"scope!\",\n            COUNT(*) AS \"thought_count!\",\n            MIN(created_at) AS \"first_activity_at!\",\n            MAX(created_at) AS \"last_activity_at!\"\n        FROM thoughts\n        WHERE retracted_at IS NULL\n          AND ($1::text IS NULL OR scope LIKE $1 || '%')\n        GROUP BY scope\n        ORDER BY MAX(created_at) DESC\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "scope!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "thought_count!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "first_activity_at!",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 3,
+        "name": "last_activity_at!",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "9d88698deb16708461e6f31efa242b21c89bf2e5fc5046a59e968b0280765feb"
+}

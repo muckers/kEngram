@@ -1,0 +1,102 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                tl.id AS link_id,\n                tl.relation,\n                tl.to_kind,\n                tl.to_thought_id,\n                tl.to_entity,\n                tl.to_person,\n                tl.to_url,\n                tl.created_at AS link_created_at,\n                tl.source AS link_source,\n                tl.note,\n                t.scope                 AS \"t_scope?\",\n                t.content               AS \"t_content?\",\n                t.created_at            AS \"t_created_at?\",\n                CASE WHEN t.id IS NOT NULL THEN (t.retracted_at IS NOT NULL) END\n                    AS \"t_retracted?\"\n            FROM thought_links tl\n            LEFT JOIN thoughts t ON t.id = tl.to_thought_id\n            WHERE tl.from_thought_id = $1\n              AND tl.deleted_at IS NULL\n              AND (cardinality($2::text[]) = 0 OR tl.relation = ANY($2::text[]))\n              AND (cardinality($3::text[]) = 0 OR tl.to_kind = ANY($3::text[]))\n            ORDER BY tl.created_at DESC\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "link_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "relation",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "to_kind",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "to_thought_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 4,
+        "name": "to_entity",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "to_person",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "to_url",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "link_created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 8,
+        "name": "link_source",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "note",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 10,
+        "name": "t_scope?",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 11,
+        "name": "t_content?",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 12,
+        "name": "t_created_at?",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 13,
+        "name": "t_retracted?",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "TextArray",
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      null
+    ]
+  },
+  "hash": "a66bc38d1d3091d5de1256d2966b74a5e2b7051a328ccf141405bed8bedc0611"
+}

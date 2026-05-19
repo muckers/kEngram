@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT to_kind, COUNT(*) AS \"count!\"\n        FROM thought_links\n        WHERE deleted_at IS NULL\n        GROUP BY to_kind\n        ORDER BY COUNT(*) DESC, to_kind ASC\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "to_kind",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "count!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      null
+    ]
+  },
+  "hash": "ab652a0bcd82768ffe32101491bca41b57f5c6547a03073d06c8bb8974eac060"
+}

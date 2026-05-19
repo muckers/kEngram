@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO pending_embeddings (target_kind, target_id, model_id)\n        SELECT 'thought', t.id, $1\n        FROM thoughts t\n        LEFT JOIN embeddings e\n            ON e.target_kind = 'thought'\n           AND e.target_id = t.id\n           AND e.model_id = $1\n        WHERE e.id IS NULL\n          AND ($2::text IS NULL OR t.scope = $2)\n          AND ($3::text IS NULL OR t.scope LIKE $3 || '%')\n          AND t.retracted_at IS NULL\n        ORDER BY t.created_at ASC\n        LIMIT $4\n        ON CONFLICT (target_kind, target_id, model_id) DO NOTHING\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "6a98be28237d107ef6aae0421bc99ad85057193265fdd1b66a809d91613a0b61"
+}

@@ -1,0 +1,25 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT id\n        FROM thought_links\n        WHERE from_thought_id = $1\n          AND relation = $2\n          AND to_kind = $3\n          AND to_value = $4\n          AND deleted_at IS NULL\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "d68ef797a7aaccd53f2db324834242d19009f6ec0cfa50a4a182201df7b99abf"
+}

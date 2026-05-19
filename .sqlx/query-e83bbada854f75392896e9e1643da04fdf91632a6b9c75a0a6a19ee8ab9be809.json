@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE thought_links\n        SET deleted_at = NOW()\n        WHERE from_thought_id = $1\n          AND source = 'tagger'\n          AND deleted_at IS NULL\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e83bbada854f75392896e9e1643da04fdf91632a6b9c75a0a6a19ee8ab9be809"
+}

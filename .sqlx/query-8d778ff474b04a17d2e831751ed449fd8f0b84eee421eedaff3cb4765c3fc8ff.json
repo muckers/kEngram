@@ -1,0 +1,82 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT id, scope, content, source, created_at, metadata,\n               content_fingerprint, tags,\n               tags_extractor_model, tags_extractor_version, tags_extracted_at\n        FROM thoughts\n        WHERE id = $1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "scope",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "content",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "source",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 5,
+        "name": "metadata",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 6,
+        "name": "content_fingerprint",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 7,
+        "name": "tags",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 8,
+        "name": "tags_extractor_model",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "tags_extractor_version",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 10,
+        "name": "tags_extracted_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "8d778ff474b04a17d2e831751ed449fd8f0b84eee421eedaff3cb4765c3fc8ff"
+}

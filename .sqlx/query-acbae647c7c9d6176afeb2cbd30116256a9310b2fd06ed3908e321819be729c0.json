@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE thoughts\n        SET retracted_at = NOW(), retracted_reason = $2\n        WHERE id = $1 AND retracted_at IS NULL\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "acbae647c7c9d6176afeb2cbd30116256a9310b2fd06ed3908e321819be729c0"
+}

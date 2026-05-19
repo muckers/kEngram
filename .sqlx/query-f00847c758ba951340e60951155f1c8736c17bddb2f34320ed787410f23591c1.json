@@ -1,0 +1,84 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT id, scope, content, source, created_at, metadata,\n               content_fingerprint, tags,\n               tags_extractor_model, tags_extractor_version, tags_extracted_at\n        FROM thoughts\n        WHERE ($1::text IS NULL OR scope = $1)\n          AND ($2::text IS NULL OR scope LIKE $2 || '%')\n          AND retracted_at IS NULL\n        ORDER BY created_at DESC\n        LIMIT $3\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "scope",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "content",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "source",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 5,
+        "name": "metadata",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 6,
+        "name": "content_fingerprint",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 7,
+        "name": "tags",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 8,
+        "name": "tags_extractor_model",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "tags_extractor_version",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 10,
+        "name": "tags_extracted_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "f00847c758ba951340e60951155f1c8736c17bddb2f34320ed787410f23591c1"
+}

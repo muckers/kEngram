@@ -1,0 +1,46 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE pending_embeddings p\n        SET attempts = p.attempts + 1, last_attempt_at = NOW()\n        FROM (\n            SELECT id FROM pending_embeddings\n            ORDER BY enqueued_at ASC\n            LIMIT $1\n            FOR UPDATE SKIP LOCKED\n        ) AS sub\n        WHERE p.id = sub.id\n        RETURNING p.id, p.target_kind, p.target_id, p.model_id, p.attempts\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "target_kind",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "target_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "model_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "attempts",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "9f59f76f1b3553499d722d496cbe0c20ec8cb4eb162e859a17c2294ce638d848"
+}

@@ -1,0 +1,38 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            model_id,\n            model_version,\n            COUNT(*) AS \"count!\",\n            (vector_dims((SELECT vector FROM embeddings e2\n                          WHERE e2.model_id = e.model_id\n                            AND e2.model_version = e.model_version\n                          LIMIT 1))) AS \"dimensions!\"\n        FROM embeddings e\n        GROUP BY model_id, model_version\n        ORDER BY model_id, model_version\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "model_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "model_version",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 2,
+        "name": "count!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "dimensions!",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      null,
+      null
+    ]
+  },
+  "hash": "51a32c16434bc52de6fa4dd634be8bb3fef13caad13f22f0f7e21861f222523a"
+}

@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE thoughts\n        SET tags = $2,\n            tags_extractor_model = $3,\n            tags_extractor_version = $4,\n            tags_extracted_at = NOW()\n        WHERE id = $1\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Jsonb",
+        "Text",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "709fa9bfd115fdb05a4a6ab8befcfb0d3c12c51ec4a612cd98b144543c7a15c6"
+}

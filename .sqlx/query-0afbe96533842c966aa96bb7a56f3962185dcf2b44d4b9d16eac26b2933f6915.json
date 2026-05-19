@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT tags, tags_extractor_model, tags_extractor_version, tags_extracted_at\n        FROM thoughts\n        WHERE id = $1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "tags",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 1,
+        "name": "tags_extractor_model",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "tags_extractor_version",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 3,
+        "name": "tags_extracted_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "0afbe96533842c966aa96bb7a56f3962185dcf2b44d4b9d16eac26b2933f6915"
+}

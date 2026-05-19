@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO pending_embeddings (target_kind, target_id, model_id)\n        VALUES ($1, $2, $3)\n        ON CONFLICT (target_kind, target_id, model_id) DO NOTHING\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "73ce72e0ac14f5009a739799dbac6aaf4a7240cce9ecbea769f93ebe4897a34b"
+}

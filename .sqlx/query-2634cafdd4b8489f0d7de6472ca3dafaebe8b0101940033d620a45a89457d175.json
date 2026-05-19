@@ -1,0 +1,84 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT t.id, t.scope, t.content, t.source, t.created_at, t.metadata,\n               t.content_fingerprint, t.tags,\n               t.tags_extractor_model, t.tags_extractor_version, t.tags_extracted_at\n        FROM thoughts t\n        LEFT JOIN embeddings e\n            ON e.target_kind = 'thought'\n           AND e.target_id = t.id\n           AND e.model_id = $1\n        WHERE e.id IS NULL\n          AND ($2::text IS NULL OR t.scope = $2)\n          AND t.retracted_at IS NULL\n        ORDER BY t.created_at ASC\n        LIMIT $3\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "scope",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "content",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "source",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 5,
+        "name": "metadata",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 6,
+        "name": "content_fingerprint",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 7,
+        "name": "tags",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 8,
+        "name": "tags_extractor_model",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "tags_extractor_version",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 10,
+        "name": "tags_extracted_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "2634cafdd4b8489f0d7de6472ca3dafaebe8b0101940033d620a45a89457d175"
+}

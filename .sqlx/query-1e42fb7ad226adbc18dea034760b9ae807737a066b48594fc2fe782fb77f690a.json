@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT term AS \"term!\"\n        FROM thoughts,\n             LATERAL jsonb_array_elements_text(tags->'entities') AS term\n        WHERE scope = $1 AND retracted_at IS NULL\n        GROUP BY term\n        ORDER BY COUNT(*) DESC, term ASC\n        LIMIT $2\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "term!",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "1e42fb7ad226adbc18dea034760b9ae807737a066b48594fc2fe782fb77f690a"
+}

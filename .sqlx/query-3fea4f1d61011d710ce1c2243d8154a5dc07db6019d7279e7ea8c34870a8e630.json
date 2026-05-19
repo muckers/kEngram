@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE pending_tags SET attempts = attempts + 1 WHERE thought_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "3fea4f1d61011d710ce1c2243d8154a5dc07db6019d7279e7ea8c34870a8e630"
+}

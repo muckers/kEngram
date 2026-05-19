@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO pending_tags (thought_id, tagger_model_id)\n        VALUES ($1, $2)\n        ON CONFLICT (thought_id) DO NOTHING\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c3139e7adc731cda5f647e7247212726e8e8615b4a238e78b0aea8821a76c7aa"
+}

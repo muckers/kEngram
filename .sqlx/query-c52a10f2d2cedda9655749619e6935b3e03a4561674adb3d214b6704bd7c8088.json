@@ -1,0 +1,56 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            COUNT(*) FILTER (WHERE retracted_at IS NULL)             AS \"live!\",\n            COUNT(*) FILTER (WHERE retracted_at IS NOT NULL)         AS \"retracted!\",\n            COUNT(*) FILTER (WHERE tags_extractor_version IS NULL\n                              AND retracted_at IS NULL)              AS \"untagged!\",\n            COALESCE(SUM(LENGTH(content))         FILTER (WHERE retracted_at IS NULL), 0)::bigint\n                AS \"content_bytes_total!\",\n            COALESCE(AVG(LENGTH(content))         FILTER (WHERE retracted_at IS NULL), 0)::bigint\n                AS \"content_bytes_avg!\",\n            COALESCE(SUM(LENGTH(tags::text))      FILTER (WHERE retracted_at IS NULL), 0)::bigint\n                AS \"tags_bytes_total!\",\n            COALESCE(SUM(LENGTH(metadata::text))  FILTER (WHERE retracted_at IS NULL), 0)::bigint\n                AS \"metadata_bytes_total!\"\n        FROM thoughts\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "live!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "retracted!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "untagged!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "content_bytes_total!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 4,
+        "name": "content_bytes_avg!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 5,
+        "name": "tags_bytes_total!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 6,
+        "name": "metadata_bytes_total!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "c52a10f2d2cedda9655749619e6935b3e03a4561674adb3d214b6704bd7c8088"
+}

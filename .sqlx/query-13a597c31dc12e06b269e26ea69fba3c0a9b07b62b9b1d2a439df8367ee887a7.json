@@ -1,0 +1,77 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                tl.id AS link_id,\n                tl.relation,\n                tl.created_at AS link_created_at,\n                tl.source AS link_source,\n                tl.note,\n                t.id AS thought_id,\n                t.scope,\n                t.content,\n                t.created_at AS thought_created_at,\n                (t.retracted_at IS NOT NULL) AS \"retracted!\"\n            FROM thought_links tl\n            JOIN thoughts t ON t.id = tl.from_thought_id\n            WHERE tl.to_thought_id = $1\n              AND tl.deleted_at IS NULL\n              AND (cardinality($2::text[]) = 0 OR tl.relation = ANY($2::text[]))\n            ORDER BY tl.created_at DESC\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "link_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "relation",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "link_created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 3,
+        "name": "link_source",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "note",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "thought_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 6,
+        "name": "scope",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "content",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "thought_created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 9,
+        "name": "retracted!",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      null
+    ]
+  },
+  "hash": "13a597c31dc12e06b269e26ea69fba3c0a9b07b62b9b1d2a439df8367ee887a7"
+}
