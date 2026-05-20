@@ -359,42 +359,15 @@ async fn run_serve(config: Config) -> anyhow::Result<()> {
     };
 
     let cancel = CancellationToken::new();
-    // Stateful streamable-HTTP mode. rmcp's default; required because strict
-    // MCP clients (e.g. Dart's `ChatMcpiOSClient`) open `GET /mcp` to receive
-    // the optional server→client SSE notification stream and treat a 405
-    // there as handshake-incomplete, even though POST request/response works.
-    // Stateless mode would force that 405 — see rmcp `tower.rs::call` switch
-    // on `stateful_mode`.
-    //
-    // Engram itself has no server-initiated events; the SSE stream stays idle
-    // aside from rmcp's 15s keep-alive pings. POST responses are now
-    // SSE-framed `text/event-stream` (`json_response` is silently ignored
-    // under stateful mode); spec-compliant for MCP 2025-06-18 / 2025-11-25.
-    // The `Mcp-Session-Id` is rmcp-internal — engram tool handlers don't
-    // observe it.
-    //
-    // We disable rmcp's 5-minute idle-session reaper (`keep_alive: None` on
-    // `LocalSessionManager.session_config`). Reason: the reaper's 404 on
-    // post-expiry POSTs is exactly what made Claude Desktop's tool list
-    // "disappear" when the app sat idle, which drove our original stateless
-    // choice. Trade-off: orphan sessions (whose connection silently dropped)
-    // accumulate until process restart, but at ~1-2 KB idle each this is
-    // trivial for engram's single-user deployment. Restart on demand if it
-    // ever matters.
-    //
-    // We also disable SSE priming events (`sse_retry: None` on both the
-    // server config and the session config). Background: rmcp prepends a
-    // priming event with an `id:` field to standalone and request-wise SSE
-    // streams (`id: 0` and `id: 0/0` respectively). Some clients (notably
-    // Dart's `ChatMcpiOSClient`) track the most-recent `id` across all SSE
-    // streams they're reading — including completed POST response streams —
-    // and reuse it as `Last-Event-Id` on the next GET. That routes through
-    // rmcp's request-wise resume path, hits `ChannelClosed`, returns an
-    // empty stream, and the client retries in a loop. Removing primings
-    // eliminates the bogus `Last-Event-Id` source; clients fall back to
-    // their built-in reconnect interval (2-3s) instead of the server's
-    // suggested `retry: 3000` directive — indistinguishable in practice.
-    //
+    // Stateless mode (allowed by MCP Streamable HTTP spec 2025-06-18 for
+    // simple request-response tools). Engram has no per-session state — every
+    // tool is `Result<Response, Error>`, returns synchronously, doesn't push
+    // events. Disabling stateful mode means rmcp never issues a session id,
+    // never runs the idle-session reaper, and therefore can't return
+    // `Session not found` 404s when a long-lived MCP client (Claude Desktop,
+    // mcp-remote bridge) comes back after idling past the 5-minute default.
+    // `json_response: true` pairs naturally — replies are plain JSON, no SSE
+    // framing overhead.
     // DNS-rebinding protection: rmcp ships with a safe default allowlist
     // (`localhost` / `127.0.0.1` / `::1`). Operators binding to a non-loopback
     // interface (Tailnet, LAN) must extend the allowlist via
@@ -402,15 +375,13 @@ async fn run_serve(config: Config) -> anyhow::Result<()> {
     // every request whose Host header isn't `localhost`. Empty config list =
     // keep rmcp's default; non-empty replaces it.
     let mut http_cfg = StreamableHttpServerConfig::default()
-        .with_stateful_mode(true)
-        .with_sse_retry(None);
+        .with_stateful_mode(false)
+        .with_json_response(true);
     if !config.server.allowed_hosts.is_empty() {
         http_cfg = http_cfg.with_allowed_hosts(config.server.allowed_hosts.clone());
     }
-    let mut session_manager = LocalSessionManager::default();
-    session_manager.session_config.keep_alive = None;
-    session_manager.session_config.sse_retry = None;
-    let mcp_service = StreamableHttpService::new(factory, Arc::new(session_manager), http_cfg);
+    let mcp_service =
+        StreamableHttpService::new(factory, LocalSessionManager::default().into(), http_cfg);
 
     let app = axum::Router::new().nest_service("/mcp", mcp_service);
     let listener = tokio::net::TcpListener::bind(bind)
