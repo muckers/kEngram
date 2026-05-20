@@ -23,7 +23,10 @@ use engram_embed::{
 };
 use engram_extract::{OpenAICompatibleConfig as TaggerConfigBuilder, OpenAICompatibleTagger};
 use engram_mcp::EngramServer;
-use futures::stream::{self, Stream};
+use futures::{
+    StreamExt,
+    stream::{self, Stream},
+};
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
@@ -332,20 +335,23 @@ fn build_tagger(c: &TaggerConfig) -> anyhow::Result<ResolvedTagger> {
 /// 405. Strict MCP clients (Dart `ChatMcpiOSClient`) treat that 405 as
 /// handshake-incomplete and never transition past their "connecting" UI
 /// state. This handler intercepts GET *before* the request reaches rmcp,
-/// returns an immediately-open SSE response that emits nothing but bare
-/// keep-alive comments (`:\n\n` every 15 s per the SSE spec), and stays
-/// open until the client disconnects. Engram doesn't push server-initiated
-/// MCP messages, so we never have anything real to send anyway.
+/// returns an immediately-open SSE response that emits an empty comment as
+/// the first frame (so any client gating on "first-event-within-Xs" is
+/// satisfied instantly) and then falls back to periodic keep-alive comments
+/// every 5 s. Engram doesn't push server-initiated MCP messages, so the
+/// stream stays content-free aside from these comments.
 ///
 /// Crucially this stream carries NO `id:` field on any frame. That's the
 /// mechanism that broke iOS in our prior stateful-mode attempts: rmcp's
 /// SSE machinery tags every event with a resumable id like `0/0`, and the
 /// Dart client extracts that id for `Last-Event-Id` on reconnect, which
 /// routes through rmcp's request-wise resume path and produces a tight
-/// retry loop. With no id tags here, the client has nothing to latch onto.
+/// retry loop. Event::default().comment("") emits just `: \n\n`, no id.
 async fn mcp_get_handler() -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    Sse::new(stream::pending::<Result<Event, Infallible>>())
-        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+    tracing::info!("mcp GET stream opened");
+    let immediate = stream::once(async { Ok(Event::default().comment("")) });
+    let rest = stream::pending::<Result<Event, Infallible>>();
+    Sse::new(immediate.chain(rest)).keep_alive(KeepAlive::new().interval(Duration::from_secs(5)))
 }
 
 async fn run_serve(config: Config) -> anyhow::Result<()> {
