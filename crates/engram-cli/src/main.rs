@@ -382,18 +382,34 @@ async fn run_serve(config: Config) -> anyhow::Result<()> {
     // trivial for engram's single-user deployment. Restart on demand if it
     // ever matters.
     //
+    // We also disable SSE priming events (`sse_retry: None` on both the
+    // server config and the session config). Background: rmcp prepends a
+    // priming event with an `id:` field to standalone and request-wise SSE
+    // streams (`id: 0` and `id: 0/0` respectively). Some clients (notably
+    // Dart's `ChatMcpiOSClient`) track the most-recent `id` across all SSE
+    // streams they're reading — including completed POST response streams —
+    // and reuse it as `Last-Event-Id` on the next GET. That routes through
+    // rmcp's request-wise resume path, hits `ChannelClosed`, returns an
+    // empty stream, and the client retries in a loop. Removing primings
+    // eliminates the bogus `Last-Event-Id` source; clients fall back to
+    // their built-in reconnect interval (2-3s) instead of the server's
+    // suggested `retry: 3000` directive — indistinguishable in practice.
+    //
     // DNS-rebinding protection: rmcp ships with a safe default allowlist
     // (`localhost` / `127.0.0.1` / `::1`). Operators binding to a non-loopback
     // interface (Tailnet, LAN) must extend the allowlist via
     // `[server].allowed_hosts` in engram.toml, or the rmcp transport rejects
     // every request whose Host header isn't `localhost`. Empty config list =
     // keep rmcp's default; non-empty replaces it.
-    let mut http_cfg = StreamableHttpServerConfig::default().with_stateful_mode(true);
+    let mut http_cfg = StreamableHttpServerConfig::default()
+        .with_stateful_mode(true)
+        .with_sse_retry(None);
     if !config.server.allowed_hosts.is_empty() {
         http_cfg = http_cfg.with_allowed_hosts(config.server.allowed_hosts.clone());
     }
     let mut session_manager = LocalSessionManager::default();
     session_manager.session_config.keep_alive = None;
+    session_manager.session_config.sse_retry = None;
     let mcp_service = StreamableHttpService::new(factory, Arc::new(session_manager), http_cfg);
 
     let app = axum::Router::new().nest_service("/mcp", mcp_service);
