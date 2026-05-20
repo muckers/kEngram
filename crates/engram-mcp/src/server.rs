@@ -14,10 +14,14 @@ use engram_core::{
 };
 use engram_embed::Reranker;
 use rmcp::{
-    ServerHandler,
+    ErrorData as McpError, RoleServer, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{ServerCapabilities, ServerInfo},
-    schemars, tool, tool_handler, tool_router,
+    model::{
+        InitializeRequestParams, InitializeResult, ProtocolVersion, ServerCapabilities, ServerInfo,
+    },
+    schemars,
+    service::{MaybeSendFuture, RequestContext},
+    tool, tool_handler, tool_router,
 };
 use serde::Deserialize;
 use sqlx::PgPool;
@@ -837,6 +841,37 @@ impl ServerHandler for EngramServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_instructions(SERVER_INSTRUCTIONS)
+    }
+
+    // rmcp 1.6's default `initialize` ignores the client's requested
+    // `protocolVersion` and unconditionally returns `ProtocolVersion::LATEST`.
+    // That breaks clients pinned to an older known-good version (e.g. the iOS
+    // ChatMcpiOSClient asks for `2025-03-26`). Override to echo any version
+    // rmcp itself knows about; fall back to LATEST otherwise.
+    fn initialize(
+        &self,
+        request: InitializeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<InitializeResult, McpError>> + MaybeSendFuture + '_
+    {
+        let client_version = request.protocol_version.clone();
+        if context.peer.peer_info().is_none() {
+            context.peer.set_peer_info(request);
+        }
+        let negotiated = if ProtocolVersion::KNOWN_VERSIONS.contains(&client_version) {
+            client_version.clone()
+        } else {
+            ProtocolVersion::LATEST
+        };
+        if negotiated != ProtocolVersion::LATEST {
+            tracing::info!(
+                client_requested = %client_version,
+                negotiated = %negotiated,
+                "mcp initialize: echoed client's protocol version"
+            );
+        }
+        let info = self.get_info().with_protocol_version(negotiated);
+        std::future::ready(Ok(info))
     }
 }
 
