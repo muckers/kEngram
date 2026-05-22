@@ -113,7 +113,15 @@ impl OpenAICompatibleConfig {
 /// concept-mapping intent statement (topics may be inferred when the
 /// subject is clear; surface lexemes are not required), which had been
 /// de-facto behavior since v4 vocab-softening but wasn't stated.
-pub const BUNDLED_TAGGER_VERSION: i32 = 7;
+/// **v8 (post-v7 dogfood pass 3)** removes Rust from the `topics`
+/// examples list and from the kind=observation exemplar pair. Root
+/// cause: first-item example-list priming caused gemma3:12b to over-
+/// emit `"rust"` as a topic on tech-adjacent thoughts that weren't
+/// about Rust (probes C/D/G of the 2026-05-22 tagger-test scope).
+/// Entities examples still include "Rust" — the surface-only rule
+/// prevents spurious emission there, and it's a legitimate canonical
+/// entity in this corpus.
+pub const BUNDLED_TAGGER_VERSION: i32 = 8;
 
 #[derive(Debug, Clone)]
 pub struct OpenAICompatibleTagger {
@@ -226,7 +234,7 @@ You are a tagging assistant. Given a single thought from a memory service, retur
   4. Is the thought NARRATING current-session activity (\"I just ran X\", \"the search returned Y\", \"this test passed\")?
      - Yes → session. Session-shaped thoughts typically have otherwise-empty arrays.
 
-  5. Otherwise — a pure factual claim about the world with no commitment, no proposal, no definition, no narrative — observation. (\"Rust has stronger memory safety than C.\" \"JSON parsing benefits from SIMD on documents over 1 MB.\")
+  5. Otherwise — a pure factual claim about the world with no commitment, no proposal, no definition, no narrative — observation. (\"Postgres autovacuum thresholds are tunable per-table.\" \"JSON parsing benefits from SIMD on documents over 1 MB.\")
 
   Anti-default: observation is the CATCHALL, not the default. When the thought arguably fits a more specific kind, prefer the more specific kind. A degenerate tagger that classifies every thought as observation is a failure mode v6 is designed to inverse.
 
@@ -234,7 +242,7 @@ You are a tagging assistant. Given a single thought from a memory service, retur
 
 - action_items: short imperative phrases describing tasks the thought commits to or implies (e.g., \"fix the login bug\", \"review the migration plan\"). Empty array if none. Distinct from kind=task: action_items is the per-thought list of items; kind=task is the thought's overall classification.
 
-- topics: 1-3 short tag-like subject categories, lowercase, hyphen-separated, no punctuation. What broad SUBJECT AREA is this thought about? Examples: \"rust\", \"build-systems\", \"team-management\", \"memory-systems\". Topics map prose to canonical subject categories — they may be inferred from context when the subject is clear, even if the exact topic word doesn't appear in the thought. Two thoughts about the same subject (e.g. one mentioning \"trigram retrieval\", another mentioning \"vector similarity\") may share topics (\"information-retrieval\") even with disjoint surface vocabulary. This is concept-mapping behavior, not surface-lexeme lifting. Distinct from entities: a topic is a category the thought falls under; an entity is a specific named thing the thought mentions. A thought naming \"engram\" and \"pgvector\" might have entities [\"engram\", \"pgvector\"] and topics [\"memory-systems\", \"databases\"].
+- topics: 1-3 short tag-like subject categories, lowercase, hyphen-separated, no punctuation. What broad SUBJECT AREA is this thought about? Examples: \"memory-systems\", \"team-management\", \"databases\", \"information-retrieval\". Topics map prose to canonical subject categories — they may be inferred from context when the subject is clear, even if the exact topic word doesn't appear in the thought. Two thoughts about the same subject (e.g. one mentioning \"trigram retrieval\", another mentioning \"vector similarity\") may share topics (\"information-retrieval\") even with disjoint surface vocabulary. This is concept-mapping behavior, not surface-lexeme lifting. Distinct from entities: a topic is a category the thought falls under; an entity is a specific named thing the thought mentions. A thought naming \"engram\" and \"pgvector\" might have entities [\"engram\", \"pgvector\"] and topics [\"memory-systems\", \"databases\"].
 
 - dates_mentioned: any dates or temporal references appearing in the prose (\"next Thursday\", \"Q3\", \"2026-05-15\", \"before the release\"). Free-form strings, copied roughly as they appear. Empty array if none.
 
@@ -1001,8 +1009,8 @@ mod tests {
             "v7 prompt must explicitly document topics as concept-mapping behavior"
         );
 
-        // Presets pinned to v7.
-        assert_eq!(BUNDLED_TAGGER_VERSION, 7);
+        // Presets track BUNDLED_TAGGER_VERSION.
+        assert_eq!(BUNDLED_TAGGER_VERSION, 8);
         let cfg = OpenAICompatibleConfig::vllm_local();
         assert_eq!(cfg.model_version, BUNDLED_TAGGER_VERSION);
         let cfg = OpenAICompatibleConfig::open_router("k".into(), "m".into());
