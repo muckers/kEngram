@@ -16,5 +16,5 @@ pub mod openai_compatible;
 
 pub use fake_tagger::{FakeBehavior, FakeTagger, FakeTaggerOutput, RecordedTag};
 pub use openai_compatible::{
-    BUNDLED_TAGGER_PROMPT, OpenAICompatibleConfig, OpenAICompatibleTagger,
+    BUNDLED_TAGGER_PROMPT, BUNDLED_TAGGER_VERSION, OpenAICompatibleConfig, OpenAICompatibleTagger,
 };

@@ -4,6 +4,7 @@
 //! 3. `--config <path>` (if passed)
 //! 4. `ENGRAM_*` environment variables (nested via `__`, e.g. `ENGRAM_DATABASE__URL`)
 
+use engram_extract::BUNDLED_TAGGER_VERSION;
 use figment::{
     Figment,
     providers::{Env, Format, Serialized, Toml},
@@ -250,17 +251,10 @@ impl Default for TaggerConfig {
             endpoint: "http://localhost:8000/v1".to_string(),
             model_name: "qwen2.5-7b-instruct".to_string(),
             model_id: "vllm/qwen2.5-7b-instruct".to_string(),
-            // Tracks engram_extract::BUNDLED_TAGGER_VERSION; M4.1 shipped at
-            // v2, bumped to v3 (entities anti-padding + kind isolation),
-            // bumped to v4 (lead-with-empty entities + vocab softening) after
-            // dogfood revealed the v3 negative-example list backfired, bumped
-            // to v5 (M6.1) adding tagger-extracted relations, bumped to v6
-            // (post-M6.1 dogfood pass 1) rebalancing kind + surface-only
-            // entities + URL tightening, bumped to v7 (post-M6.1 dogfood
-            // pass 2) after v6 listed adjectival phrases as negative
-            // examples and re-triggered the v3→v4 backfire — v7 drops the
-            // NOT-entities phrase list, relies on the structural test alone.
-            model_version: 7,
+            // Track the bundled const so a prompt-version bump in
+            // engram-extract propagates without a hand-edit here. The
+            // version history lives on `BUNDLED_TAGGER_VERSION` itself.
+            model_version: BUNDLED_TAGGER_VERSION,
             api_key: None,
             timeout_seconds: 60,
             temperature: 0.2,
@@ -369,12 +363,7 @@ mod tests {
         assert_eq!(c.tagger.endpoint, "http://localhost:8000/v1");
         assert_eq!(c.tagger.model_name, "qwen2.5-7b-instruct");
         assert_eq!(c.tagger.model_id, "vllm/qwen2.5-7b-instruct");
-        // Tracks engram_extract::BUNDLED_TAGGER_VERSION; M4.1 shipped at
-        // v2; v3 added entities anti-padding + kind isolation; v4 restructured
-        // entities to lead-with-empty + softened vocab to tie-break; v5 (M6.1)
-        // added tagger-extracted relations; v6 (post-M6.1 dogfood) rebalanced
-        // kind + added surface-only entities rule + tightened URL emission.
-        assert_eq!(c.tagger.model_version, 7);
+        assert_eq!(c.tagger.model_version, BUNDLED_TAGGER_VERSION);
         assert!(c.tagger.api_key.is_none());
         // Default is the bundled prompt — no file override.
         assert!(c.tagger.system_prompt_file.is_none());
@@ -398,7 +387,7 @@ mod tests {
             .unwrap();
         assert_eq!(c.tagger.provider, "openai-compatible");
         assert_eq!(c.tagger.endpoint, "http://localhost:8000/v1");
-        assert_eq!(c.tagger.model_version, 7);
+        assert_eq!(c.tagger.model_version, BUNDLED_TAGGER_VERSION);
     }
 
     /// Operator can disable scope-vocabulary injection or tune its size via
