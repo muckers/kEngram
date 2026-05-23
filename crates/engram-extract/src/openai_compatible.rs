@@ -132,7 +132,26 @@ impl OpenAICompatibleConfig {
 /// pgvector might have topics [memory-systems, databases]") and
 /// the concept-mapping intent statement to teach the field, without
 /// a free-floating priming list.
-pub const BUNDLED_TAGGER_VERSION: i32 = 9;
+/// **v10** was an ephemeral version used as a toml override during
+/// the 2026-05-22 scope_vocab experiment (toggle vocab off, measure).
+/// Not shipped to source — the const skips from 9 to 11.
+/// **v11 (post-v9 dogfood pass 5)** moves topic canonical-form
+/// convergence from in-prompt vocab hints to a post-process
+/// normalization step in `engram-mcp::drain`. The post-v9 retag
+/// revealed a second overreach mechanism: the worker drainer feeds
+/// the scope's established topic vocab into the prompt as canonical
+/// hints, and the LLM treats them as menu items — overreaching on
+/// `"databases"` exactly the way it had previously overreached on
+/// `"rust"`. v11 separates emission (LLM's job — what is this
+/// thought about?) from normalization (post-process — what's the
+/// canonical form?). Topics are no longer fed into the LLM prompt;
+/// after the LLM emits topics, the drainer normalizes each emitted
+/// topic against the scope vocab via string similarity (lowercased
+/// Levenshtein + token-subset detection). Entities continue to
+/// flow into the prompt vocab section — the surface-only rule
+/// prevents entity overreach, and the in-prompt hint preserves
+/// canonical casing/spelling.
+pub const BUNDLED_TAGGER_VERSION: i32 = 11;
 
 #[derive(Debug, Clone)]
 pub struct OpenAICompatibleTagger {
@@ -289,28 +308,27 @@ You are a tagging assistant. Given a single thought from a memory service, retur
 
 /// Render the optional controlled-vocabulary section appended to the system
 /// prompt when scope vocabulary is available. Returns an empty string when
-/// the vocab is `None` or completely empty, so callers can unconditionally
+/// the vocab is `None` or has no entities, so callers can unconditionally
 /// concatenate the result.
+///
+/// v11: only entities render into the prompt. Topics are intentionally
+/// excluded — they get post-process normalization in `engram-mcp::drain`
+/// instead. Entities are surface-bound (the prose must mention them) so
+/// the in-prompt hint helps with canonical casing/spelling without
+/// risking the overreach feedback loop that topics exhibited at v8-v10.
 fn render_vocab_section(vocab: Option<&ScopeVocab>) -> String {
     let Some(v) = vocab else {
         return String::new();
     };
-    if v.is_empty() {
+    if v.entities.is_empty() {
         return String::new();
     }
     let mut out = String::from("\n\n# Controlled vocabulary (this scope's established terms)\n");
-    if !v.topics.is_empty() {
-        out.push_str("Topics already used in this scope: ");
-        out.push_str(&v.topics.join(", "));
-        out.push_str(".\n");
-    }
-    if !v.entities.is_empty() {
-        out.push_str("Entities already used in this scope: ");
-        out.push_str(&v.entities.join(", "));
-        out.push_str(".\n");
-    }
+    out.push_str("Entities already used in this scope: ");
+    out.push_str(&v.entities.join(", "));
+    out.push_str(".\n");
     out.push_str(
-        "These are terms other thoughts in this scope have used. Use one when it accurately describes the thought's subject. Use a more specific or different term when no vocab term is a close fit — precision over consistency.",
+        "These are entity names other thoughts in this scope have used. When a thought genuinely mentions one of them, prefer the established casing/spelling. Do not emit an entity that doesn't appear in the prose just because it's listed here — the surface-only rule still binds.",
     );
     out
 }
@@ -1021,7 +1039,7 @@ mod tests {
         );
 
         // Presets track BUNDLED_TAGGER_VERSION.
-        assert_eq!(BUNDLED_TAGGER_VERSION, 9);
+        assert_eq!(BUNDLED_TAGGER_VERSION, 11);
         let cfg = OpenAICompatibleConfig::vllm_local();
         assert_eq!(cfg.model_version, BUNDLED_TAGGER_VERSION);
         let cfg = OpenAICompatibleConfig::open_router("k".into(), "m".into());
@@ -1074,35 +1092,36 @@ mod tests {
     }
 
     #[test]
-    fn render_vocab_section_lists_topics_and_entities() {
+    fn render_vocab_section_renders_entities_only_not_topics() {
+        // v11: only entities flow into the prompt vocab section. Topics
+        // are intentionally excluded and get post-process normalization
+        // in engram-mcp::drain instead.
         let v = ScopeVocab {
             topics: vec!["rust".into(), "memory-systems".into()],
             entities: vec!["engram".into(), "pgvector".into()],
         };
         let rendered = render_vocab_section(Some(&v));
         assert!(rendered.contains("Controlled vocabulary"));
-        assert!(rendered.contains("rust, memory-systems"));
         assert!(rendered.contains("engram, pgvector"));
-        // v4: vocab is a tie-breaker, not a hard preference.
         assert!(
-            rendered.contains("precision over consistency"),
-            "v4 vocab section must frame vocab as tie-breaker, not dominator"
+            !rendered.contains("Topics already used"),
+            "v11 must not render topics into the prompt vocab section"
         );
         assert!(
-            !rendered.contains("prefer the established form"),
-            "v4 vocab section must not preserve the v2/v3 'prefer established form' framing"
+            !rendered.contains("rust, memory-systems"),
+            "v11 must not list topic vocab in the prompt — topics are post-normalized"
         );
     }
 
     #[test]
-    fn render_vocab_section_omits_empty_arm() {
+    fn render_vocab_section_with_topics_only_is_empty() {
+        // v11: a vocab with topics but no entities renders to nothing, since
+        // topics no longer go through the prompt.
         let topics_only = ScopeVocab {
             topics: vec!["rust".into()],
             entities: vec![],
         };
-        let rendered = render_vocab_section(Some(&topics_only));
-        assert!(rendered.contains("Topics already used"));
-        assert!(!rendered.contains("Entities already used"));
+        assert_eq!(render_vocab_section(Some(&topics_only)), "");
     }
 
     #[tokio::test]
@@ -1133,10 +1152,22 @@ mod tests {
         let sys = body["messages"][0]["content"].as_str().unwrap();
         assert!(
             sys.contains("Controlled vocabulary"),
-            "vocab section must be present in system message"
+            "vocab section must be present in system message when entities are non-empty"
         );
-        assert!(sys.contains("memory-systems"));
-        assert!(sys.contains("engram"));
+        assert!(
+            sys.contains("Entities already used in this scope:"),
+            "vocab section must list entities under the established marker"
+        );
+        assert!(sys.contains("engram"), "entities flow into prompt vocab");
+        // v11: topics no longer render into the prompt — they get post-process
+        // normalization in engram-mcp::drain instead. The bundled prompt's
+        // topics paragraph still mentions "memory-systems" as a prose example
+        // (legitimately), so we assert on the vocab-section marker that the
+        // old render_vocab_section used for topics.
+        assert!(
+            !sys.contains("Topics already used in this scope:"),
+            "v11 must not render a topics sub-section in the vocab block"
+        );
     }
 
     #[tokio::test]

@@ -13,6 +13,7 @@
 //! `insert_thought_embedding` and `mark_embedded`, the next tick re-claims
 //! the row, re-embeds, re-inserts (no-op), and marks embedded — clean.
 
+use crate::normalize;
 use engram_core::{
     Embedder, EmbedderError, Embedding, EmbeddingError, ExtractedRelation, LinkSource, Tagger,
     ThoughtId,
@@ -267,13 +268,26 @@ async fn process_tag_job(
     };
 
     match tagger.tag(&thought.content, vocab.as_ref()).await {
-        Ok(output) => {
+        Ok(mut output) => {
             // `output` is a TagOutput { tags, relations }. The Tags portion
             // is persisted to thoughts.tags JSONB; the relations portion is
             // routed to thought_links via apply_tagger_relations. They are
             // NOT mirrored — thought_links is the canonical store for the
             // link graph; tags.relations is no longer persisted (migration
             // 0011 dropped the field from existing rows).
+
+            // v11 post-process topic normalization. Topics no longer flow
+            // into the LLM prompt (render_vocab_section is entities-only
+            // since v11). Instead, the drainer normalizes emitted topics
+            // against the scope vocab here, after the LLM has emitted them
+            // fresh from the prose. Separates emission (LLM's job) from
+            // canonical-form convergence (post-process). Pass-through when
+            // vocab is absent or has no topics to converge against.
+            if let Some(v) = vocab.as_ref()
+                && !v.topics.is_empty()
+            {
+                output.tags.topics = normalize::normalize_topics(&output.tags.topics, &v.topics);
+            }
             if let Err(e) = engram_storage::update_thought_tags(
                 pool,
                 job.thought_id,

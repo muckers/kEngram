@@ -59,6 +59,82 @@ Lesson: the structural issue was the example list itself, not its
 contents. Entities example list still carries one (it's needed for the
 surface-only rule's clarity) but topics now has none.
 
+### Topic overreach via scope_vocab feedback loop — decision recorded; in-progress fix
+
+**Diagnosis.** Post-v9 corpus-wide retag revealed that v9 only addressed the
+*in-prompt* priming mechanism. A second mechanism persisted: the worker
+drainer fetches the top-N established topic/entity terms from each
+thought's scope (`scope_vocab_limit = Some(50)`) and injects them into the
+prompt as a controlled-vocabulary hint. The intent (v4 design) was
+"tie-break to canonical forms when a thought is genuinely about an
+established subject." In practice the LLM treats the hint list as a menu
+of canonical options and fits new thoughts to whichever ones plausibly
+apply.
+
+This creates a positive feedback loop: noise in early tags (e.g. v7's
+`databases` overreach) becomes "established" in the vocab; subsequent
+retags see those terms as canonical and reapply them; the noise
+self-reinforces indefinitely.
+
+**Empirical evidence (2026-05-22 / 2026-05-23 retag cycles):**
+
+| Configuration | `"databases"` topic count | Overreach (not really about DBs) |
+|---|---:|---:|
+| v8 + scope_vocab on (size=50) | 18 | 13 |
+| v9 + scope_vocab on (size=50) | 16 | 11 |
+| v9 + scope_vocab off          | 10 | 3 |
+
+Disabling vocab dropped overreach by ~77%. But it also killed the
+legitimate benefit: `"rust"` topic disappeared from probe A (which is
+genuinely about Rust) and from `307b0039` (Ron's Rust-preference note),
+because the LLM no longer had a canonical-form hint to reach for.
+
+**Why this isn't fixable with prompt edits alone.** Tagger history (v3→v4
+backfire, v6→v7 repeat) shows that small LLMs don't reliably honor
+"qualifier" instructions like "use these only when the thought is centrally
+about them." The mechanism is sound in principle but the LLM's execution
+is unreliable. Mechanism-level changes are needed.
+
+**Approaches considered:**
+
+- **A. Post-process topic normalization (chosen).** LLM emits topics fresh
+  from prose (no topic vocab in prompt). After response, normalize each
+  emitted topic against the scope vocab using embedding similarity — close
+  matches get substituted with canonical forms; novel emissions pass
+  through. Separates emission (LLM's job) from normalization (post-process).
+- B. Embedding-similarity-filtered vocab in prompt. Per-thought, embed the
+  content and pass only vocab terms semantically close to the thought as
+  hints. More invasive (LLM still in the loop); more code surface.
+- C. Reduce `scope_vocab_size` from 50 to 10. Cheap empirical test; loses
+  long-tail canonical-form convergence; doesn't address the mechanism.
+  Acceptable only if `tag_filter` usage is light.
+
+**Decision: implement Option A** with one refinement — keep *entities*
+in the prompt vocab. Entities are surface-bound (the prose must contain
+the name) so the overreach failure mode doesn't apply to them, and the
+casing/spelling consistency benefit of the in-prompt entity hint is
+worth preserving. Only *topics* get the Option A treatment.
+
+**Concrete change shape:**
+
+1. `render_vocab_section` in `engram-extract` stops rendering the topics
+   sub-section. The entities sub-section keeps its current behavior.
+2. New post-processing step in the tagger flow: after the LLM emits topics,
+   embed each emitted topic + each scope-vocab topic; for each emitted
+   topic, find the best embedding-similarity match in the vocab. If above
+   threshold (initial guess: cosine ≥ 0.85), substitute the canonical form.
+3. `BUNDLED_TAGGER_VERSION` will bump (10 → 11) to mark the behavioral
+   change in provenance.
+4. The `scope_vocab_enabled` flag remains the master switch: when false,
+   no vocab feed AND no normalization. When true, entities-in-prompt +
+   topics-normalized-post.
+
+**The general design lesson (worth recording):** any LLM-driven extraction
+system that uses its own corpus output as feedback into subsequent
+extractions is at risk of self-reinforcing overreach. Separating emission
+from normalization is the structural fix. Not gemma3-specific; applies to
+any controlled-vocabulary-with-LLM pipeline.
+
 ## Open issues
 
 ### 1. "Bob-as-verb" ambiguity (residual)

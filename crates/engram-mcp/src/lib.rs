@@ -12,6 +12,7 @@ pub mod backfill;
 pub mod capture;
 pub mod drain;
 pub mod link;
+mod normalize;
 pub mod relate;
 pub mod retract;
 pub mod search;
