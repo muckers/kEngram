@@ -1,5 +1,20 @@
 # Goal: close the use-mention gap in the tagger prompt
 
+> **Status: PARKED (2026-05-23).** v13 closed the bracketed-enumeration
+> use-mention pattern on `gemma3:12b` and shipped. The 2026-05-23
+> corpus-retag evaluation found that three other discourse patterns
+> (inline parenthetical, distributed comma-separated, quoted-directive
+> in meta-discussion) did NOT generalize from the v13 exemplars. See
+> the "Parked" section in `docs/tagger-improvements.md` for the full
+> residual list and the recipe to resume. This artifact remains as a
+> historical record and as a template for the resumed work.
+>
+> **Do not re-run this artifact unchanged via /goal** — it will burn
+> iterations against the same v13-saturated configuration. Resume only
+> when a larger model is available and after the fixture set has been
+> extended with the iteration-tractable failure shapes documented in
+> `tagger-improvements.md`.
+
 ## Goal
 
 Close the use-mention failure in the engram tagger prompt so that

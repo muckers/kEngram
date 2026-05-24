@@ -298,6 +298,95 @@ future goal artifacts: iterate against the production model when
 feasible; small-model headroom-for-discrimination is real but
 ambiguity-of-failure-class is also real.
 
+**v13 corpus-retag outcome (2026-05-23 evaluation).** Real-corpus
+retag showed v13 landed for one specific discourse signature —
+flat enumeration inside parentheses, mirroring Example 2 in the
+prompt verbatim — and did NOT generalize to three other patterns
+that the diagnostic recommendation thoughts in `engram.tagger-test`
+captured:
+
+- Inline parenthetical clarification: `<NP> (<token> <descriptive>)`
+  — `e48a1944`
+- Distributed comma-separated examples across narrative prose —
+  `c7b15717`
+- Quoted directive content in meta-discussion of directives —
+  `74b46543`
+
+Small-model few-shot learning is literal pattern matching, not
+abstract rule generalization. Each missing pattern would need its
+own exemplar to land.
+
+**Unanticipated v13 wins** (free from gemma3:12b's overall discourse
+improvement, not the prompt diff alone):
+
+- Role descriptors (`ce83b7ba`) no longer routed to `people`
+- GitHub handles (`0e5a528b`) no longer routed to `people`
+- Brainstorm list-shape (`1bfcc158`) collapsed from 16 spurious
+  per-candidate action items to 5 sensible grouping-level items
+- Disjointness tiebreaker on probes A and E now resolves cleanly:
+  bare first names land in `people`, multi-token / org-shape names
+  land in `entities`. The v12 validator strips overlap; gemma3:12b
+  on v13 prompt now produces the dual emission pattern the validator
+  was designed for.
+
+**New issues v13 introduced:**
+
+- Past-tense report verbs extracted as imperatives (`ce83b7ba` has
+  `action_items: ["confirm"]` from "X confirmed Y")
+- Date digit transposition (`1bfcc158` emits `"2004"` for source
+  prose `"Semon 1904"`) — `tag_filter` correctness bug, not just
+  noise
+
+## Parked
+
+The prompt-iteration work on `gemma3:12b` has reached diminishing
+returns. The infrastructure built for v13 (eval harness, fixture
+schema, goal-artifact format) is reusable; resume work post-3090
+when a larger model gives meaningful additional headroom.
+
+**Iteration-tractable (resume here first with a larger model):**
+
+- Use-mention generalization to three additional discourse patterns
+  — inline parenthetical clarification, distributed comma-separated
+  examples, quoted-directive content in meta-discussion. Each needs
+  one new fixture + paired exemplar.
+- Past-tense report verbs extracted as `action_items` (one
+  exemplar: "X confirmed Y" → empty action_items).
+- Resultative-clause "Bob-as-verb" shape — probe E's
+  `<Name> <NP> down to <quantity>` differs from probe B's
+  `<Name> <NP> for <PP>` that v13 closed. One exemplar.
+
+**Model-capacity-bound (probably NER-required regardless of prompt):**
+
+- Compound product names containing first-name tokens — probe D's
+  `Claude Desktop` → "Claude" extracted as person. Survives v11,
+  v12, and v13. Distinct failure class from Bob-as-verb.
+- ALL-CAPS section heading anchoring (`96b470cf`): section labels
+  in body prose get promoted to `entities` while real technical
+  terms in surrounding paragraphs are missed.
+- Date digit transposition (`1bfcc158`'s 1904→2004): `tag_filter`
+  correctness bug. May be deterministic or single-shot; worth a
+  diagnostic re-tag to confirm before treating as parked.
+- Adjectival noun phrase entity inclusion: descriptive NPs continue
+  to be tagged as entities alongside legitimate proper nouns.
+
+**Reusable infrastructure for resumed work:**
+
+- Eval harness: `crates/engram-extract/examples/tagger_eval.rs`
+- Fixture file: `crates/engram-extract/tests/fixtures/use_mention.json`
+  (extensible — add per-failure-shape fixtures alongside)
+- Goal artifact format spec: `docs/goals/README.md`
+- First goal artifact: `docs/goals/use-mention.md` (currently
+  status PARKED; serves as template for the resumed work)
+
+**Recipe to resume:** pull a larger model (Qwen 2.5 32B / Gemma 2
+27B / Qwen3 32B per the Future model upgrades section below) on the
+new hardware, override `TAGGER_MODEL` in the harness command,
+re-baseline at v13 against the existing fixtures to confirm which
+residuals persist at the higher capacity tier, then extend the
+fixture set with the iteration-tractable items above and
+/goal-iterate against the surviving subset.
+
 ## Open issues
 
 ### 1. "Bob-as-verb" ambiguity (residual)
