@@ -253,8 +253,8 @@ model_id = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 timeout_seconds = 30
 
 [tagger]                                                # opt-in
-provider = "openai-compatible"                          # "" = silent-disable; "openai-compatible" or "openrouter"
-endpoint = "http://localhost:8000/v1"                   # vLLM default
+provider = "openai-compatible"                          # "" = silent-disable; "openai-compatible" / "openrouter" / "http"
+endpoint = "http://localhost:8000/v1"                   # vLLM default; ignored when provider = "http"
 model_name = "qwen2.5-7b-instruct"                      # the model the backend serves
 model_id = "vllm/qwen2.5-7b-instruct"                   # provenance written into thoughts.tags_extractor_model
 model_version = 7                                       # tracks BUNDLED_TAGGER_VERSION; see Tagger version history
@@ -264,6 +264,16 @@ temperature = 0.2
 scope_vocab_enabled = true
 scope_vocab_size = 50
 # system_prompt_file = "~/.config/engram/tagger-prompt.txt"
+
+# HTTP-sidecar backend (provider = "http"). Points engram at any tagger
+# sidecar speaking the engram-tagger-protocol wire shape. The reference
+# implementation is crates/engram-tagger-deterministic/ (Rust-native, no
+# LLM); operators can also ship sidecars in Python, Go, etc. See
+# docs/tagger-backends.md + docs/tagger-sidecar-protocol.md.
+# [tagger.http]
+# endpoint = "http://localhost:8081"
+# timeout_seconds = 30
+# api_key = ""                                          # optional bearer
 
 [worker]
 tick_interval_seconds = 5
@@ -325,21 +335,31 @@ When the reranker times out or errors, the pipeline silently degrades to RRF + r
 
 ### `[tagger]`
 
-The tagger is the per-thought metadata sidecar. Empty `provider` is the silent-disable sentinel: capture proceeds, no tag jobs enqueue, the worker doesn't spawn a tag drainer. Flip `provider = "openai-compatible"` (or `"openrouter"`) to enable.
+The tagger is the per-thought metadata sidecar. Empty `provider` is the silent-disable sentinel: capture proceeds, no tag jobs enqueue, the worker doesn't spawn a tag drainer. Flip `provider = "openai-compatible"` (LLM via vLLM / Ollama / OpenRouter) or `"http"` (engram-native HTTP sidecar, any language) to enable. See [`docs/tagger-backends.md`](docs/tagger-backends.md) for the pluggability contract.
 
 | knob | default | what it does |
 |---|---|---|
-| `provider` | `""` | `""` = disabled; `"openai-compatible"` (vLLM, etc.) or `"openrouter"`. |
-| `endpoint` | `"http://localhost:8000/v1"` | `/v1` base URL. vLLM default port. OpenRouter is `"https://openrouter.ai/api/v1"`. |
-| `model_name` | `"qwen2.5-7b-instruct"` | Model name as the backend understands it. For OpenRouter: a model slug like `"anthropic/claude-haiku-4.5"`. |
-| `model_id` | `"vllm/qwen2.5-7b-instruct"` | Engram-side stable identity written into `thoughts.tags_extractor_model`. Conventionally `<vendor>/<model>`. |
+| `provider` | `""` | `""` = disabled; `"openai-compatible"` (vLLM, etc.), `"openrouter"`, or `"http"` (engram-native sidecar — requires `[tagger.http]` below). |
+| `endpoint` | `"http://localhost:8000/v1"` | `/v1` base URL. vLLM default port. OpenRouter is `"https://openrouter.ai/api/v1"`. Ignored when `provider = "http"`. |
+| `model_name` | `"qwen2.5-7b-instruct"` | Model name as the backend understands it. For OpenRouter: a model slug like `"anthropic/claude-haiku-4.5"`. Ignored when `provider = "http"`. |
+| `model_id` | `"vllm/qwen2.5-7b-instruct"` | Engram-side stable identity written into `thoughts.tags_extractor_model`. Conventionally `<vendor>/<model>`. Used by both LLM and HTTP-sidecar providers. |
 | `model_version` | `7` | Tracks `engram_extract::BUNDLED_TAGGER_VERSION`. Written into `thoughts.tags_extractor_version`. Bump when the prompt or schema changes such that prior tags shouldn't be considered comparable; then `engram tag --rerun`. See [Tagger version history](#tagger-version-history-and-safe-re-tag-procedure). |
-| `api_key` | `None` | Bearer token for hosted endpoints. |
-| `timeout_seconds` | `60` | Per-request timeout. vLLM JSON-Schema responses can run long. |
-| `temperature` | `0.2` | Generation temperature. Lower = more deterministic. 0 makes some backends loop. |
-| `system_prompt_file` | `None` | Path to a file containing a custom system prompt. `None` = use `BUNDLED_TAGGER_PROMPT`. Operators who supply a custom prompt are responsible for also bumping `model_version` so provenance stays meaningful; a WARN log is emitted at startup. |
-| `scope_vocab_enabled` | `true` | Inject the top topic + entity terms from the thought's scope into the tagger prompt as a controlled-vocabulary hint. Encourages consistent term reuse across captures. |
-| `scope_vocab_size` | `50` | Top-N established terms (each for topics and entities) fed to the tagger. Larger = more vocabulary stability; smaller = faster emergence of new terms. |
+| `api_key` | `None` | Bearer token for hosted LLM endpoints. The HTTP sidecar provider has its own `[tagger.http].api_key`. |
+| `timeout_seconds` | `60` | Per-request timeout for the LLM provider. The HTTP sidecar provider has its own `[tagger.http].timeout_seconds`. |
+| `temperature` | `0.2` | Generation temperature. Lower = more deterministic. 0 makes some backends loop. LLM provider only. |
+| `system_prompt_file` | `None` | Path to a file containing a custom system prompt. `None` = use `BUNDLED_TAGGER_PROMPT`. Operators who supply a custom prompt are responsible for also bumping `model_version` so provenance stays meaningful; a WARN log is emitted at startup. LLM provider only. |
+| `scope_vocab_enabled` | `true` | Inject the top topic + entity terms from the thought's scope into the tagger prompt as a controlled-vocabulary hint. Encourages consistent term reuse across captures. LLM provider only. |
+| `scope_vocab_size` | `50` | Top-N established terms (each for topics and entities) fed to the tagger. Larger = more vocabulary stability; smaller = faster emergence of new terms. LLM provider only. |
+
+### `[tagger.http]`
+
+Active only when `[tagger].provider = "http"`. Engram POSTs `/tag` against the sidecar's `endpoint` using the [`engram-tagger-protocol`](crates/engram-tagger-protocol/) wire shape. Sidecars can be in any language; the reference implementation is [`engram-tagger-deterministic`](crates/engram-tagger-deterministic/) (a Rust-native zero-LLM tagger). See [`docs/tagger-sidecar-protocol.md`](docs/tagger-sidecar-protocol.md) for the wire contract.
+
+| knob | default | what it does |
+|---|---|---|
+| `endpoint` | `"http://localhost:8081"` | Base URL of the sidecar. The client appends `/tag` to this. |
+| `api_key` | `None` | Optional bearer token sent as `Authorization: Bearer <token>` to the sidecar. |
+| `timeout_seconds` | `60` | Per-request timeout. Sidecars doing CPU inference can run long on first call. |
 
 ### `[worker]`
 
