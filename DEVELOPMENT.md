@@ -137,9 +137,34 @@ curl -sS -X POST http://localhost:8081/tag \
 # expect: {"protocol_version":"1","tags":{"people":["Sarah"],...},"relations":[]}
 ```
 
-Then flip `[tagger]` in your `engram.toml` to the http provider (see Configuration below). Worker logs will show `tagger: resolved config ... provider=http ...` on next restart.
+Then flip `[tagger]` in your `~/.config/engram/engram.toml` to the http provider. Complete block (replace your existing `[tagger]` section with this):
 
-To bring the sidecar down without stopping the rest of the stack: `docker compose --profile tagger stop tagger-deterministic`. To recreate after editing `topic-taxonomy.toml`: `docker compose --profile tagger restart tagger-deterministic` (taxonomy is embedded once at startup).
+```toml
+[tagger]
+provider = "http"
+model_id = "deterministic/gliner-small-v2.1+regex+bge-m3"   # stamped onto thoughts.tags_extractor_model
+model_version = 1                                            # the sidecar's schema version
+
+[tagger.http]
+endpoint = "http://localhost:8081"
+timeout_seconds = 30
+# api_key = "..."   # optional bearer; sidecars on a private network typically omit
+```
+
+The flat `[tagger]` fields openai-compatible uses (`endpoint`, `model_name`, `api_key`, `temperature`, `system_prompt_file`, `scope_vocab_*`) are ignored when `provider = "http"`. Leave them as-is — they'll quietly do nothing — or delete them entirely.
+
+Restart the worker (and `engram serve` if you want clean logs):
+
+```bash
+cargo run --bin engram -- worker
+# expect: "tagger: resolved config ... provider=http ..." in the startup logs
+```
+
+**Port collision watch.** The sidecar's default host port is `8081`, which is also the convention for `engram serve`'s Tier 1 (Tailnet) bind in this doc. If your `[server].bind` uses `0.0.0.0:8081`, you'll need to either change the sidecar's published port (edit `docker-compose.yml` to `"8082:8081"` and update `[tagger.http].endpoint = "http://localhost:8082"`) or change `engram serve`'s bind.
+
+**To bring the sidecar down** without stopping the rest of the stack: `docker compose --profile tagger stop tagger-deterministic`. **To recreate after editing `topic-taxonomy.toml`**: `docker compose --profile tagger restart tagger-deterministic` (taxonomy is embedded once at startup, so a restart is required for new vectors to take effect). **To stop the whole stack and bring back only specific services**: `docker compose down` tears down everything regardless of profile; bring back with `docker compose --profile tagger up -d` (default-profile services + tagger) or omit the profile to leave the sidecar off.
+
+**Switching back to the LLM tagger** is the same shape: change `provider = "openai-compatible"`, restore the LLM `model_id` / `model_version` / `endpoint` / `model_name` fields, restart the worker. The `[tagger.http]` block can stay in the file; it's ignored when `provider != "http"`.
 
 ### 4. Run migrations
 
@@ -404,21 +429,21 @@ Active only when `[tagger].provider = "http"`. Engram POSTs `/tag` against the s
 
 ## Tagger version history and safe re-tag procedure
 
-The tagger's prompt + JSON schema is versioned by `engram_extract::BUNDLED_TAGGER_VERSION` (currently **7**). Each thought row carries a `tags_extractor_version` recording the version it was tagged under, so the drainer can identify stale rows when the version is bumped.
+The tagger's prompt + JSON schema is versioned by `engram_extract::BUNDLED_TAGGER_VERSION` (currently **13** for the openai-compatible LLM backend). Each thought row carries a `tags_extractor_version` recording the version it was tagged under, so the drainer can identify stale rows when the version is bumped.
 
-### Version changelog
+The deterministic HTTP-sidecar backend has its own independent version line (currently **1**) stamped via the sidecar's `MODEL_VERSION` env var. Re-tagging across backends works the same way (`engram tag --rerun`) but the version comparison is per-`tags_extractor_model` — a row stamped by the LLM backend isn't "stale" relative to the deterministic backend's version 1.
 
-- **v1** (M4 launch, 2026-05-16). Initial thoughts-only tagger. Single `topics` field for both proper-noun identifiers and subject categories.
-- **v2** (M4.1, 2026-05-16). Split `topics` into `entities` (proper-noun-style identifiers) + `topics` (subject categories). Added the optional scope-vocabulary controlled-vocab section: the drainer pre-fetches the top-N established terms from the thought's scope and feeds them as a hint so new captures prefer existing vocabulary.
-- **v3** (M4.1 iteration, 2026-05-17). Tightened `entities` to canonical proper names only, with an explicit anti-padding rule. Added a kind-isolation clause forbidding the controlled vocabulary from influencing `kind` classification.
-- **v4** (M4.1 iteration, 2026-05-17). Restructured the `entities` description to lead with the empty case and a structural NAME-vs-DESCRIBE test. (The v3 negative-example list backfired — on thought `047d0ce8` the model emitted those exact phrases verbatim.) Dropped `entities` `maxItems` from 5 to 3. Softened the scope-vocabulary section from "vocab dominates" to "vocab tie-breaks" — precision over consistency.
-- **v5** (M6.1, 2026-05-17). Added tagger-extracted relations: the LLM emits closed-vocabulary `(relation, to_kind, to_value)` edges for explicit relational claims in prose. Non-thought targets only (`entity` / `person` / `url`); the LLM does not synthesise UUIDs.
-- **v6** (post-M6.1 dogfood pass 1, 2026-05-18). Rebalanced `kind` classification as a 5-step decision tree. Added an entity surface-only rule. Tightened URL emission criteria. Listed `embedding-based` and `lexical signals` as literal negative examples — which repeated the v3→v4 backfire pattern (the model emitted those phrases verbatim on `047d0ce8` again).
-- **v7** (post-v6 dogfood pass 2, 2026-05-18). Dropped the literal-phrase NOT-entities list and any suffix hints (e.g. `-based`), relying on the structural NAME-vs-DESCRIBE test, the surface-only rule, and the re-read verification alone. Mirrors v4's clean-pattern fix and documents the v6 lesson explicitly so a v8 doesn't reintroduce phrase hints. Adds an explicit topics-as-concept-mapping intent statement (topics may be inferred when the subject is clear; surface lexemes are not required), which had been de-facto behavior since v4 vocab-softening but wasn't stated.
+### Version changelog (LLM backend)
 
-There's an outstanding doc-only acknowledgement that came with v8 (2026-05-18): the "entities-adjectival regression" — corner-case adjectival phrases sometimes still land as entities — is accepted as structural. v8 is not a tagger version bump (no prompt or schema change), just the documented decision not to chase it further with another phrase-list iteration.
+The full prompt-iteration history (v1 through v13, plus the v14 deterministic-backend transition) lives at [`docs/tagger-improvements.md`](docs/tagger-improvements.md) — the canonical source of decisions, dogfood evaluations, and rationale. Brief summary:
 
-There's also a v9 (2026-05-18) code-side change that dropped `tags.relations` from the persisted JSONB. `thought_links` is now the sole canonical store for tagger-emitted relations; the LLM emission shape is unchanged and `BUNDLED_TAGGER_VERSION` did NOT bump (still 7). Migration 0011 removed the key from existing rows.
+- **v1–v4** (M4, 2026-05-16/17). Initial tagger + entities/topics split + iterative prompt cleanup.
+- **v5** (M6.1, 2026-05-17). Added tagger-extracted relations into `thought_links`.
+- **v6–v9** (post-M6.1 dogfood, 2026-05-18). Kind classification rebalance, NOT-entities-list iteration, topics-as-concept-mapping, `tags.relations` dropped from persisted JSONB (migration 0011).
+- **v10–v13** (2026-05-22/23). Scope-vocab experiment, topic canonical-form normalization moved to post-process, people↔entities disjointness validator, USE-vs-MENTION discipline added to the prompt. v13 is the current bundled default.
+- **v14** (2026-05-24). Not a prompt bump — the pluggability framework + reference HTTP-sidecar tagger (`engram-tagger-deterministic`) shipped. LLM backend default unchanged; deterministic backend is opt-in via `provider = "http"` per the `[tagger.http]` config recipe in Section 3c above.
+
+See [`docs/tagger-backends.md`](docs/tagger-backends.md) for the pluggability contract, [`docs/tagger-sidecar-protocol.md`](docs/tagger-sidecar-protocol.md) for the HTTP-sidecar wire spec, and [`docs/tagger-improvements.md`](docs/tagger-improvements.md) for the v14 head-to-head measurement and rollout rationale.
 
 ### Safe re-tag procedure
 
@@ -426,19 +451,21 @@ After bumping the tagger version (or the bundled default rolls forward and you w
 
 1. **Verify the resolved target version.** Start `engram serve` (or `engram worker`). The startup log line is:
    ```
-   tagger: resolved config ... model_version=7 ...
+   tagger: resolved config ... model_version=13 ...
    ```
    And on the re-tag side, `engram tag` prints:
    ```
-   engram tag starting ... target_version=7 ...
+   engram tag starting ... target_version=13 ...
    ```
-   If `target_version` is lower than expected, your `~/.config/engram/engram.toml` is overriding the bundled default. Bump it manually or delete the line.
+   If `target_version` is lower than expected, your `~/.config/engram/engram.toml` is overriding the bundled default. Bump it manually or delete the `model_version` line so the bundled default takes over.
 
 2. **Re-tag the corpus.** Whole corpus:
    ```bash
    cargo run --bin engram -- tag --rerun --since 1970-01-01T00:00:00Z
    ```
    The drainer walks rows where `tags_extractor_version < target_version`. Bound it tighter if you only want a recent window — `--since 2026-04-01T00:00:00Z` or `--scope-prefix engram.`.
+
+   **Cross-backend retag note.** If you're switching providers (e.g. flipping from `openai-compatible` v13 to `http` v1, or vice-versa), the version comparison no longer maps cleanly — a row stamped `tags_extractor_version = 13` from the LLM backend isn't "stale" relative to the deterministic sidecar's `model_version = 1`. To force a full re-tag under the new backend without bumping its `model_version`, use `--since` with an old date to walk by creation time instead of version: `--rerun --since 1970-01-01T00:00:00Z`. Alternatively, set the new backend's `model_version` to one above the highest existing version on the rows you want re-tagged.
 
 3. **Monitor the worker logs for failures.** The `engram tag complete` line reports `n_candidates`, `tagged`, `failed`. Non-zero `failed` exits non-zero so cron / scripts can detect partial failures; per-row errors are logged at WARN with the `thought_id`.
 
