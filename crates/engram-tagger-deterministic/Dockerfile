@@ -25,8 +25,21 @@ FROM rust:1.95-slim-bookworm AS builder
 
 WORKDIR /workspace
 
-# System deps for compiling ort + protobuf-sys (used by tokenizers).
+# System deps for compiling the native sub-tree:
+# - build-essential: gcc + g++ + make. `cc-rs` (used by several deps under
+#   ort-sys / tokenizers) probes for a C++ compiler by literal name; the
+#   slim base ships `cc` but not `c++`, so without g++ the build fails
+#   with `ToolNotFound: failed to find tool "c++"`.
+# - clang + libclang-dev: `bindgen` (pulled in by tokenizers transitively)
+#   needs libclang at compile time. Without these the build dies later
+#   with "Unable to find libclang".
+# - pkg-config + libssl-dev: reqwest's OpenSSL fallback path (rustls is
+#   the default but the build script probes for OpenSSL anyway).
+# - cmake: required by a handful of native build scripts in the ort tree.
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    clang \
+    libclang-dev \
     pkg-config \
     libssl-dev \
     cmake \
