@@ -8,6 +8,7 @@ members = [
   "crates/engram-mcp",
   "crates/engram-cli",
   "crates/engram-tagger-protocol",
+  "crates/engram-tagger-deterministic",
 ]
 
 [workspace.package]
