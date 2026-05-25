@@ -107,6 +107,40 @@ Then add a `[reranker]` section to your `engram.toml` (see Configuration below) 
 
 The Apple Silicon variant of the image (`cpu-arm64-latest`) is what's pinned. Production deployments use TEI as a systemd-managed sidecar, not Docker — same HTTP interface either way.
 
+### 3c. (Optional) Start the deterministic tagger sidecar
+
+If you want non-LLM tagging (the engram-native HTTP-tagger pattern), the reference sidecar runs in docker-compose under the `tagger` profile. It's opt-in — `docker compose up -d` does NOT start it by default.
+
+**Prerequisites.** Before first `docker compose --profile tagger up`:
+
+1. Download the GLiNER ONNX model to `~/models/gliner_small-v2.1/`. See [`crates/engram-tagger-deterministic/README.md`](crates/engram-tagger-deterministic/README.md#1-download-the-gliner-onnx-model) for the curl invocations (~580MB).
+2. Make sure Ollama is running with `bge-m3` available (the sidecar's default `EMBEDDER_ENDPOINT` points at the host's Ollama via `host.docker.internal:11434`).
+
+```bash
+docker compose --profile tagger up -d tagger-deterministic
+# First build is slow (~5-10 min on Apple Silicon) — cargo compiles
+# gline-rs + ort native deps. Subsequent builds are fast (cached layers).
+docker compose --profile tagger ps tagger-deterministic
+# STATUS should reach "healthy" within ~30s of starting.
+```
+
+Smoke:
+
+```bash
+curl -fsS http://localhost:8081/health
+# expect: {"status":"ok"}
+
+curl -sS -X POST http://localhost:8081/tag \
+  -H 'Content-Type: application/json' \
+  -d '{"protocol_version":"1","content":"Sarah pushed the bge-m3 reranker config."}' \
+  | jq .
+# expect: {"protocol_version":"1","tags":{"people":["Sarah"],...},"relations":[]}
+```
+
+Then flip `[tagger]` in your `engram.toml` to the http provider (see Configuration below). Worker logs will show `tagger: resolved config ... provider=http ...` on next restart.
+
+To bring the sidecar down without stopping the rest of the stack: `docker compose --profile tagger stop tagger-deterministic`. To recreate after editing `topic-taxonomy.toml`: `docker compose --profile tagger restart tagger-deterministic` (taxonomy is embedded once at startup).
+
 ### 4. Run migrations
 
 On a fresh checkout, run migrations with `sqlx-cli` directly — no compilation needed:
