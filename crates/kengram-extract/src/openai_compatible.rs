@@ -1576,11 +1576,12 @@ mod tests {
                 match t.tag(content, None).await {
                     Ok(tags) => {
                         let k = tags
+                            .tags
                             .kind
                             .map(|k| format!("{k:?}").to_lowercase())
                             .unwrap_or_else(|| "null".to_string());
                         observed_kinds.push(k);
-                        observed_entities.push(tags.entities);
+                        observed_entities.push(tags.tags.entities);
                     }
                     Err(e) => {
                         eprintln!("[diagnostic] {short_id} run {} ERR: {e}", run + 1);
@@ -1684,11 +1685,12 @@ mod tests {
                 match t.tag(content, Some(&vocab)).await {
                     Ok(tags) => {
                         let k = tags
+                            .tags
                             .kind
                             .map(|k| format!("{k:?}").to_lowercase())
                             .unwrap_or_else(|| "null".to_string());
                         observed_kinds.push(k);
-                        observed_entities.push(tags.entities);
+                        observed_entities.push(tags.tags.entities);
                     }
                     Err(e) => {
                         eprintln!("[diagnostic-vocab] {short_id} run {} ERR: {e}", run + 1);

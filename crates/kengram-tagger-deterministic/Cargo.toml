@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 authors.workspace = true
+license.workspace = true
 
 # Reference sidecar for the kengram HTTP-tagger wire contract.
 # Bundles a Rust-native deterministic tagger (gline-rs zero-shot NER +

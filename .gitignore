@@ -23,3 +23,6 @@
 
 # OS
 Thumbs.db
+
+# Local agent tooling / config
+.claude/

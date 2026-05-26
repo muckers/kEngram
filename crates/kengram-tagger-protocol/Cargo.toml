@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 authors.workspace = true
+license.workspace = true
 
 # Wire contract for the HTTP tagger sidecar pattern. Defines the JSON
 # request/response shapes that kengram's HTTP-tagger client and any

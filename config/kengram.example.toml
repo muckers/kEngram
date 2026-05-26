@@ -1,0 +1,77 @@
+# Kengram example configuration.
+#
+# Copy this to one of the locations Kengram reads (later wins):
+#   1. ~/.config/kengram/kengram.toml          (auto-loaded if present)
+#   2. a path passed via `kengram --config <path> ...`
+# Every value can also be overridden by a `KENGRAM_*` environment variable,
+# nested with `__` — e.g. `KENGRAM_DATABASE__URL=...`, `KENGRAM_TAGGER__PROVIDER=""`.
+#
+# All sections are optional; omitting one uses the defaults shown below.
+
+[server]
+# Bind address. Tier 0 (localhost) is the default. For Tier 1 (Tailnet/LAN)
+# exposure, change this to the interface IP (or "0.0.0.0:<port>") — no code change.
+bind = "127.0.0.1:8080"
+
+# Host header allowlist for the MCP transport's DNS-rebinding protection.
+# Empty = rmcp's safe default (localhost / 127.0.0.1 / ::1). When binding to a
+# non-loopback interface you MUST list the hostnames AND host:port forms clients
+# use, plus the IP and ip:port forms, or remote requests are rejected:
+#   allowed_hosts = ["localhost", "127.0.0.1", "::1", "myhost", "myhost:8081", "100.x.y.z", "100.x.y.z:8081"]
+allowed_hosts = []
+
+[database]
+url = "postgres://kengram:kengram@localhost:5432/kengram"
+max_connections = 10
+
+[embedder]
+# "openai-compatible" covers Ollama, TEI, OpenAI, and Voyage by varying
+# endpoint/model. Ollama is the zero-config dev path (`ollama pull bge-m3`).
+provider = "openai-compatible"
+endpoint = "http://localhost:11434/v1"
+model = "bge-m3"
+# Kengram-side model identity. Must match the HNSW partial index in Postgres.
+model_id = "bge-m3:1024"
+dimensions = 1024
+# api_key = "..."        # omit for Ollama / TEI; set for hosted endpoints
+timeout_seconds = 5
+
+[worker]
+# How often the embed-drainer claims a batch off pending_embeddings.
+tick_interval_seconds = 5
+# Max jobs claimed per tick (one embedder HTTP call per batch).
+batch_size = 16
+
+# --- Optional stages (disabled by default via empty `provider`) --------------
+
+[reranker]
+# "" (default) = no reranker; the search pipeline uses RRF + recency only.
+# "tei" = Hugging Face text-embeddings-inference in rerank mode.
+provider = ""
+endpoint = "http://localhost:8080"
+model_id = "BAAI/bge-reranker-v2-m3"
+timeout_seconds = 30
+
+[tagger]
+# "" (default) = silent-disable: capture proceeds, no tag jobs enqueue, the
+# worker doesn't spawn a tag drainer. Opt in with one of:
+#   "openai-compatible" — vLLM / any OpenAI /v1/chat/completions backend
+#   "openrouter"        — hosted models via OpenRouter
+#   "http"              — the kengram-native sidecar (see [tagger.http] + docs/tagger-backends.md)
+provider = ""
+endpoint = "http://localhost:8000/v1"
+model_name = "qwen2.5-7b-instruct"
+model_id = "vllm/qwen2.5-7b-instruct"
+# Omit `model_version` to track the bundled prompt version automatically.
+# api_key = "..."                 # e.g. an OpenRouter key (or use KENGRAM_TAGGER__API_KEY)
+timeout_seconds = 60
+temperature = 0.2
+# system_prompt_file = "..."      # custom prompt; bump model_version if you set this
+scope_vocab_enabled = true
+scope_vocab_size = 50
+
+# Only used when [tagger].provider = "http".
+# [tagger.http]
+# endpoint = "http://localhost:8082"
+# api_key = ""                    # optional bearer; sidecars on a private network usually omit
+# timeout_seconds = 60
