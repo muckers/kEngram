@@ -6,14 +6,11 @@
 # deterministic tagger sidecar.
 set -euo pipefail
 
-services=(postgres tei)
-compose_args=()
 if [[ "${1:-}" == "--tagger" ]]; then
-  compose_args=(--profile tagger)
-  services+=(tagger-deterministic)
+  docker compose --profile tagger up -d postgres tei tagger-deterministic
+else
+  docker compose up -d postgres tei
 fi
-
-docker compose "${compose_args[@]}" up -d "${services[@]}"
 
 printf 'waiting for kengram-postgres'
 until docker exec kengram-postgres pg_isready -U kengram >/dev/null 2>&1; do
