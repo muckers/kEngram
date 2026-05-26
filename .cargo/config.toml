@@ -1,0 +1,18 @@
+# Build against the committed `.sqlx/` query metadata by default, so a fresh
+# clone — CI, or any machine without the dev database — compiles with no
+# database connection. sqlx's compile-time `query!` checks read `.sqlx/`
+# instead of dialing `DATABASE_URL`.
+#
+# When you ADD or CHANGE a `sqlx::query!`, refresh the metadata against a live,
+# migrated database and commit the result:
+#
+#   cargo sqlx prepare --workspace -- --all-targets --all-features
+#
+# For a one-off live check against your own database, override per-invocation:
+#
+#   SQLX_OFFLINE=false cargo build
+#
+# (This `[env]` entry does not override SQLX_OFFLINE if it's already set in your
+# shell, so that override works.)
+[env]
+SQLX_OFFLINE = "true"
