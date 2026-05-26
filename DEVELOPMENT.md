@@ -28,7 +28,7 @@ If you don't already have these, here's the canonical install for each:
 
 ## Quick launch (recommended)
 
-Three checked-in scripts at the repo root bring the dev stack up with minimal typing. This is the recommended path; the step-by-step [Manual setup (advanced)](#manual-setup-advanced) below is the fallback when you need to run or customize an individual step.
+Four checked-in scripts at the repo root drive the dev stack with minimal typing. This is the recommended path; the step-by-step [Manual setup (advanced)](#manual-setup-advanced) below is the fallback when you need to run or customize an individual step.
 
 **One-time prerequisites** (see [Install prerequisites](#install-prerequisites)): Docker, the Rust toolchain, `sqlx-cli`, and Ollama installed and running. Pull the models the scripts use:
 
@@ -42,6 +42,7 @@ ollama pull qwen2.5:7b-instruct    # tagging (worker, on by default)
 | `./start_stack.sh` | Brings up the backing containers (`postgres` + the `tei` reranker) and blocks until Postgres is ready. Pass `--tagger` to also start the opt-in deterministic tagger sidecar. Sets no env vars — service config lives in `docker-compose.yml`. |
 | `./start_server.sh` | Runs `kengram serve` in the foreground (MCP server on `127.0.0.1:8080`, endpoint `/mcp`). |
 | `./start_worker.sh` | Runs `kengram worker` in the foreground — drains `pending_embeddings` and (by default) `pending_tags`, tagging via local Ollama. |
+| `./stop_stack.sh` | Stops the backing containers. Default keeps the containers and the Postgres data volume for a fast resume; `--down` removes the containers and network (the data volume is still preserved). |
 
 **Two-terminal flow:**
 
@@ -53,6 +54,9 @@ ollama pull qwen2.5:7b-instruct    # tagging (worker, on by default)
 
 # Terminal 2 — worker (foreground; Ctrl-C to stop):
 ./start_worker.sh
+
+# When done — server/worker stop with Ctrl-C; halt the containers with:
+./stop_stack.sh                  # add --down to also remove the containers
 ```
 
 `start_stack.sh` exits once Postgres is ready (TEI keeps warming in the background — only reranked search waits on it). The server and worker both run in the foreground, so each wants its own terminal.
