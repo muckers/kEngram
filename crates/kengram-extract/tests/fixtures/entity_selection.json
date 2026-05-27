@@ -1,0 +1,20 @@
+{
+  "fixtures": [
+    {
+      "name": "production-stack-keeps-midlist-entities",
+      "category": "entity_cap",
+      "content": "Production stack as of this week: Ruby 3.3 on Rails 7.1, Sidekiq for background jobs, Aurora PostgreSQL 15 for the primary database, Redis 7 for cache and pub/sub, Kafka 3.6 for the event bus, OpenSearch 2.11 for product and order search, S3 for object storage, ECS Fargate for compute, an Application Load Balancer in front of it all, and Datadog for metrics, logs, and APM. The newest addition is Temporal 1.22 for long-running workflows, still in pilot for the order-fulfillment service.",
+      "assertions": {
+        "entities_must_contain": ["Redis", "Kafka", "OpenSearch"]
+      }
+    },
+    {
+      "name": "model-comparison-colon-entities-survive",
+      "category": "entity_cap",
+      "content": "Comparing local models for the tagger: ollama/qwen3-coder:30b runs in about 7s per thought on the M3 Max, ollama/gemma3:12b runs in 3s, and ollama-cloud/qwen3.5:397b-cloud is around 12s round-trip including network. Speed isn't the binding constraint at our throughput — accuracy is.",
+      "assertions": {
+        "entities_must_contain": ["ollama/qwen3-coder:30b", "ollama/gemma3:12b"]
+      }
+    }
+  ]
+}

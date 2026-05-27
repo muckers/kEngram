@@ -203,7 +203,20 @@ impl OpenAICompatibleConfig {
 /// residual quoted-span use-mention patterns (Bug 2 — capacity-bound per
 /// the parked notes) and gemma3's colon-truncation of entity strings
 /// (Bug 6 — a model artifact; the parse path has no colon logic).
-pub const BUNDLED_TAGGER_VERSION: i32 = 14;
+/// **v15 (post-v14 staging audit)** the v14 audit (scope
+/// `engram.audit.v14`) showed the `entities` `maxItems: 3` cap was too
+/// tight: entity-rich thoughts (a 12-name production-stack inventory) lost
+/// 9 real, queryable names to source-order truncation, which no salience
+/// rule can fix — all the names are salient. Raise `maxItems` 3→8 (entities
+/// are surface-bound, so emission is self-limiting — unlike topics, which
+/// needed the v11 normalize layer) and add a relevance-ordering instruction
+/// (most-relevant-first / descending relevance) so when the cap still binds
+/// on a >8-name thought the least-relevant tail is what's dropped. The
+/// ordering clause also nudges specificity (specific names over generic /
+/// descriptive phrases) at the slot the v14 audit saw weak phrases like
+/// `workflow_run triggers` leak into — a separate NAME-vs-DESCRIBE precision
+/// residual, only partially addressed here.
+pub const BUNDLED_TAGGER_VERSION: i32 = 15;
 
 #[derive(Debug, Clone)]
 pub struct OpenAICompatibleTagger {
@@ -329,6 +342,8 @@ Apply this check FIRST. Then proceed to the field rules below.
   Surface-only rule (load-bearing): entities must appear in the thought's prose. Do NOT infer entities from world knowledge. Example failure: if the thought says \"trigram retrieval\", do NOT emit `pg_trgm` even though pg_trgm is the Postgres extension that implements trigram retrieval — that is a world-knowledge inference, not surface evidence. The name (or a clearly-recognizable abbreviation that maps to it) must appear in the prose.
 
   NAME-vs-DESCRIBE test (apply this to every candidate before including it): ask \"does this phrase NAME a specific thing that has its own canonical identity outside this thought, or does the thought DESCRIBE an action / concept / style using a noun phrase?\" Only names belong in entities. When in doubt, omit. If the same phrase could be a name elsewhere but is used descriptively here, omit.
+
+  Ordering and selection: list entities most-relevant-first — the names most central to the thought's point come first, in descending relevance. A thought that legitimately names many distinct things (a tech-stack inventory, a tool comparison) should emit them all; one that only mentions a couple in passing stays short. When more candidates exist than you can keep, prefer specific, distinctive names over generic or descriptive phrases.
 
   Before you emit: re-read the thought. Verify each entity in your output appears (by name or close paraphrase) in the prose. Remove any that don't.
 
@@ -628,7 +643,7 @@ fn tags_response_format() -> serde_json::Value {
                 ],
                 "properties": {
                     "people": { "type": "array", "items": { "type": "string" } },
-                    "entities": { "type": "array", "items": { "type": "string" }, "maxItems": 3 },
+                    "entities": { "type": "array", "items": { "type": "string" }, "maxItems": 8 },
                     "action_items": { "type": "array", "items": { "type": "string" } },
                     "topics": { "type": "array", "items": { "type": "string" }, "maxItems": 3 },
                     "dates_mentioned": { "type": "array", "items": { "type": "string" } },
@@ -1121,6 +1136,11 @@ mod tests {
             p.contains("entities: default to []"),
             "v7 prompt must lead the entities description with the empty case"
         );
+        // v15 entity relevance-ordering + cap-8 headroom guidance.
+        assert!(
+            p.contains("descending relevance"),
+            "v15 prompt must instruct entity relevance-ordering (most-relevant-first)"
+        );
         // v4 NAME-vs-DESCRIBE test preserved.
         assert!(
             p.contains("NAME a specific thing"),
@@ -1249,7 +1269,7 @@ mod tests {
         );
 
         // Presets track BUNDLED_TAGGER_VERSION.
-        assert_eq!(BUNDLED_TAGGER_VERSION, 14);
+        assert_eq!(BUNDLED_TAGGER_VERSION, 15);
         let cfg = OpenAICompatibleConfig::vllm_local();
         assert_eq!(cfg.model_version, BUNDLED_TAGGER_VERSION);
         let cfg = OpenAICompatibleConfig::open_router("k".into(), "m".into());
@@ -1275,7 +1295,7 @@ mod tests {
             ]
         );
         assert_eq!(schema["properties"]["topics"]["maxItems"], 3);
-        assert_eq!(schema["properties"]["entities"]["maxItems"], 3);
+        assert_eq!(schema["properties"]["entities"]["maxItems"], 8);
         assert_eq!(schema["properties"]["relations"]["maxItems"], 5);
         // `kind` must allow null on the wire.
         let kind_type = &schema["properties"]["kind"]["type"];
