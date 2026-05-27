@@ -1,0 +1,38 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT id, tags, tags_extractor_model, tags_extractor_version\n        FROM thoughts\n        WHERE retracted_at IS NULL\n        ORDER BY created_at\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "tags",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 2,
+        "name": "tags_extractor_model",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "tags_extractor_version",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "5d4f7b5c62776f2dba3ca304d4794a3f75f56cbb9aa3dac148a2f1bcd591c858"
+}

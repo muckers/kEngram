@@ -721,6 +721,47 @@ pub async fn update_thought_tags(
     Ok(())
 }
 
+/// One row of a pre-retag tag snapshot — the tag provenance of a single
+/// non-retracted thought, captured before a destructive retag overwrites it.
+/// Serialization is the caller's concern (the CLI writes the JSON file);
+/// `kengram-storage` deliberately depends only on `serde_json`, not `serde`.
+#[derive(Debug, Clone)]
+pub struct TagSnapshotRow {
+    pub thought_id: ThoughtId,
+    pub tags: serde_json::Value,
+    pub tags_extractor_model: Option<String>,
+    pub tags_extractor_version: Option<i32>,
+}
+
+/// Snapshot the current tags + provenance for every non-retracted thought.
+/// Retag passes overwrite `tags` in place (there is no tag-history table), so
+/// the operator captures this before a `--rerun`/`--force` retag to keep a
+/// recoverable copy. Retracted thoughts are excluded: retag passes skip them,
+/// so their tags never change. Ordered by `created_at` for a stable dump.
+pub async fn snapshot_nonretracted_tags(
+    pool: &PgPool,
+) -> Result<Vec<TagSnapshotRow>, StorageError> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT id, tags, tags_extractor_model, tags_extractor_version
+        FROM thoughts
+        WHERE retracted_at IS NULL
+        ORDER BY created_at
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| TagSnapshotRow {
+            thought_id: ThoughtId(r.id),
+            tags: r.tags,
+            tags_extractor_model: r.tags_extractor_model,
+            tags_extractor_version: r.tags_extractor_version,
+        })
+        .collect())
+}
+
 /// Enqueue a thought for the tag drainer. Idempotent on `thought_id`
 /// conflict — re-enqueuing the same thought is a no-op.
 pub async fn enqueue_tag_job(
@@ -1794,6 +1835,75 @@ mod tests {
             metadata,
             content_fingerprint: sha256_of(content),
         }
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn snapshot_excludes_retracted_and_captures_tag_provenance(pool: PgPool) {
+        let scope = Scope::new("work").unwrap();
+        let source = Source::new("manual").unwrap();
+        let metadata = Metadata::empty();
+
+        // A tagged, non-retracted thought.
+        let (tagged, _) =
+            insert_thought(&pool, new_thought(&scope, &source, &metadata, "tagged one"))
+                .await
+                .unwrap();
+        let tags = Tags {
+            people: vec!["Ron".to_string()],
+            kind: Some(TagKind::Observation),
+            ..Default::default()
+        };
+        update_thought_tags(&pool, tagged.id, &tags, "ollama/test", 13)
+            .await
+            .unwrap();
+
+        // An untagged, non-retracted thought (default tags, NULL provenance).
+        let (untagged, _) = insert_thought(
+            &pool,
+            new_thought(&scope, &source, &metadata, "untagged one"),
+        )
+        .await
+        .unwrap();
+
+        // A retracted thought — must be excluded.
+        let (gone, _) = insert_thought(
+            &pool,
+            new_thought(&scope, &source, &metadata, "retracted one"),
+        )
+        .await
+        .unwrap();
+        retract_thought(&pool, gone.id, Some("test")).await.unwrap();
+
+        let snap = snapshot_nonretracted_tags(&pool).await.unwrap();
+
+        let ids: Vec<ThoughtId> = snap.iter().map(|r| r.thought_id).collect();
+        assert!(
+            ids.contains(&tagged.id),
+            "tagged thought must be in snapshot"
+        );
+        assert!(
+            ids.contains(&untagged.id),
+            "untagged thought must be in snapshot"
+        );
+        assert!(
+            !ids.contains(&gone.id),
+            "retracted thought must be excluded"
+        );
+        assert_eq!(snap.len(), 2);
+
+        // Provenance is captured for the tagged row.
+        let tagged_row = snap.iter().find(|r| r.thought_id == tagged.id).unwrap();
+        assert_eq!(
+            tagged_row.tags_extractor_model.as_deref(),
+            Some("ollama/test")
+        );
+        assert_eq!(tagged_row.tags_extractor_version, Some(13));
+        assert_eq!(tagged_row.tags["people"][0], "Ron");
+
+        // Untagged row carries NULL provenance.
+        let untagged_row = snap.iter().find(|r| r.thought_id == untagged.id).unwrap();
+        assert!(untagged_row.tags_extractor_model.is_none());
+        assert!(untagged_row.tags_extractor_version.is_none());
     }
 
     #[sqlx::test(migrations = "../../migrations")]

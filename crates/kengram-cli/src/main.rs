@@ -102,6 +102,13 @@ enum Command {
         /// `--since`, which required `--rerun`).
         #[arg(long)]
         since: Option<String>,
+        /// Before tagging, snapshot current tags + provenance for ALL
+        /// non-retracted thoughts to a JSON file (retag overwrites `tags` in
+        /// place; there is no history table). Bare `--snapshot` writes
+        /// `./kengram-tag-snapshot-<unixtime>.json`; `--snapshot=PATH` writes
+        /// to PATH. Recover by hand via psql if a retag produces worse tags.
+        #[arg(long, value_name = "PATH", num_args = 0..=1, require_equals = true)]
+        snapshot: Option<Option<PathBuf>>,
     },
     /// Benchmarking harness — A/B comparisons across search-pipeline
     /// configurations. Subcommand-action shape leaves room for additional
@@ -726,6 +733,26 @@ async fn run_embed_backfill(
 /// queue interaction — `pending_tags` is the worker-tick path, not this
 /// one. Hard-fails when `[tagger]` is unconfigured (matches `kengram bench
 /// rerank`'s "configured reranker required" stance).
+/// Shape pre-retag snapshot rows into the JSON array written by `--snapshot`.
+/// `thought_id` serializes as a bare UUID string (`ThoughtId` is transparent),
+/// and untagged rows carry `null` provenance — both pinned by the unit test.
+fn snapshot_rows_to_json(rows: &[kengram_storage::TagSnapshotRow]) -> Vec<serde_json::Value> {
+    rows.iter()
+        .map(|r| {
+            serde_json::json!({
+                "thought_id": r.thought_id,
+                "tags": r.tags,
+                "tags_extractor_model": r.tags_extractor_model,
+                "tags_extractor_version": r.tags_extractor_version,
+            })
+        })
+        .collect()
+}
+
+// Args mirror the `Command::Tag` clap flags 1:1; grouping them into a struct
+// would just move the same fields behind one more name. Same rationale as the
+// wide query helpers in kengram-storage.
+#[allow(clippy::too_many_arguments)]
 async fn run_tag(
     config: Config,
     scope: Option<String>,
@@ -734,6 +761,7 @@ async fn run_tag(
     rerun: bool,
     force: bool,
     since: Option<String>,
+    snapshot: Option<Option<PathBuf>>,
 ) -> anyhow::Result<()> {
     let parsed_since = match since {
         Some(s) => Some(
@@ -748,6 +776,37 @@ async fn run_tag(
         .connect(&config.database.url)
         .await
         .with_context(|| format!("connecting to {}", config.database.url))?;
+
+    // Pre-retag safety net: snapshot current tags before any destructive
+    // overwrite. Runs before build_tagger so the snapshot is captured even if
+    // the tagger turns out to be misconfigured. Corpus-wide (all non-retracted
+    // rows) regardless of --scope/--since, so any row stays recoverable.
+    if let Some(snapshot_arg) = snapshot {
+        let path = snapshot_arg.unwrap_or_else(|| {
+            PathBuf::from(format!(
+                "kengram-tag-snapshot-{}.json",
+                time::OffsetDateTime::now_utc().unix_timestamp()
+            ))
+        });
+        let rows = kengram_storage::snapshot_nonretracted_tags(&pool)
+            .await
+            .context("capturing pre-retag tag snapshot")?;
+        let json = snapshot_rows_to_json(&rows);
+        let file = std::fs::File::create(&path)
+            .with_context(|| format!("creating snapshot file {}", path.display()))?;
+        serde_json::to_writer_pretty(file, &json)
+            .with_context(|| format!("writing snapshot to {}", path.display()))?;
+        tracing::info!(
+            count = rows.len(),
+            path = %path.display(),
+            "kengram tag: wrote pre-retag tag snapshot",
+        );
+        println!(
+            "Wrote pre-retag snapshot of {} non-retracted thoughts to {}",
+            rows.len(),
+            path.display()
+        );
+    }
 
     let ResolvedTagger {
         tagger,
@@ -893,7 +952,20 @@ async fn main() -> anyhow::Result<()> {
             rerun,
             force,
             since,
-        } => run_tag(config, scope, scope_prefix, limit, rerun, force, since).await,
+            snapshot,
+        } => {
+            run_tag(
+                config,
+                scope,
+                scope_prefix,
+                limit,
+                rerun,
+                force,
+                since,
+                snapshot,
+            )
+            .await
+        }
         Command::Bench { action } => match action {
             BenchAction::Rerank { corpus } => run_bench_rerank(config, corpus).await,
         },
@@ -1174,5 +1246,46 @@ mod stats_tests {
         assert_eq!(humanize_bytes(1024 * 1024), "1.0 MB");
         assert_eq!(humanize_bytes(12 * 1024 * 1024), "12.0 MB");
         assert_eq!(humanize_bytes(1024_i64.pow(3)), "1.00 GB");
+    }
+}
+
+#[cfg(test)]
+mod tag_tests {
+    use super::*;
+    use kengram_core::ThoughtId;
+    use kengram_storage::TagSnapshotRow;
+
+    #[test]
+    fn snapshot_rows_to_json_shapes_provenance_and_bare_uuid() {
+        let id = ThoughtId::new();
+        let rows = vec![
+            TagSnapshotRow {
+                thought_id: id,
+                tags: serde_json::json!({"people": ["Ron"], "kind": "observation"}),
+                tags_extractor_model: Some("ollama/test".to_string()),
+                tags_extractor_version: Some(13),
+            },
+            TagSnapshotRow {
+                thought_id: ThoughtId::new(),
+                tags: serde_json::json!({}),
+                tags_extractor_model: None,
+                tags_extractor_version: None,
+            },
+        ];
+
+        let json = snapshot_rows_to_json(&rows);
+
+        assert_eq!(json.len(), 2);
+        // thought_id is a bare UUID string, not a wrapper object.
+        assert_eq!(
+            json[0]["thought_id"].as_str().unwrap(),
+            id.as_uuid().to_string()
+        );
+        assert_eq!(json[0]["tags"]["people"][0], "Ron");
+        assert_eq!(json[0]["tags_extractor_model"], "ollama/test");
+        assert_eq!(json[0]["tags_extractor_version"], 13);
+        // Untagged row → null provenance.
+        assert!(json[1]["tags_extractor_model"].is_null());
+        assert!(json[1]["tags_extractor_version"].is_null());
     }
 }

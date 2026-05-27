@@ -72,6 +72,8 @@ KENGRAM_TAGGER__MODEL_NAME=qwen2.5:14b-instruct ./start_worker.sh   # one-off ov
 To run a different tagger backend persistently — vLLM, OpenRouter, the HTTP sidecar, or another Ollama model — put a `[tagger]` block in `~/.config/kengram/kengram.toml` (see [Configuration reference](#configuration-reference)); the script honors it.
 
 > **Backfill note.** The worker only tags *newly enqueued* thoughts. After enabling or switching the tagger, catch up the existing corpus with `kengram tag --force` (re-tags regardless of version), or `kengram tag --rerun --since 1970-01-01T00:00:00Z`.
+>
+> **Retag is destructive** — it overwrites the `tags` JSONB in place, and there is no tag-history table. Before a corpus-wide retag, snapshot first: `kengram tag --snapshot --force …` writes all non-retracted rows' tags + provenance to `./kengram-tag-snapshot-<unixtime>.json` (or `--snapshot=PATH`) before tagging. The equivalent by hand is `psql "$DATABASE_URL" -c "\copy (SELECT id, tags, tags_extractor_model, tags_extractor_version FROM thoughts WHERE retracted_at IS NULL) TO 'snapshot.csv' CSV HEADER"`. Recover individual rows by hand if a pass produces worse tags.
 
 ---
 
