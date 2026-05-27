@@ -138,7 +138,7 @@ Restart Claude Desktop after editing the config.
 
 ### claude.ai (web)
 
-claude.ai supports remote MCP servers as custom connectors. Kengram's tool schemas declare concrete JSON-Schema types on every object field (a v9-cycle fix) because claude.ai's MCP client silently strips fields without explicit `type` annotations from outbound tool calls. With v9+ Kengram every tool argument round-trips correctly through the web client; older revisions saw silent drops on `metadata` and `tag_filter`.
+claude.ai supports remote MCP servers as custom connectors. Kengram's tool schemas declare concrete JSON-Schema types on every object field, because claude.ai's MCP client silently strips fields without an explicit `type` annotation from outbound tool calls — so every tool argument (including `metadata` and `tag_filter`) round-trips correctly through the web client.
 
 ### opencode (Ollama-backed)
 
@@ -177,7 +177,7 @@ Any client speaking streamable-HTTP can point at `http://127.0.0.1:8081/mcp` dir
 
 ## What you get (MCP surface)
 
-**Status:** M1 (capture & search), M2 (async-embed seam, since superseded by M4), M3 (hybrid search + cross-encoder rerank + A/B harness), M4 (collapse to thoughts-only with tagging sidecar), M4.1 (entities split + scope-aware vocabulary), M5 (selective relations — closed-vocab thought graph), and M6 (`kengram stats` + tagger-extracted relations) are shipped. M7 (operational maturity — metrics, Tier 2 auth, eval suite, backups) is ahead. See the [Roadmap](#roadmap).
+**Status:** everything through M6 is shipped — capture & search, hybrid retrieval with cross-encoder rerank, the tagging sidecar, and the relational link graph. M7 (operational maturity — metrics, Tier 2 auth, eval suite, backups) is ahead. See the [Roadmap](#roadmap) for the per-milestone breakdown.
 
 | Tool | What it does |
 |---|---|
@@ -218,15 +218,13 @@ Tagger-emitted relations land in `thought_links` (with `source='tagger'`), not i
 
 `entities` are canonical proper names the prose mentions (projects, products, libraries, tools, organizations); descriptive phrases belong in `topics`. `topics` are broader subject categories. Keeping them separate lets `tag_filter` distinguish "thoughts that mention kengram by name" from "thoughts categorized under memory-systems." `kind` is one of `observation | task | idea | reference | person_note | session | decision_record` (or `null` if the model is unsure). Tags are **advisory** — a wrong tag is low-impact because retrieval still works against the raw content via vector + trigram. See [Tagger version history](DEVELOPMENT.md#tagger-version-history-and-safe-re-tag-procedure) in DEVELOPMENT.md for the full v1→v16 changelog and re-tag procedure.
 
-**Scope-aware vocabulary.** Before tagging, the drainer fetches the top-N most-frequent topic and entity terms used in the same scope and injects them as a tie-break vocabulary hint. The v4+ prompt frames vocab as suggestions — the model uses a vocab term when it accurately fits and coins a new one when nothing does (precision over consistency). Configurable via `[tagger].scope_vocab_enabled` (default `true`) and `[tagger].scope_vocab_size` (default `50`). Tuning details in [Configuration presets and troubleshooting](DEVELOPMENT.md#configuration-presets-and-troubleshooting) in DEVELOPMENT.md.
-
 **Filter at search time.** `search_thoughts(query, tag_filter?)` runs `WHERE tags @> $tag_filter` (JSONB containment, GIN-indexed). Examples: `{"kind": "task"}`, `{"entities": ["kengram"]}`, `{"topics": ["rust"], "kind": "idea"}`.
 
-**Re-tag.** `kengram tag [--rerun --since <RFC3339>] [--scope X | --scope-prefix Y]` runs the tagger on demand. Without `--rerun`, tags thoughts where `tags_extractor_version IS NULL`. With `--rerun`, re-tags thoughts whose stored version is below the current tagger version. Tags are overwritten — no supersede semantics, no audit chain, because the raw text is what's queryable.
+**Re-tag.** `kengram tag [--rerun] [--force] [--snapshot[=PATH]] [--since <RFC3339>] [--scope X | --scope-prefix Y]` runs the tagger on demand. Plain, it tags only thoughts where `tags_extractor_version IS NULL`; `--rerun` also re-tags thoughts whose stored version is below the current tagger version; `--force` re-tags every matching thought regardless of version (for a model swap that didn't bump the prompt version). Tags are overwritten in place — no supersede semantics, no audit chain, because the raw text is what's queryable — so `--snapshot` first writes the current tags to a JSON file before a destructive pass.
 
 ## How relations work
 
-On top of the tagging sidecar, Kengram has a graph layer of edges in a closed vocabulary of seven relations (M5 shipped six; M5.1 added `supports` after day-one dogfood):
+On top of the tagging sidecar, Kengram has a graph layer of edges in a closed vocabulary of seven relations:
 
 | relation | meaning |
 |---|---|
@@ -238,9 +236,9 @@ On top of the tagging sidecar, Kengram has a graph layer of edges in a closed vo
 | `decided_by` | provenance: a decision attributable to a person or session anchor |
 | `refines` | newer thought refines an earlier one (both stand; newer is updated thinking) |
 
-Edges are either agent-supplied via `link_thoughts` or auto-emitted by the tagger (M6.1). Each row in `thought_links` carries a `source` discriminator (`agent` vs `tagger`), surfaced in `get_related_thoughts` responses as `link_source`. The closed vocab is intentionally small: it captures the relational structure that shows up in conversation memory without trying to be a general knowledge graph.
+Edges are either agent-supplied via `link_thoughts` or auto-emitted by the tagger. Each row in `thought_links` carries a `source` discriminator (`agent` vs `tagger`), surfaced in `get_related_thoughts` responses as `link_source`. The closed vocab is intentionally small: it captures the relational structure that shows up in conversation memory without trying to be a general knowledge graph.
 
-**Polymorphic targets.** The `from` side is always a thought; the `to` side can be a thought (UUID), a free-text entity name, a free-text person name, or a URL (must start with `http://` or `https://`). Pass exactly one of `to_thought_id` / `to_entity` / `to_person` / `to_url`. Tagger-emitted edges ship v1 as non-thought targets only (`url` / `entity` / `person`); thought-to-thought tagger extraction requires entity resolution and is deferred.
+**Polymorphic targets.** The `from` side is always a thought; the `to` side can be a thought (UUID), a free-text entity name, a free-text person name, or a URL (must start with `http://` or `https://`). Pass exactly one of `to_thought_id` / `to_entity` / `to_person` / `to_url`. Tagger-emitted edges currently target non-thoughts only (`url` / `entity` / `person`); thought-to-thought tagger extraction requires entity resolution and is deferred.
 
 **Idempotency.** `link_thoughts` is idempotent on `(from, relation, to_kind, to_value)` — re-asserting the same live edge returns the existing `link_id` with `is_new: false`.
 
@@ -272,20 +270,22 @@ Env vars override the file (e.g. `KENGRAM_DATABASE__URL=...`, nested via `__`). 
 
 ```
 crates/
-├── kengram-core/      # domain types, Embedder + Reranker + Tagger traits, RRF + recency_boost (pure)
-├── kengram-storage/   # sqlx queries, migrations, repository functions
-├── kengram-embed/     # Embedder + Reranker impls: OpenAICompatibleEmbedder, TeiReranker, fakes
-├── kengram-extract/   # Tagger impls: OpenAICompatibleTagger (vLLM/OpenRouter), FakeTagger
-├── kengram-mcp/       # capture/search/get/recent/retract/link/unlink/related/scopes orchestrators + rmcp wiring
-└── kengram-cli/       # binary; serve/migrate/worker/embed-backfill/tag/stats/bench/audit/backup/restore subcommands
-migrations/           # sqlx migrations (numbered)
-docs/                 # design doc + per-milestone scope/progress
-scripts/              # operator-driven runbooks (bench-rerank.md)
+├── kengram-core/                 # domain types, Embedder + Reranker + Tagger traits, RRF + recency_boost (pure)
+├── kengram-storage/              # sqlx queries, migrations, repository functions
+├── kengram-embed/                # Embedder + Reranker impls: OpenAICompatibleEmbedder, TeiReranker, fakes
+├── kengram-extract/              # Tagger impls: OpenAICompatibleTagger (vLLM/OpenRouter/Ollama), HttpTagger (sidecar client), FakeTagger
+├── kengram-tagger-protocol/      # wire types for the HTTP tagger-sidecar contract
+├── kengram-tagger-deterministic/ # reference non-LLM tagger sidecar (opt-in)
+├── kengram-mcp/                  # capture/search/get/recent/retract/link/unlink/related/scopes orchestrators + rmcp wiring
+└── kengram-cli/                  # binary; serve/migrate/worker/embed-backfill/tag/stats/bench/audit/backup/restore subcommands
+migrations/                       # sqlx migrations (numbered)
+docs/                             # design doc + per-milestone scope/progress
+scripts/                          # operator-driven runbooks (bench-rerank.md, smoke.md)
 ```
 
 ## Roadmap
 
-Built in six capability milestones (M1 → M6), preceded by an environment milestone (M0):
+Built across seven capability milestones (M1 → M7), preceded by an environment milestone (M0):
 
 | Milestone | Status | What it adds |
 |---|---|---|
