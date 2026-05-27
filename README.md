@@ -49,7 +49,7 @@ ollama pull qwen2.5:7b-instruct    # tagging (worker, on by default)
 export DATABASE_URL='postgres://kengram:kengram@localhost:5432/kengram'
 sqlx migrate run
 
-# 3. Terminal 1 — MCP server (binds 127.0.0.1:8080, MCP endpoint /mcp)
+# 3. Terminal 1 — MCP server (binds 127.0.0.1:8081, MCP endpoint /mcp)
 ./start_server.sh
 
 # 4. Terminal 2 — worker (drains embeddings + tags; pass `off` for embed-only)
@@ -61,7 +61,7 @@ sqlx migrate run
 
 A freshly-captured thought returns `embedding_status: "pending"` — that's normal; the worker picks it up on the next tick (default 5 seconds) and the vector becomes searchable. Lexical (trigram) search finds it immediately, so retrieval works during the gap.
 
-Once the server is up, point an MCP client at `http://127.0.0.1:8080/mcp` — see [Connecting MCP clients](#connecting-mcp-clients).
+Once the server is up, point an MCP client at `http://127.0.0.1:8081/mcp` — see [Connecting MCP clients](#connecting-mcp-clients).
 
 ## Connecting MCP clients
 
@@ -71,10 +71,10 @@ Speaks streamable-HTTP natively, so no bridge is needed.
 
 ```bash
 # Project-scoped (writes a checked-in .mcp.json):
-claude mcp add --transport http kengram --scope project http://127.0.0.1:8080/mcp
+claude mcp add --transport http kengram --scope project http://127.0.0.1:8081/mcp
 
 # User-scoped (writes to ~/.claude.json for the current project):
-claude mcp add --transport http kengram http://127.0.0.1:8080/mcp
+claude mcp add --transport http kengram http://127.0.0.1:8081/mcp
 ```
 
 Equivalent JSON for `.mcp.json`:
@@ -84,7 +84,7 @@ Equivalent JSON for `.mcp.json`:
   "mcpServers": {
     "kengram": {
       "type": "http",
-      "url": "http://127.0.0.1:8080/mcp"
+      "url": "http://127.0.0.1:8081/mcp"
     }
   }
 }
@@ -103,7 +103,7 @@ stdio-only, so a bridge process is required. The community-standard `mcp-remote`
   "mcpServers": {
     "kengram": {
       "command": "npx",
-      "args": ["-y", "mcp-remote", "http://127.0.0.1:8080/mcp"]
+      "args": ["-y", "mcp-remote", "http://127.0.0.1:8081/mcp"]
     }
   }
 }
@@ -152,7 +152,7 @@ Config lives at `opencode.json` (project root) or `~/.config/opencode/opencode.j
   "mcp": {
     "kengram": {
       "type": "remote",
-      "url": "http://127.0.0.1:8080/mcp",
+      "url": "http://127.0.0.1:8081/mcp",
       "enabled": true
     }
   },
@@ -173,7 +173,7 @@ In opencode, pick the model via `/models` (it appears as `ollama/qwen3:14b`); Ke
 
 ### Other MCP clients
 
-Any client speaking streamable-HTTP can point at `http://127.0.0.1:8080/mcp` directly. Known-good options for Ollama-driven chat include [Cline](https://github.com/cline/cline) and [Roo Code](https://github.com/RooCodeInc/Roo-Code) (VS Code extensions) and [OpenWebUI](https://openwebui.com) via the [MCPO](https://github.com/open-webui/mcpo) bridge. For a quick smoke test without a chat UI, `npx @modelcontextprotocol/inspector` opens an interactive tool browser.
+Any client speaking streamable-HTTP can point at `http://127.0.0.1:8081/mcp` directly. Known-good options for Ollama-driven chat include [Cline](https://github.com/cline/cline) and [Roo Code](https://github.com/RooCodeInc/Roo-Code) (VS Code extensions) and [OpenWebUI](https://openwebui.com) via the [MCPO](https://github.com/open-webui/mcpo) bridge. For a quick smoke test without a chat UI, `npx @modelcontextprotocol/inspector` opens an interactive tool browser.
 
 ## What you get (MCP surface)
 
