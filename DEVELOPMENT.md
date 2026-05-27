@@ -327,9 +327,9 @@ cargo run --bin kengram -- tag --rerun --since 1970-01-01T00:00:00Z   # whole co
 cargo run --bin kengram -- tag --force --scope work                  # re-tag regardless of version (e.g. after a model swap)
 ```
 
-If you've pinned `model_version` in your local `~/.config/kengram/kengram.toml`, bump it manually. The new bundled default (currently 13) only applies when the field is absent from your TOML. The log line at startup reports the resolved value: look for `target_version=13`. If it says `target_version=N` with `N < 13`, your config still overrides; either update the line or delete it.
+If you've pinned `model_version` in your local `~/.config/kengram/kengram.toml`, it must equal the bundled version (currently **16**) while you're on the bundled prompt — as of v14 the tagger **refuses to start** otherwise (the stamp is bound to prompt identity so it can't silently misrepresent which prompt produced a row). Simplest fix: delete the line and let it track the bundled default automatically. The startup log reports the resolved value: look for `target_version=16`.
 
-For the procedural detail and the full v1→v13 changelog, see [Tagger version history and safe re-tag procedure](#tagger-version-history-and-safe-re-tag-procedure).
+For the procedural detail and the full v1→v16 changelog, see [Tagger version history and safe re-tag procedure](#tagger-version-history-and-safe-re-tag-procedure).
 
 ### Reranker A/B benchmark
 
@@ -374,7 +374,7 @@ provider = "openai-compatible"                          # "" = silent-disable; "
 endpoint = "http://localhost:8000/v1"                   # vLLM default; ignored when provider = "http"
 model_name = "qwen2.5-7b-instruct"                      # the model the backend serves
 model_id = "vllm/qwen2.5-7b-instruct"                   # provenance written into thoughts.tags_extractor_model
-model_version = 13                                      # tracks BUNDLED_TAGGER_VERSION; see Tagger version history
+# model_version = 16                                     # omit to auto-track BUNDLED_TAGGER_VERSION (recommended); pinning a value != bundled refuses to start. See Tagger version history
 # api_key = ""
 timeout_seconds = 60
 temperature = 0.2
@@ -460,11 +460,11 @@ The tagger is the per-thought metadata sidecar. Empty `provider` is the silent-d
 | `endpoint` | `"http://localhost:8000/v1"` | `/v1` base URL. vLLM default port. OpenRouter is `"https://openrouter.ai/api/v1"`. Ignored when `provider = "http"`. |
 | `model_name` | `"qwen2.5-7b-instruct"` | Model name as the backend understands it. For OpenRouter: a model slug like `"anthropic/claude-haiku-4.5"`. Ignored when `provider = "http"`. |
 | `model_id` | `"vllm/qwen2.5-7b-instruct"` | Kengram-side stable identity written into `thoughts.tags_extractor_model`. Conventionally `<vendor>/<model>`. Used by both LLM and HTTP-sidecar providers. |
-| `model_version` | `13` | Tracks `kengram_extract::BUNDLED_TAGGER_VERSION`. Written into `thoughts.tags_extractor_version`. Bump when the prompt or schema changes such that prior tags shouldn't be considered comparable; then `kengram tag --rerun`. See [Tagger version history](#tagger-version-history-and-safe-re-tag-procedure). |
+| `model_version` | `16` | Tracks `kengram_extract::BUNDLED_TAGGER_VERSION`. Written into `thoughts.tags_extractor_version`. As of v14 the stamp is **bound to prompt identity**: with the bundled prompt this must equal the bundled version (the tagger refuses to start otherwise) — omit the field to track it automatically. A `BUNDLED_TAGGER_VERSION` bump (prompt/schema change) is followed by `kengram tag --rerun`. See [Tagger version history](#tagger-version-history-and-safe-re-tag-procedure). |
 | `api_key` | `None` | Bearer token for hosted LLM endpoints. The HTTP sidecar provider has its own `[tagger.http].api_key`. |
 | `timeout_seconds` | `60` | Per-request timeout for the LLM provider. The HTTP sidecar provider has its own `[tagger.http].timeout_seconds`. |
 | `temperature` | `0.2` | Generation temperature. Lower = more deterministic. 0 makes some backends loop. LLM provider only. |
-| `system_prompt_file` | `None` | Path to a file containing a custom system prompt. `None` = use `BUNDLED_TAGGER_PROMPT`. Operators who supply a custom prompt are responsible for also bumping `model_version` so provenance stays meaningful; a WARN log is emitted at startup. LLM provider only. |
+| `system_prompt_file` | `None` | Path to a file containing a custom system prompt. `None` = use `BUNDLED_TAGGER_PROMPT`. As of v14, a custom prompt MUST be paired with a `model_version` distinct from the bundled version — the tagger refuses to start if a custom prompt carries the bundled version number, so custom-prompt tags can't be mislabeled as bundled output. LLM provider only. |
 | `scope_vocab_enabled` | `true` | Inject the top topic + entity terms from the thought's scope into the tagger prompt as a controlled-vocabulary hint. Encourages consistent term reuse across captures. LLM provider only. |
 | `scope_vocab_size` | `50` | Top-N established terms (each for topics and entities) fed to the tagger. Larger = more vocabulary stability; smaller = faster emergence of new terms. LLM provider only. |
 
@@ -487,21 +487,24 @@ Active only when `[tagger].provider = "http"`. Kengram POSTs `/tag` against the 
 
 ## Tagger version history and safe re-tag procedure
 
-The tagger's prompt + JSON schema is versioned by `kengram_extract::BUNDLED_TAGGER_VERSION` (currently **13** for the openai-compatible LLM backend). Each thought row carries a `tags_extractor_version` recording the version it was tagged under, so the drainer can identify stale rows when the version is bumped.
+The tagger's prompt + JSON schema is versioned by `kengram_extract::BUNDLED_TAGGER_VERSION` (currently **16** for the openai-compatible LLM backend). Each thought row carries a `tags_extractor_version` recording the version it was tagged under, so the drainer can identify stale rows when the version is bumped.
 
 The deterministic HTTP-sidecar backend has its own independent version line (currently **1**) stamped via the sidecar's `MODEL_VERSION` env var. Re-tagging across backends works the same way (`kengram tag --rerun`) but the version comparison is per-`tags_extractor_model` — a row stamped by the LLM backend isn't "stale" relative to the deterministic backend's version 1.
 
 ### Version changelog (LLM backend)
 
-The full prompt-iteration history (v1 through v13, plus the v14 deterministic-backend transition) lives at [`docs/tagger-improvements.md`](docs/tagger-improvements.md) — the canonical source of decisions, dogfood evaluations, and rationale. Brief summary:
+The full prompt-iteration history lives at [`docs/tagger-improvements.md`](docs/tagger-improvements.md) and in the `BUNDLED_TAGGER_VERSION` doc-comment in `crates/kengram-extract/src/openai_compatible.rs` (the authoritative per-version record). Brief summary:
 
 - **v1–v4** (M4, 2026-05-16/17). Initial tagger + entities/topics split + iterative prompt cleanup.
 - **v5** (M6.1, 2026-05-17). Added tagger-extracted relations into `thought_links`.
 - **v6–v9** (post-M6.1 dogfood, 2026-05-18). Kind classification rebalance, NOT-entities-list iteration, topics-as-concept-mapping, `tags.relations` dropped from persisted JSONB (migration 0011).
-- **v10–v13** (2026-05-22/23). Scope-vocab experiment, topic canonical-form normalization moved to post-process, people↔entities disjointness validator, USE-vs-MENTION discipline added to the prompt. v13 is the current bundled default.
-- **v14** (2026-05-24). Not a prompt bump — the pluggability framework + reference HTTP-sidecar tagger (`kengram-tagger-deterministic`) shipped. LLM backend default unchanged; deterministic backend is opt-in via `provider = "http"` per the `[tagger.http]` config recipe in Section 3c above.
+- **v10–v13** (2026-05-22/23). Scope-vocab experiment, topic canonical-form normalization moved to post-process, people↔entities disjointness validator, USE-vs-MENTION discipline added to the prompt.
+- **Deterministic backend** (2026-05-24, *not* a prompt-version bump — shipped at prompt v13). The pluggability framework + reference HTTP-sidecar tagger (`kengram-tagger-deterministic`) shipped; opt-in via `provider = "http"` per the `[tagger.http]` recipe in Section 3c. The sidecar carries its own independent version line (currently 1), separate from `BUNDLED_TAGGER_VERSION`.
+- **v14** (2026-05-26). `decision_record` kind + a past-tense decision-tree step; `action_items` redefined as forward-looking only (habits, completed/past actions, settled decisions, preferences, hypotheticals excluded); deterministic scope-identifier + relationship-noun filters and a `metadata.decision_type → decision_record` override added to the shared `kengram_mcp::finalize` seam (applied by both the worker drainer and `kengram tag`, fixing a path that previously skipped post-process); version stamp bound to prompt identity so `model_version` can no longer silently drift.
+- **v15** (2026-05-27). Raised the `entities` cap 3→8 and added a relevance-ordering instruction.
+- **v16** (2026-05-27). Raised the `entities` cap 8→15 after a staging audit showed ordering can't drive selection under a binding cap — the cap is a pathology bound, not a selector (entities are surface-bound, so the model emits by content, not by filling the cap). **v16 is the current bundled default.**
 
-See [`docs/tagger-backends.md`](docs/tagger-backends.md) for the pluggability contract, [`docs/tagger-sidecar-protocol.md`](docs/tagger-sidecar-protocol.md) for the HTTP-sidecar wire spec, and [`docs/tagger-improvements.md`](docs/tagger-improvements.md) for the v14 head-to-head measurement and rollout rationale.
+See [`docs/tagger-backends.md`](docs/tagger-backends.md) for the pluggability contract, [`docs/tagger-sidecar-protocol.md`](docs/tagger-sidecar-protocol.md) for the HTTP-sidecar wire spec, and [`docs/tagger-improvements.md`](docs/tagger-improvements.md) for the head-to-head measurement and rollout rationale.
 
 ### Safe re-tag procedure
 
@@ -509,11 +512,11 @@ After bumping the tagger version (or the bundled default rolls forward and you w
 
 1. **Verify the resolved target version.** Start `kengram serve` (or `kengram worker`). The startup log line is:
    ```
-   tagger: resolved config ... model_version=13 ...
+   tagger: resolved config ... model_version=16 ...
    ```
    And on the re-tag side, `kengram tag` prints:
    ```
-   kengram tag starting ... target_version=13 ...
+   kengram tag starting ... target_version=16 ...
    ```
    If `target_version` is lower than expected, your `~/.config/kengram/kengram.toml` is overriding the bundled default. Bump it manually or delete the `model_version` line so the bundled default takes over.
 
@@ -698,7 +701,7 @@ cargo run --bin kengram -- backup
 #   links:     96 live
 #   scopes:    5
 #   embedder:  bge-m3:1024 (1024d)
-#   tagger:    vllm/qwen2.5-7b-instruct v13
+#   tagger:    vllm/qwen2.5-7b-instruct v16
 ```
 
 Defaults to `./kengram-backup-<timestamp>.tar.gz`; override with `--to <path>`. Use `--skip-embeddings` to drop embedding rows from the archive (smaller backup; restore requires `kengram embed-backfill` to repopulate vectors; HNSW index survives an empty table).
@@ -755,7 +758,7 @@ provider = "openai-compatible"
 endpoint = "http://localhost:8000/v1"
 model_name = "qwen2.5-7b-instruct"
 model_id = "vllm/qwen2.5-7b-instruct"
-model_version = 13
+# model_version = 16    # omit to auto-track BUNDLED_TAGGER_VERSION; pinning a value != bundled refuses to start
 timeout_seconds = 60
 temperature = 0.2
 scope_vocab_enabled = true
@@ -790,7 +793,7 @@ provider = "openrouter"
 endpoint = "https://openrouter.ai/api/v1"
 model_name = "anthropic/claude-haiku-4.5"
 model_id = "openrouter/anthropic/claude-haiku-4.5"
-model_version = 13
+# model_version = 16    # omit to auto-track BUNDLED_TAGGER_VERSION; pinning a value != bundled refuses to start
 timeout_seconds = 30
 temperature = 0.2
 ```

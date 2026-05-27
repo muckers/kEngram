@@ -90,7 +90,7 @@ Field reference:
 | `tags.action_items` | string[] | no | Default `[]`. Imperatives or to-do items in the thought. |
 | `tags.topics` | string[] | no | Default `[]`. Broad subject categories. Typically 0-3 short kebab-case labels. |
 | `tags.dates_mentioned` | string[] | no | Default `[]`. Surface forms of dates / temporal references. No interpretation expected. |
-| `tags.kind` | string\|null | no | Default `null`. One of: `"observation"`, `"task"`, `"idea"`, `"reference"`, `"person_note"`, `"session"`. |
+| `tags.kind` | string\|null | no | Default `null`. One of: `"observation"`, `"task"`, `"idea"`, `"reference"`, `"person_note"`, `"session"`, `"decision_record"`. |
 | `relations` | array | no | Default `[]`. Tagger-extracted relations. See "Relations" below. |
 
 **Relations** (optional, often empty for non-LLM sidecars):

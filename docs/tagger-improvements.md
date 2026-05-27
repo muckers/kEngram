@@ -576,3 +576,46 @@ model against this corpus:
 
 Probes are pre-tagged from the 2026-05-22 round; the table records the
 canonical "good" answers for re-running on new tagger configs.
+
+## Prompt v14–v16 — decision_record, action_items, entity cap (2026-05-26/27)
+
+Distinct from the "v14 deterministic backend" exploration above (that sidecar shipped at
+*prompt* v13): these are `BUNDLED_TAGGER_VERSION` prompt/schema bumps. Authoritative
+per-version detail is in the `BUNDLED_TAGGER_VERSION` doc-comment in
+`crates/kengram-extract/src/openai_compatible.rs`; this is the dogfood narrative.
+
+**The reframe that started it.** A findings doc blamed the bugs on "pipeline version," but the
+version stamp turned out to be a free operator integer *decoupled from the prompt text* — the
+cited v7/v10/v13 stamps were toml toggles over a constant v13 prompt. So the bugs were live on
+the current prompt and reproduced across model families (phi4:14b + gemma3:12b emitted them
+identically) → a prompt/schema cause, not a model-capacity ceiling. Fixing that decoupling
+(binding the stamp to prompt identity) is part of v14.
+
+**v14** — `decision_record` kind + a past-tense decision-tree step; `action_items` redefined as
+forward-looking only; deterministic scope-identifier / relationship-noun filters + a
+`metadata.decision_type → decision_record` override added to the shared `kengram_mcp::finalize`
+seam (applied by both the worker drainer and `kengram tag`, which previously skipped
+post-process); version stamp bound to prompt identity. Cross-model sweep (`tagger-sweep.sh`):
+qwen3-coder:30b 6/6 on the new fixtures; gemma3:12b 4/6 (decision/habit misses are
+capacity-bound — the deterministic filters hold the floor regardless of model).
+
+**v15** — entities cap 3→8 + a relevance-ordering instruction. A staging audit
+(`engram.audit.v14`) showed cap-3 truncating real names from entity-rich thoughts: a 12-name
+production-stack thought kept only the first 3 in *source order*. Raising to 8 helped; the
+ordering instruction did not.
+
+**v16** — entities cap 8→15. The v15 audit proved relevance-ordering can't drive selection: at
+cap-8 the model still emitted the first 8 in document order — the stack thought dropped
+`Temporal` despite "newest addition" + version + use-case salience cues, purely because it was
+last. The `maxItems` grammar truncates in emission order and the model emits in reading order,
+so a soft "descending relevance" instruction can't reorder against it. **Lesson: a `maxItems`
+cap is a pathology bound, not a selector.** Raised to 15 so it stops binding on realistic
+thoughts. Verified hallucination-safe — the model emits by content, not by filling the cap:
+entity-poor thoughts emit `[]` with 15 slots free, and the 12-name stack keeps all 12, every one
+prose-present. The surface-only rule, not the cap, is the anti-hallucination gate.
+
+**Residuals (parked).** gemma3:12b remains the floor — it colon-splits model-name strings and
+concatenates overflow on >cap thoughts; qwen3-coder:30b is clean. Weak-but-real phrases
+(`workflow_run`, `orbs`) still land in `entities` on feature-heavy thoughts (the NAME-vs-DESCRIBE
+precision residual, advisory-only). The Bug-2 quoted-span use-mention residual persists on
+meta-thoughts that quote other content.

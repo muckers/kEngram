@@ -274,7 +274,7 @@ There is one write path. It terminates in a `thoughts` row plus an embedding plu
 
 1. **Drain.** `SELECT thought_id, tagger_model_id FROM pending_tags ORDER BY enqueued_at ASC FOR UPDATE SKIP LOCKED LIMIT $batch_size`. Fetched in the same idempotent style as `pending_embeddings`.
 
-2. **Tag.** Call `Tagger::tag(content, vocab)`. The default impl (`OpenAICompatibleTagger`) POSTs to `/v1/chat/completions` with the bundled prompt (currently v13) + `response_format: { type: "json_schema", strict: true, schema: { ... } }`. Schema (live in `crates/kengram-extract/src/openai_compatible.rs`):
+2. **Tag.** Call `Tagger::tag(content, vocab)`. The default impl (`OpenAICompatibleTagger`) POSTs to `/v1/chat/completions` with the bundled prompt (currently v16) + `response_format: { type: "json_schema", strict: true, schema: { ... } }`. Schema (live in `crates/kengram-extract/src/openai_compatible.rs`):
 
     ```json
     {
@@ -283,12 +283,12 @@ There is one write path. It terminates in a `thoughts` row plus an embedding plu
       "required": ["people", "entities", "action_items", "topics", "dates_mentioned", "kind", "relations"],
       "properties": {
         "people":          { "type": "array", "items": { "type": "string" } },
-        "entities":        { "type": "array", "items": { "type": "string" }, "maxItems": 3 },
+        "entities":        { "type": "array", "items": { "type": "string" }, "maxItems": 15 },
         "action_items":    { "type": "array", "items": { "type": "string" } },
         "topics":          { "type": "array", "items": { "type": "string" }, "maxItems": 3 },
         "dates_mentioned": { "type": "array", "items": { "type": "string" } },
         "kind":            { "type": ["string", "null"],
-                             "enum": ["observation","task","idea","reference","person_note","session", null] },
+                             "enum": ["observation","task","idea","reference","person_note","session","decision_record", null] },
         "relations":       { "type": "array", "maxItems": 5,
                              "items": { "type": "object",
                                         "required": ["relation","to_kind","to_value","note"],
@@ -561,7 +561,7 @@ provider        = "openai-compatible"           # alternatives: "openrouter", "h
 endpoint        = "http://localhost:8000/v1"    # vLLM default
 model_name      = "qwen2.5-7b-instruct"         # backend-side model name
 model_id        = "vllm/qwen2.5-7b-instruct"    # provenance label → thoughts.tags_extractor_model
-model_version   = 13                            # tracks BUNDLED_TAGGER_VERSION; bump on prompt/schema change
+model_version   = 16                            # tracks BUNDLED_TAGGER_VERSION; omit to auto-track (bound to prompt identity — pinning != bundled refuses to start)
 scope_vocab_enabled = true                      # [M4.1] controlled-vocabulary hint per scope
 scope_vocab_size    = 50                        # [M4.1] top-N established terms per scope
 timeout_seconds = 60
