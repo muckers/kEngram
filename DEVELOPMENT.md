@@ -316,14 +316,14 @@ cargo run --bin kengram -- tag --scope-prefix kengram. --limit 200
 
 ### Re-tag after tagger version bump
 
-Re-run the tagger over thoughts whose stored `tags_extractor_version` is below the configured current version. Use this after bumping `[tagger].model_version` (typically after a prompt or schema change). Tags are overwritten in place — no supersede semantics, no audit chain. Pair with `--since` to bound the rerun to recent thoughts; use `--since 1970-01-01T00:00:00Z` to re-tag the entire corpus.
+Re-run the tagger over thoughts whose stored `tags_extractor_version` is below the configured current version. Use this after bumping `[tagger].model_version` (typically after a prompt or schema change). Tags are overwritten in place — no supersede semantics, no audit chain — so pass `--snapshot` to dump current tags to a JSON file first if you want a recoverable copy. Pair with `--since` to bound the rerun to recent thoughts; use `--since 1970-01-01T00:00:00Z` to re-tag the entire corpus.
 
 If you **switched the tagger model** without bumping the prompt version, the stored version isn't actually lower, so `--rerun` skips those rows. Use `--force` to re-tag every matching thought regardless of version — it re-stamps the configured `model_version` and records the new `model_id`. Bound it with `--scope` / `--scope-prefix` / `--since` / `--limit`.
 
 ```bash
 cargo run --bin kengram -- tag --rerun --scope work
 cargo run --bin kengram -- tag --rerun --scope-prefix kengram. --since 2026-04-01T00:00:00Z
-cargo run --bin kengram -- tag --rerun --since 1970-01-01T00:00:00Z   # whole corpus
+cargo run --bin kengram -- tag --snapshot --rerun --since 1970-01-01T00:00:00Z  # whole corpus (snapshot first)
 cargo run --bin kengram -- tag --force --scope work                  # re-tag regardless of version (e.g. after a model swap)
 ```
 
@@ -520,11 +520,11 @@ After bumping the tagger version (or the bundled default rolls forward and you w
    ```
    If `target_version` is lower than expected, your `~/.config/kengram/kengram.toml` is overriding the bundled default. Bump it manually or delete the `model_version` line so the bundled default takes over.
 
-2. **Re-tag the corpus.** Whole corpus:
+2. **Snapshot, then re-tag the corpus.** Re-tag overwrites `tags` in place with no history table, so capture a snapshot first — `--snapshot` writes every non-retracted row's current tags + provenance to a JSON file before tagging. Whole corpus:
    ```bash
-   cargo run --bin kengram -- tag --rerun --since 1970-01-01T00:00:00Z
+   cargo run --bin kengram -- tag --snapshot --rerun --since 1970-01-01T00:00:00Z
    ```
-   The drainer walks rows where `tags_extractor_version < target_version`. Bound it tighter if you only want a recent window — `--since 2026-04-01T00:00:00Z` or `--scope-prefix kengram.`.
+   The drainer walks rows where `tags_extractor_version < target_version`. Bound it tighter if you only want a recent window — `--since 2026-04-01T00:00:00Z` or `--scope-prefix kengram.`. If a pass produces worse tags, recover the affected rows by hand from the snapshot JSON (psql).
 
    **Cross-backend / model-swap retag note.** If you're switching providers or models (e.g. flipping from `openai-compatible` to `http`, or to a stronger model) without bumping the prompt version, the version comparison no longer marks the old rows as "stale" — a row stamped `tags_extractor_version = 13` isn't lower than the new backend's `model_version`, so `--rerun` skips it. Use `--force` to re-tag every matching thought regardless of version, bounded by `--scope` / `--scope-prefix` / `--since` / `--limit`: `kengram tag --force --since 1970-01-01T00:00:00Z` for the whole corpus. The refreshed `tags_extractor_model` records which backend did the re-tag.
 
@@ -538,9 +538,9 @@ After bumping the tagger version (or the bundled default rolls forward and you w
    ORDER BY tags_extracted_at DESC
    LIMIT 10;
    ```
-   If the change was a migration (e.g. v9's 0011), use `kengram audit migrations` instead — see [Operator workflows](#operator-workflows).
+   If the version bump also shipped a migration, use `kengram audit migrations` instead — see [Operator workflows](#operator-workflows).
 
-5. **Note for `tag_filter` consumers.** Agents that hardcoded `tag_filter` queries against an earlier prompt shape may need updating. For example, descriptive phrases like `agent memory protocol` or `cross-encoder` that v2 sometimes landed in `entities` are now consistently routed to `topics` (v3+); queries on `entities` will miss those thoughts. Migrate `tag_filter` to use `topics` for descriptive-phrase searches.
+5. **Note for `tag_filter` consumers.** A re-tag at a new prompt version can shift which field a term lands in — a phrase the old prompt emitted as an `entity` may now be a `topic`, or vice versa. Agents that pin exact `entities` / `topics` values in `tag_filter` may need to re-check those queries after a major re-tag; the raw-content search path is unaffected.
 
 ## Relational data and link graph
 
@@ -596,7 +596,7 @@ The `thought_links_deleted_at_idx` partial index (`WHERE deleted_at IS NOT NULL`
 
 ### Tagger-emitted edges
 
-When the tagger (v5+) extracts relational claims from prose, the worker drainer writes them to `thought_links` with `source = 'tagger'`. They appear in `get_related_thoughts` alongside agent-supplied edges; the caller distinguishes via `link_source`.
+When the tagger extracts relational claims from prose, the worker drainer writes them to `thought_links` with `source = 'tagger'`. They appear in `get_related_thoughts` alongside agent-supplied edges; the caller distinguishes via `link_source`.
 
 On re-tag, the drainer first soft-deletes the prior tagger edges from that thought before applying fresh emissions. Agent edges are unaffected — only `source = 'tagger'` rows are touched. This makes re-tagging idempotent at the edge level: prompt iteration can't accumulate stale tagger-emitted edges.
 
