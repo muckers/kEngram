@@ -765,9 +765,25 @@ scope_vocab_size = 50
 
 vLLM's JSON-Schema-constrained generation occasionally takes 5–10s on first-token latency for a cold model; the 60s timeout has headroom.
 
-### Preset: Ollama embedder (dev)
+### Preset: Dockerized Ollama embedder (recommended dev)
 
-Local Ollama serving bge-m3 on port 11434:
+Dedicated `ollama-embed` container serving bge-m3 on port 11435, brought up and pulled by `./start_stack.sh`. The container is CPU-only (Docker Desktop on macOS exposes no Metal to containers) so embeddings never compete with the tagger model on the host Ollama.
+
+```toml
+[embedder]
+provider = "openai-compatible"
+endpoint = "http://localhost:11435/v1"
+model = "bge-m3"
+model_id = "bge-m3:1024"
+dimensions = 1024
+timeout_seconds = 30
+```
+
+The 30s timeout has comfortable headroom over the observed 0.5–2s embed latency on Apple Silicon CPU through the Docker Desktop VM. The `:1024` suffix on `model_id` must match the HNSW partial index dimension.
+
+### Preset: Host-Ollama embedder (single-Ollama dev)
+
+If you'd rather run the embedder against the host Ollama (no Docker for embeddings, or a setup where the tagger isn't on Ollama at all):
 
 ```toml
 [embedder]
@@ -779,7 +795,7 @@ dimensions = 1024
 timeout_seconds = 5
 ```
 
-Ensure `ollama serve` (or the macOS desktop app) is running and `ollama pull bge-m3` has completed. The `:1024` suffix on `model_id` must match the HNSW partial index dimension.
+Ensure `ollama serve` (or the macOS desktop app) is running and `ollama pull bge-m3` has completed. The 5s timeout is fine for the host-Ollama path on its own — bump it if you ever point this back at a host Ollama that's also serving a large tagger model, since model-swap can blow the budget.
 
 ### Preset: OpenRouter tagger (cloud fallback)
 

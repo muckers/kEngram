@@ -41,7 +41,7 @@ The system is built in seven capability milestones (M1–M7), preceded by a smal
 
 **M0 — Development environment.** *The floor under the floor.*
 - Postgres 16 running in Docker via `docker-compose.yml` at the repo root, using the `pgvector/pgvector:pg16` image (bundles `vector`, `pg_trgm`, `pgcrypto`).
-- Ollama (already installed on the operator's box) serves as the dev-mode embedder via its OpenAI-compatible endpoint (`http://localhost:11434/v1/embeddings`, model `bge-m3`). Production retains the TEI sidecar.
+- Ollama (already installed on the operator's box) serves as the dev-mode embedder via its OpenAI-compatible endpoint (`bge-m3`). The recommended dev layout (post-M6.1) runs a *dedicated* `ollama-embed` container on `http://localhost:11435/v1` so embeddings sit on CPU and never compete for GPU with whatever model the tagger is currently serving on the host Ollama (`:11434`); a single-Ollama setup pointed at `:11434` is still supported for operators who want one process. Production retains the TEI sidecar.
 - `DEVELOPMENT.md` runbook for first-time setup. No code is written; M0 only ensures M1's code has somewhere to run.
 
 **M1 — Capture and search.** *The floor.*

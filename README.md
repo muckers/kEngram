@@ -38,11 +38,13 @@ brew install ollama   # or: download from https://ollama.com/
 The fastest path uses the launch scripts at the repo root. (Manual steps and customization: [DEVELOPMENT.md](DEVELOPMENT.md#manual-setup-advanced).)
 
 ```bash
-# 0. Pull the models once (Ollama running)
-ollama pull bge-m3                 # embeddings
+# 0. Pull the tagger model once into the host Ollama. The embedder runs
+#    in Docker — start_stack.sh pulls bge-m3 into the ollama-embed
+#    container on first run, so you don't pull it on the host.
 ollama pull qwen2.5:7b-instruct    # tagging (worker, on by default)
 
-# 1. Backing containers (Postgres + TEI reranker); waits for Postgres to be ready
+# 1. Backing containers (Postgres + TEI reranker + ollama-embed for
+#    embeddings); waits for Postgres + ollama-embed to be ready.
 ./start_stack.sh
 
 # 2. Apply migrations (idempotent; safe to re-run)
@@ -260,7 +262,7 @@ url = "postgres://kengram:kengram@localhost:5432/kengram"
 # See DEVELOPMENT.md for the annotated config reference.
 ```
 
-- **Embedder.** Defaults to Ollama at `http://localhost:11434/v1` with `bge-m3`. To change providers (TEI in production, OpenAI, OpenRouter), see [Configuration presets](DEVELOPMENT.md#configuration-presets-and-troubleshooting) in DEVELOPMENT.md.
+- **Embedder.** Recommended dev setup runs `bge-m3` in the Dockerized `ollama-embed` container on `http://localhost:11435/v1` (CPU-only, isolated from the host Ollama that serves the tagger); the built-in code default is `http://localhost:11434/v1` for operators running everything through one host Ollama. To change providers (TEI in production, OpenAI, OpenRouter), see [Configuration presets](DEVELOPMENT.md#configuration-presets-and-troubleshooting) in DEVELOPMENT.md.
 - **Tagger.** Silent-disable when `[tagger].provider` is empty (the default) — capture and search work normally; thoughts stay with `tags = '{}'`. Local vLLM and OpenRouter presets ship. See [Configuration presets](DEVELOPMENT.md#configuration-presets-and-troubleshooting).
 - **Reranker.** Optional cross-encoder re-scores the top RRF candidates: BGE-reranker-v2-m3 in production, MiniLM in dev. Disabled when `[reranker].provider` is empty (the default). See [Configuration presets](DEVELOPMENT.md#configuration-presets-and-troubleshooting).
 
