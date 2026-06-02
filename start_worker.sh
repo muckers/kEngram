@@ -7,7 +7,7 @@
 # < KENGRAM_* env. This script honors your config: if you have a kengram.toml
 # (or have set KENGRAM_TAGGER__* yourself), it is used as-is — the script injects
 # nothing. ONLY when no tagger config is present does it enable a zero-config
-# default — tagging via local Ollama (qwen2.5:7b-instruct on :11434) — so a fresh
+# default — tagging via local Ollama (qwen3-coder:30b on :11434) — so a fresh
 # checkout tags out of the box.
 #
 #   ./start_worker.sh            # honor kengram.toml; else default to Ollama tagging
@@ -34,6 +34,6 @@ fi
 exec env \
   KENGRAM_TAGGER__PROVIDER=openai-compatible \
   KENGRAM_TAGGER__ENDPOINT="${KENGRAM_TAGGER__ENDPOINT:-http://localhost:11434/v1}" \
-  KENGRAM_TAGGER__MODEL_NAME="${KENGRAM_TAGGER__MODEL_NAME:-qwen2.5:7b-instruct}" \
-  KENGRAM_TAGGER__MODEL_ID="${KENGRAM_TAGGER__MODEL_ID:-ollama/qwen2.5:7b-instruct}" \
+  KENGRAM_TAGGER__MODEL_NAME="${KENGRAM_TAGGER__MODEL_NAME:-qwen3-coder:30b}" \
+  KENGRAM_TAGGER__MODEL_ID="${KENGRAM_TAGGER__MODEL_ID:-ollama/qwen3-coder:30b}" \
   cargo run --bin kengram -- worker

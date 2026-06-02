@@ -18,11 +18,11 @@ pub struct OpenAICompatibleConfig {
     /// Base URL ending in `/v1`.
     pub endpoint: String,
     /// Model name as the backend understands it. For vLLM: the deployed
-    /// model (`"qwen2.5-7b-instruct"`). For OpenRouter: a model slug
+    /// model (`"qwen3-coder:30b"`). For OpenRouter: a model slug
     /// (`"anthropic/claude-haiku-4.5"`).
     pub model_name: String,
     /// Kengram-side stable identity written into `thoughts.tags_extractor_model`.
-    /// Conventionally `<vendor>/<model>` — `"vllm/qwen2.5-7b-instruct"`,
+    /// Conventionally `<vendor>/<model>` — `"vllm/qwen3-coder:30b"`,
     /// `"openrouter/anthropic/claude-haiku-4.5"`.
     pub model_id: String,
     /// Schema-version of this tagger's prompt/response contract. Bump
@@ -50,8 +50,8 @@ impl OpenAICompatibleConfig {
     pub fn vllm_local() -> Self {
         Self {
             endpoint: "http://localhost:8000/v1".to_string(),
-            model_name: "qwen2.5-7b-instruct".to_string(),
-            model_id: "vllm/qwen2.5-7b-instruct".to_string(),
+            model_name: "qwen3-coder:30b".to_string(),
+            model_id: "vllm/qwen3-coder:30b".to_string(),
             model_version: BUNDLED_TAGGER_VERSION,
             api_key: None,
             timeout: Duration::from_secs(60),

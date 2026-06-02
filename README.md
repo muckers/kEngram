@@ -41,7 +41,7 @@ The fastest path uses the launch scripts at the repo root. (Manual steps and cus
 # 0. Pull the tagger model once into the host Ollama. The embedder runs
 #    in Docker — start_stack.sh pulls bge-m3 into the ollama-embed
 #    container on first run, so you don't pull it on the host.
-ollama pull qwen2.5:7b-instruct    # tagging (worker, on by default)
+ollama pull qwen3-coder:30b        # tagging (worker, on by default)
 
 # 1. Backing containers (Postgres + TEI reranker + ollama-embed for
 #    embeddings); waits for Postgres + ollama-embed to be ready.

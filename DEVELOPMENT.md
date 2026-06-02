@@ -33,7 +33,7 @@ Four checked-in scripts at the repo root drive the dev stack with minimal typing
 **One-time prerequisites** (see [Install prerequisites](#install-prerequisites)): Docker, the Rust toolchain, `sqlx-cli`, and Ollama installed and running. Pull the tagger model into the host Ollama (the embedder runs in Docker — `start_stack.sh` pulls `bge-m3` into the `ollama-embed` container on first run, so you don't pull it on the host):
 
 ```bash
-ollama pull qwen2.5:7b-instruct    # tagging (worker, on by default)
+ollama pull qwen3-coder:30b    # tagging (worker, on by default)
 ```
 
 | Script | What it does |
@@ -60,12 +60,12 @@ ollama pull qwen2.5:7b-instruct    # tagging (worker, on by default)
 
 `start_stack.sh` exits once Postgres is ready (TEI keeps warming in the background — only reranked search waits on it). The server and worker both run in the foreground, so each wants its own terminal.
 
-**The worker honors your tagger config.** Precedence is built-in defaults < `~/.config/kengram/kengram.toml` < `KENGRAM_*` env. `start_worker.sh` stays out of the way: if you have a `kengram.toml` (or set `KENGRAM_TAGGER__*` yourself), it's used as-is. **Only when no config file exists** does the script enable a zero-config default — tagging via local Ollama (`qwen2.5:7b-instruct`) — so a fresh checkout tags out of the box.
+**The worker honors your tagger config.** Precedence is built-in defaults < `~/.config/kengram/kengram.toml` < `KENGRAM_*` env. `start_worker.sh` stays out of the way: if you have a `kengram.toml` (or set `KENGRAM_TAGGER__*` yourself), it's used as-is. **Only when no config file exists** does the script enable a zero-config default — tagging via local Ollama (`qwen3-coder:30b`) — so a fresh checkout tags out of the box.
 
 ```bash
 ./start_worker.sh                # honor kengram.toml; else default to Ollama tagging
 ./start_worker.sh off            # force embed-only this run (no tagging)
-KENGRAM_TAGGER__MODEL_NAME=qwen2.5:14b-instruct ./start_worker.sh   # one-off override (wins over the file)
+KENGRAM_TAGGER__MODEL_NAME=gemma3:12b ./start_worker.sh             # one-off override (wins over the file)
 ```
 
 To run a different tagger backend persistently — vLLM, OpenRouter, the HTTP sidecar, or another Ollama model — put a `[tagger]` block in `~/.config/kengram/kengram.toml` (see [Configuration reference](#configuration-reference)); the script honors it.
@@ -373,8 +373,8 @@ timeout_seconds = 30
 [tagger]                                                # opt-in
 provider = "openai-compatible"                          # "" = silent-disable; "openai-compatible" / "openrouter" / "http"
 endpoint = "http://localhost:8000/v1"                   # vLLM default; ignored when provider = "http"
-model_name = "qwen2.5-7b-instruct"                      # the model the backend serves
-model_id = "vllm/qwen2.5-7b-instruct"                   # provenance written into thoughts.tags_extractor_model
+model_name = "qwen3-coder:30b"                      # the model the backend serves
+model_id = "vllm/qwen3-coder:30b"                   # provenance written into thoughts.tags_extractor_model
 # api_key = ""
 timeout_seconds = 60
 temperature = 0.2
@@ -457,8 +457,8 @@ The tagger is the per-thought metadata sidecar. Empty `provider` is the silent-d
 |---|---|---|
 | `provider` | `""` | `""` = disabled; `"openai-compatible"` (vLLM, etc.), `"openrouter"`, or `"http"` (kengram-native sidecar — requires `[tagger.http]` below). |
 | `endpoint` | `"http://localhost:8000/v1"` | `/v1` base URL. vLLM default port. OpenRouter is `"https://openrouter.ai/api/v1"`. Ignored when `provider = "http"`. |
-| `model_name` | `"qwen2.5-7b-instruct"` | Model name as the backend understands it. For OpenRouter: a model slug like `"anthropic/claude-haiku-4.5"`. Ignored when `provider = "http"`. |
-| `model_id` | `"vllm/qwen2.5-7b-instruct"` | Kengram-side stable identity written into `thoughts.tags_extractor_model`. Conventionally `<vendor>/<model>`. Used by both LLM and HTTP-sidecar providers. |
+| `model_name` | `"qwen3-coder:30b"` | Model name as the backend understands it. For OpenRouter: a model slug like `"anthropic/claude-haiku-4.5"`. Ignored when `provider = "http"`. |
+| `model_id` | `"vllm/qwen3-coder:30b"` | Kengram-side stable identity written into `thoughts.tags_extractor_model`. Conventionally `<vendor>/<model>`. Used by both LLM and HTTP-sidecar providers. |
 | `model_version` | *depends* | Stamped onto `thoughts.tags_extractor_version`. **Not a general knob.** With `provider = "openai-compatible"` + the bundled prompt: NOT operator-set — auto-tracks `BUNDLED_TAGGER_VERSION` (setting it refuses to start). With `provider = "openai-compatible"` + `system_prompt_file`: required, a value distinct from the bundled version (partitions custom-prompt tags in provenance). With `provider = "http"`: the operator declares the sidecar's own schema version. A `BUNDLED_TAGGER_VERSION` bump (prompt/schema change) is followed by `kengram tag --rerun`. See [Tagger version history](#tagger-version-history-and-safe-re-tag-procedure). |
 | `api_key` | `None` | Bearer token for hosted LLM endpoints. The HTTP sidecar provider has its own `[tagger.http].api_key`. |
 | `timeout_seconds` | `60` | Per-request timeout for the LLM provider. The HTTP sidecar provider has its own `[tagger.http].timeout_seconds`. |
@@ -668,7 +668,7 @@ To enable later: set `provider = "openai-compatible"` (or `"openrouter"`), bring
 ```text
 kengram serve started ... tagger=disabled
 # or
-kengram serve started ... tagger=enabled (vllm/qwen2.5-7b-instruct)
+kengram serve started ... tagger=enabled (vllm/qwen3-coder:30b)
 ```
 
 ### Embed-backfill after embedder downtime
@@ -700,7 +700,7 @@ cargo run --bin kengram -- backup
 #   links:     96 live
 #   scopes:    5
 #   embedder:  bge-m3:1024 (1024d)
-#   tagger:    vllm/qwen2.5-7b-instruct v16
+#   tagger:    vllm/qwen3-coder:30b v16
 ```
 
 Defaults to `./kengram-backup-<timestamp>.tar.gz`; override with `--to <path>`. Use `--skip-embeddings` to drop embedding rows from the archive (smaller backup; restore requires `kengram embed-backfill` to repopulate vectors; HNSW index survives an empty table).
@@ -749,14 +749,14 @@ cargo run --bin kengram -- stats
 
 ### Preset: vLLM-local tagger (dev)
 
-Local vLLM serving qwen2.5-7b-instruct on port 8000:
+Local vLLM serving qwen3-coder:30b on port 8000:
 
 ```toml
 [tagger]
 provider = "openai-compatible"
 endpoint = "http://localhost:8000/v1"
-model_name = "qwen2.5-7b-instruct"
-model_id = "vllm/qwen2.5-7b-instruct"
+model_name = "qwen3-coder:30b"
+model_id = "vllm/qwen3-coder:30b"
 timeout_seconds = 60
 temperature = 0.2
 scope_vocab_enabled = true

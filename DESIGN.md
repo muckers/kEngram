@@ -460,7 +460,7 @@ pub trait Reranker: Send + Sync {
 
 #[async_trait]                      // [M4]
 pub trait Tagger: Send + Sync {
-    fn model_id(&self) -> &str;                  // e.g. "vllm/qwen2.5-7b-instruct"
+    fn model_id(&self) -> &str;                  // e.g. "vllm/qwen3-coder:30b"
     fn version(&self) -> i32;                    // bumped when tagger prompt/schema changes
     // [M4.1] vocab is the top-N established topic + entity terms in the
     // thought's scope; rendered into the prompt as a controlled-vocabulary hint.
@@ -525,8 +525,8 @@ timeout_seconds = 30
 [tagger]                                        # [M4]; empty provider = silent disable
 provider        = "openai-compatible"           # alternatives: "openrouter", "http"; "" = disabled
 endpoint        = "http://localhost:8000/v1"    # vLLM default
-model_name      = "qwen2.5-7b-instruct"         # backend-side model name
-model_id        = "vllm/qwen2.5-7b-instruct"    # provenance label → thoughts.tags_extractor_model
+model_name      = "qwen3-coder:30b"         # backend-side model name
+model_id        = "vllm/qwen3-coder:30b"    # provenance label → thoughts.tags_extractor_model
 scope_vocab_enabled = true                      # [M4.1] controlled-vocabulary hint per scope
 scope_vocab_size    = 50                        # [M4.1] top-N established terms per scope
 timeout_seconds = 60

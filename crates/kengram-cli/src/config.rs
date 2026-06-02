@@ -201,11 +201,11 @@ pub struct TaggerConfig {
     /// `/v1` base URL. For vLLM: `"http://localhost:8000/v1"`. For
     /// OpenRouter: `"https://openrouter.ai/api/v1"`.
     pub endpoint: String,
-    /// Backend model name. For vLLM: the deployed model (`"qwen2.5-7b-instruct"`).
+    /// Backend model name. For vLLM: the deployed model (`"qwen3-coder:30b"`).
     /// For OpenRouter: a model slug (`"anthropic/claude-haiku-4.5"`).
     pub model_name: String,
     /// Kengram-side stable identity written into `thoughts.tags_extractor_model`.
-    /// Conventionally `<vendor>/<model>`. Defaults to `"vllm/qwen2.5-7b-instruct"`.
+    /// Conventionally `<vendor>/<model>`. Defaults to `"vllm/qwen3-coder:30b"`.
     pub model_id: String,
     /// Schema-version for `thoughts.tags_extractor_version`. Default tracks
     /// `kengram_extract::BUNDLED_TAGGER_VERSION` (currently 16 — ten
@@ -312,8 +312,8 @@ impl Default for TaggerConfig {
             // setting provider = "openai-compatible" (or "openrouter").
             provider: String::new(),
             endpoint: "http://localhost:8000/v1".to_string(),
-            model_name: "qwen2.5-7b-instruct".to_string(),
-            model_id: "vllm/qwen2.5-7b-instruct".to_string(),
+            model_name: "qwen3-coder:30b".to_string(),
+            model_id: "vllm/qwen3-coder:30b".to_string(),
             // Track the bundled const so a prompt-version bump in
             // kengram-extract propagates without a hand-edit here. The
             // version history lives on `BUNDLED_TAGGER_VERSION` itself.
@@ -425,8 +425,8 @@ mod tests {
         let c = Config::default();
         assert_eq!(c.tagger.provider, "");
         assert_eq!(c.tagger.endpoint, "http://localhost:8000/v1");
-        assert_eq!(c.tagger.model_name, "qwen2.5-7b-instruct");
-        assert_eq!(c.tagger.model_id, "vllm/qwen2.5-7b-instruct");
+        assert_eq!(c.tagger.model_name, "qwen3-coder:30b");
+        assert_eq!(c.tagger.model_id, "vllm/qwen3-coder:30b");
         assert_eq!(c.tagger.model_version, BUNDLED_TAGGER_VERSION);
         assert!(c.tagger.api_key.is_none());
         // Default is the bundled prompt — no file override.

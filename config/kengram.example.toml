@@ -60,8 +60,8 @@ timeout_seconds = 30
 #   "http"              — the kengram-native sidecar (see [tagger.http] + docs/tagger-backends.md)
 provider = ""
 endpoint = "http://localhost:8000/v1"
-model_name = "qwen2.5-7b-instruct"
-model_id = "vllm/qwen2.5-7b-instruct"
+model_name = "qwen3-coder:30b"
+model_id = "vllm/qwen3-coder:30b"
 # api_key = "..."                 # e.g. an OpenRouter key (or use KENGRAM_TAGGER__API_KEY)
 timeout_seconds = 60
 temperature = 0.2

@@ -71,7 +71,7 @@ fn fingerprint_of(content: &str) -> [u8; 32] {
 /// embedder on drain.
 ///
 /// `tagger_model_id` is the active tagger's identity (e.g.
-/// `"vllm/qwen2.5-7b-instruct"`). `None` silent-disables the tag-job
+/// `"vllm/qwen3-coder:30b"`). `None` silent-disables the tag-job
 /// enqueue — captures still work, the thought just stays with `tags = '{}'`
 /// until a tagger is configured and the operator runs `kengram tag --rerun`.
 pub async fn capture(

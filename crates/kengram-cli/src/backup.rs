@@ -680,7 +680,7 @@ mod tests {
                 dimensions: 1024,
             },
             tagger: Some(TaggerInfo {
-                model_id: "vllm/qwen2.5-7b-instruct".into(),
+                model_id: "vllm/qwen3-coder:30b".into(),
                 version: 7,
             }),
             corpus: CorpusSummary {

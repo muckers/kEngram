@@ -2351,7 +2351,7 @@ mod tests {
             dates_mentioned: vec!["Thursday".into()],
             kind: Some(TagKind::Task),
         };
-        update_thought_tags(&pool, id, &tags, "vllm/qwen2.5-7b-instruct", 1)
+        update_thought_tags(&pool, id, &tags, "vllm/qwen3-coder:30b", 1)
             .await
             .unwrap();
 
@@ -2359,7 +2359,7 @@ mod tests {
         assert_eq!(read.tags, tags);
         assert_eq!(
             read.tagger_model_id.as_deref(),
-            Some("vllm/qwen2.5-7b-instruct")
+            Some("vllm/qwen3-coder:30b")
         );
         assert_eq!(read.tagger_version, Some(1));
         assert!(read.tagged_at.is_some());
@@ -2368,7 +2368,7 @@ mod tests {
     #[sqlx::test(migrations = "../../migrations")]
     async fn enqueue_tag_job_inserts_into_pending_tags(pool: PgPool) {
         let id = insert_test_thought(&pool, "to tag", "global").await;
-        let inserted = enqueue_tag_job(&pool, id, "vllm/qwen2.5-7b-instruct")
+        let inserted = enqueue_tag_job(&pool, id, "vllm/qwen3-coder:30b")
             .await
             .unwrap();
         assert!(inserted);
@@ -2376,7 +2376,7 @@ mod tests {
         let jobs = fetch_pending_tag_jobs(&pool, 10).await.unwrap();
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].thought_id, id);
-        assert_eq!(jobs[0].tagger_model_id, "vllm/qwen2.5-7b-instruct");
+        assert_eq!(jobs[0].tagger_model_id, "vllm/qwen3-coder:30b");
         assert_eq!(jobs[0].attempts, 0);
     }
 

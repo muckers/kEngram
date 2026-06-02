@@ -231,7 +231,7 @@ mod tests {
         let mut t = make_thought();
         let when = OffsetDateTime::from_unix_timestamp(1_710_000_000).unwrap();
         t.tags_extracted_at = Some(when);
-        t.tags_extractor_model = Some("vllm/qwen2.5-7b-instruct".into());
+        t.tags_extractor_model = Some("vllm/qwen3-coder:30b".into());
         t.tags_extractor_version = Some(1);
         let s = serde_json::to_string(&t).unwrap();
         let parsed: Thought = serde_json::from_str(&s).unwrap();

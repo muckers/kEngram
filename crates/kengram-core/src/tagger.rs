@@ -97,7 +97,7 @@ impl ExtractedTarget {
 pub trait Tagger: Send + Sync {
     /// Stable model identifier — written into `thoughts.tags_extractor_model`
     /// for provenance. Conventionally `"<vendor>/<model>"`, e.g.
-    /// `"openai/gpt-4o-mini"` or `"vllm/qwen2.5-7b-instruct"`.
+    /// `"openai/gpt-4o-mini"` or `"vllm/qwen3-coder:30b"`.
     fn model_id(&self) -> &str;
 
     /// Schema-version of *this* tagger's prompt/response contract. Bump
