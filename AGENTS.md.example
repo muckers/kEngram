@@ -1,0 +1,54 @@
+# Kengram memory (always-on, all projects)
+
+I use the **kengram** MCP server as my persistent memory across all projects.
+Tools are `mcp__kengram__*` (capture, search_thoughts, recent_thoughts, get_thought,
+get_related_thoughts, link_thoughts, unlink_thoughts, list_scopes, retract_thought).
+Load their schemas via ToolSearch before first use.
+
+## On startup
+- Call `mcp__kengram__list_scopes` once at the start of each session to load the current
+  scopes before doing work. (A SessionStart hook reminds me to do this.)
+
+## Storing memories (kengram is the store of record)
+- Persist anything worth remembering — decisions, preferences, project facts, useful
+  references — with `mcp__kengram__capture`. Do NOT add new entries to the old
+  file-based auto-memory; kengram is now the single store for new memories.
+- Reuse an existing scope from the startup `list_scopes` result when one fits. Only
+  create a new scope when none is appropriate. Follow the existing dotted-namespace
+  convention — e.g. `rjf.personal`, `rjf.tech`, `rjf.professional.cto`, `project.<name>`.
+  Do not invent new scopes silently or with a different separator.
+- `capture` is idempotent on content, so re-capturing the same fact is safe.
+
+## Authoring a thought (be tagger-friendly)
+
+The body's surface vocabulary drives `tags` extraction. The opening sentence
+carries the highest weight; tag-extraction probability falls off after it.
+Two practical rules:
+
+- **Prose carries the claim; the graph carries the evidence.** State the claim
+  cleanly in the opening sentence. Do not pile example names or quoted strings
+  from OTHER thoughts into the prose — those get lifted into `entities` of THIS
+  thought even when they only appear in citation form, polluting the tag index.
+  Use `mcp__kengram__link_thoughts` to cite evidence / predecessors / refinements
+  instead:
+  - `references` for passive citation or contextual mention
+  - `supports` when this thought makes a claim that ACTIVELY confirms another's
+    claim
+  - `refines` when this thought represents updated thinking on the same
+    proposition (both stand)
+  - `replaces` when this thought supersedes a retracted predecessor
+- **Length: aim for ~100–300 words.** Tight enough that the tagger finds the
+  topic; long enough that a future agent can act on the body alone without
+  traversing the graph. Under ~50 words risks context loss; over ~500 risks tag
+  pollution and topic blur.
+
+Metadata (`{client_name, session_id, agent_role, ...}`) is opaque to retrieval
+and graph traversal — use it for agent bookkeeping, never for cross-thought
+references. To make a term filterable via `tag_filter` (entity or topic), put
+it in the opening sentence of the prose.
+
+## Recalling
+- Before answering "what did we discuss / decide / agree about X" or relying on past
+  context, search kengram FIRST with `mcp__kengram__search_thoughts` (optionally a
+  `tag_filter`, e.g. `{"kind": "decision_record"}`) and check `recent_thoughts`.
+  Don't assert what was decided previously without checking kengram.
