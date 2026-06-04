@@ -36,7 +36,12 @@ services:
       start_period: 10s
 
   tei:
-    image: ghcr.io/huggingface/text-embeddings-inference:cpu-arm64-latest
+    # Arch-portable tag. start_stack.sh detects the host arch (uname -m) and
+    # writes KENGRAM_TEI_IMAGE_TAG to .env — `cpu-latest` on x86_64,
+    # `cpu-arm64-latest` on ARM64 (Apple Silicon) — which compose auto-loads.
+    # The `cpu-latest` default keeps a bare `docker compose up` working on
+    # x86_64 hosts that never ran start_stack.sh.
+    image: ghcr.io/huggingface/text-embeddings-inference:${KENGRAM_TEI_IMAGE_TAG:-cpu-latest}
     container_name: kengram-tei
     restart: unless-stopped
     environment:

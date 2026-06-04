@@ -8,6 +8,17 @@
 # tagger sidecar.
 set -euo pipefail
 
+# The TEI reranker image is arch-specific (cpu-latest = x86_64, cpu-arm64-latest
+# = Apple Silicon). Detect the host arch and record the tag in .env, which compose
+# auto-loads on every invocation — so stop_stack.sh and bare `docker compose`
+# resolve the same tag with no extra wiring. .env is gitignored; each host writes
+# its own.
+case "$(uname -m)" in
+  arm64|aarch64) tei_tag=cpu-arm64-latest ;;
+  *)             tei_tag=cpu-latest ;;
+esac
+printf 'KENGRAM_TEI_IMAGE_TAG=%s\n' "$tei_tag" > .env
+
 if [[ "${1:-}" == "--tagger" ]]; then
   docker compose --profile tagger up -d postgres tei ollama-embed tagger-deterministic
 else

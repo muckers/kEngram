@@ -159,7 +159,7 @@ Then add a `[reranker]` section to your `kengram.toml` (see Configuration below)
 
 **Model choice.** `docker-compose.yml` pins `cross-encoder/ms-marco-MiniLM-L-6-v2` — the small (~22M parameter) dev reranker that has ONNX exports on HF (TEI takes the fast ORT path; sub-100ms per call on Apple Silicon CPU). For production with a GPU host, override via `[reranker].model_id` to `BAAI/bge-reranker-v2-m3` or another full-size model.
 
-The Apple Silicon variant of the image (`cpu-arm64-latest`) is what's pinned. Production deployments use TEI as a systemd-managed sidecar, not Docker — same HTTP interface either way.
+The TEI image tag is selected per host architecture: `start_stack.sh` detects `uname -m` and writes `KENGRAM_TEI_IMAGE_TAG` to `.env` (gitignored) — `cpu-latest` on x86_64, `cpu-arm64-latest` on ARM64 (Apple Silicon) — which compose auto-loads. The same checked-in files therefore run unmodified on both; the `docker-compose.yml` default of `cpu-latest` covers a bare `docker compose up` on x86_64. Production deployments use TEI as a systemd-managed sidecar, not Docker — same HTTP interface either way.
 
 ### 3c. (Optional) Start the deterministic tagger sidecar
 
