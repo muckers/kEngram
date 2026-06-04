@@ -179,7 +179,7 @@ Any client speaking streamable-HTTP can point at `http://127.0.0.1:8081/mcp` dir
 
 ## What you get (MCP surface)
 
-**Status:** everything through M6 is shipped — capture & search, hybrid retrieval with cross-encoder rerank, the tagging sidecar, and the relational link graph. M7 (operational maturity — metrics, Tier 2 auth, eval suite, backups) is ahead. See the [Roadmap](#roadmap) for the per-milestone breakdown.
+**Status:** everything through M6 is shipped — capture & search, hybrid retrieval with cross-encoder rerank, the tagging sidecar, and the relational link graph — plus the first M7 surface, `kengram backup` / `restore` (M7.0). The rest of M7 (operational maturity — Prometheus metrics, Tier 2 auth, eval suite) is open work and a good first place to contribute. See the [Roadmap](#roadmap) for the per-milestone breakdown.
 
 | Tool | What it does |
 |---|---|
@@ -299,7 +299,7 @@ Built across seven capability milestones (M1 → M7), preceded by an environment
 | [M4.1 — v2 tagging](docs/milestones/m4.1-tagging-v2.md) | ✅ | Split `topics` into `entities` + `topics`; scope-aware controlled-vocabulary injection. |
 | [M5 — selective relations](docs/milestones/m5-selective-relations.md) | ✅ | Thought-to-thought graph layer with seven closed-vocabulary relations. M5.1 added `supports`. M5.2 added polymorphic targets, soft-delete with three-way unlink status, and operator audit (`migration_audit` + `kengram audit migrations`). |
 | [M6 — stats CLI + tagger-extracted relations](docs/milestones/m6-stats-and-tagger-relations.md) | ✅ | `kengram stats` CLI for corpus + storage telemetry. v5+ tagger auto-emits non-thought relations (URLs / entities / persons) from prose with `source='tagger'`. The original M6 (artifacts) was dropped after a live-corpus measurement showed kengram occupies a high-signal-density sweet spot. |
-| [M7 — operational maturity](docs/milestones/m7-operational-maturity.md) | ⏳ | Metrics, Tier 2 auth, eval suite, backups |
+| [M7 — operational maturity](docs/milestones/m7-operational-maturity.md) | 🚧 | **Shipped (M7.0):** `kengram backup` / `kengram restore` with manifest sidecar + compatibility checks. **Open:** Prometheus `/metrics`, Tier 2 bearer-token auth, eval suite, backup retention cron, tunnel deployment guide. |
 
 Per-milestone progress is tracked in `docs/milestones/m{N}-progress.md`.
 
