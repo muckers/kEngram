@@ -1,0 +1,46 @@
+# Example model-arms file for `kengram eval tagger`.
+#
+# Copy to eval/models.toml (gitignored) and edit. Each [[arm]] is one tagger
+# under test. `api_key_env` names an ENVIRONMENT VARIABLE holding the bearer
+# token — never put a key in this file.
+#
+# Providers:
+#   "openai-compatible" — any /v1/chat/completions backend with strict
+#                         json_schema support (Ollama, vLLM, OpenRouter).
+#   "http"              — a kengram tagger-sidecar (e.g. the deterministic
+#                         GLiNER sidecar in crates/kengram-tagger-deterministic).
+#
+# Prompt A/B: add `system_prompt_file = "prompts/v17.txt"` plus a
+# `model_version = 17` — the production provenance binding rejects a custom
+# prompt without its own version number.
+
+[[arm]]
+name = "gemma3-12b"
+provider = "openai-compatible"
+endpoint = "http://localhost:11434/v1"
+model_name = "gemma3:12b"
+
+[[arm]]
+name = "qwen3-coder-30b"
+provider = "openai-compatible"
+endpoint = "http://localhost:11434/v1"
+model_name = "qwen3-coder:30b"
+
+# [[arm]]
+# name = "qwen3.6-27b"
+# provider = "openai-compatible"
+# endpoint = "http://localhost:11434/v1"
+# model_name = "qwen3.6:27b"
+# timeout_seconds = 300            # larger models need headroom
+
+# [[arm]]
+# name = "gliner-sidecar"
+# provider = "http"
+# endpoint = "http://localhost:8082"
+
+# [[arm]]
+# name = "cloud-haiku"
+# provider = "openai-compatible"
+# endpoint = "https://openrouter.ai/api/v1"
+# model_name = "anthropic/claude-haiku-4.5"
+# api_key_env = "OPENROUTER_API_KEY"

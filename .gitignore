@@ -35,3 +35,11 @@ Thumbs.db
 /docs/goals/
 /scripts/smoke.md
 /AGENTS.md
+
+# Eval harness: personal corpora contain real thought content — never commit.
+# The synthetic example corpus and the example arms file are the only
+# committed eval assets. Reports are run artifacts.
+/eval/corpora/*
+!/eval/corpora/example.json
+/eval/models.toml
+/eval/reports/

@@ -58,6 +58,7 @@ axum    = "0.8"
 
 # Config
 figment = { version = "0.10", features = ["toml", "env"] }
+toml    = "0.8"
 
 # CLI
 clap = { version = "4", features = ["derive"] }

@@ -1603,6 +1603,7 @@ name = "kengram-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "clap",
  "figment",
@@ -1614,10 +1615,12 @@ dependencies = [
  "rmcp",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "time",
  "tokio",
  "tokio-util",
+ "toml 0.8.23",
  "tracing",
  "tracing-subscriber",
  "uuid",
