@@ -441,7 +441,15 @@ mod tests {
     use kengram_embed::{FakeBehavior, FakeEmbedder};
     use kengram_extract::{FakeBehavior as TaggerFakeBehavior, FakeTagger};
 
-    const TEST_EMBEDDER_MODEL_ID: &str = "bge-m3:1024";
+    const TEST_EMBEDDER_MODEL_ID: &str = "qwen3-embedding";
+
+    fn test_embedding_model() -> EmbeddingModel {
+        EmbeddingModel::new(TEST_EMBEDDER_MODEL_ID, 4096)
+    }
+
+    fn test_embedder() -> FakeEmbedder {
+        FakeEmbedder::with_model(test_embedding_model())
+    }
 
     async fn capture_one(pool: &PgPool, content: &str) -> ThoughtId {
         capture(
@@ -468,7 +476,7 @@ mod tests {
         let id = capture_one(&pool, "drain me").await;
         assert_eq!(kengram_storage::count_pending(&pool).await.unwrap(), 1);
 
-        let good = FakeEmbedder::new();
+        let good = test_embedder();
         let report = drain_pending_embeddings(&pool, &good, 10).await.unwrap();
         assert_eq!(report.found, 1);
         assert_eq!(report.embedded, 1);
@@ -476,7 +484,7 @@ mod tests {
 
         assert_eq!(kengram_storage::count_pending(&pool).await.unwrap(), 0);
         assert!(
-            kengram_storage::thought_has_embedding(&pool, id, &EmbeddingModel::bge_m3())
+            kengram_storage::thought_has_embedding(&pool, id, &test_embedding_model())
                 .await
                 .unwrap()
         );
@@ -486,7 +494,7 @@ mod tests {
     async fn drain_marks_failed_and_leaves_row_on_embedder_error(pool: PgPool) {
         let _id = capture_one(&pool, "stays queued").await;
 
-        let bad = FakeEmbedder::always_failing(EmbeddingModel::bge_m3(), FakeBehavior::Unreachable);
+        let bad = FakeEmbedder::always_failing(test_embedding_model(), FakeBehavior::Unreachable);
         let report = drain_pending_embeddings(&pool, &bad, 10).await.unwrap();
         assert_eq!(report.found, 1);
         assert_eq!(report.embedded, 0);
@@ -504,14 +512,14 @@ mod tests {
     #[sqlx::test(migrations = "../../migrations")]
     async fn drain_idempotent_on_crash_replay(pool: PgPool) {
         let id = capture_one(&pool, "replay").await;
-        let model = EmbeddingModel::bge_m3();
+        let model = test_embedding_model();
 
         let job = kengram_storage::claim_pending(&pool, 10)
             .await
             .unwrap()
             .pop()
             .unwrap();
-        let emb = Embedding::new(model.clone(), vec![0.5_f32; 1024]).unwrap();
+        let emb = Embedding::new(model.clone(), vec![0.5_f32; 4096]).unwrap();
         kengram_storage::insert_thought_embedding(&pool, id, &emb)
             .await
             .unwrap();
@@ -519,7 +527,7 @@ mod tests {
         assert_eq!(kengram_storage::count_pending(&pool).await.unwrap(), 1);
         let _ = job;
 
-        let good = FakeEmbedder::new();
+        let good = test_embedder();
         let report = drain_pending_embeddings(&pool, &good, 10).await.unwrap();
         assert_eq!(report.found, 1);
         assert_eq!(report.embedded, 1, "replay tick must mark embedded cleanly");
@@ -553,7 +561,7 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn drain_empty_queue_is_a_noop(pool: PgPool) {
-        let good = FakeEmbedder::new();
+        let good = test_embedder();
         let report = drain_pending_embeddings(&pool, &good, 10).await.unwrap();
         assert_eq!(report.found, 0);
         assert_eq!(report.embedded, 0);

@@ -87,7 +87,15 @@ mod tests {
     use kengram_embed::{FakeBehavior, FakeEmbedder};
     use sha2::{Digest, Sha256};
 
-    const TEST_EMBEDDER_MODEL_ID: &str = "bge-m3:1024";
+    const TEST_EMBEDDER_MODEL_ID: &str = "qwen3-embedding";
+
+    fn test_embedding_model() -> EmbeddingModel {
+        EmbeddingModel::new(TEST_EMBEDDER_MODEL_ID, 4096)
+    }
+
+    fn test_embedder() -> FakeEmbedder {
+        FakeEmbedder::with_model(test_embedding_model())
+    }
 
     async fn cap(pool: &PgPool, content: &str, scope: &str) -> ThoughtId {
         capture(
@@ -140,7 +148,7 @@ mod tests {
         let id_b = cap(&pool, "beta", "global").await;
         assert_eq!(kengram_storage::count_pending(&pool).await.unwrap(), 2);
 
-        let good = FakeEmbedder::new();
+        let good = test_embedder();
         let report = embed_backfill(&pool, &good, None, None, 100).await.unwrap();
         assert_eq!(report.healed, 0, "both thoughts were already queued");
         assert_eq!(report.embedded, 2);
@@ -166,7 +174,7 @@ mod tests {
         let id = raw_insert(&pool, "stranded", "global").await;
         assert_eq!(kengram_storage::count_pending(&pool).await.unwrap(), 0);
 
-        let good = FakeEmbedder::new();
+        let good = test_embedder();
         let report = embed_backfill(&pool, &good, None, None, 100).await.unwrap();
         assert_eq!(report.healed, 1);
         assert_eq!(report.embedded, 1);
@@ -180,7 +188,7 @@ mod tests {
     #[sqlx::test(migrations = "../../migrations")]
     async fn skips_already_embedded(pool: PgPool) {
         let id = cap(&pool, "already done", "global").await;
-        let good = FakeEmbedder::new();
+        let good = test_embedder();
         let first = embed_backfill(&pool, &good, None, None, 100).await.unwrap();
         assert_eq!(first.embedded, 1);
 
@@ -206,7 +214,7 @@ mod tests {
             .await
             .unwrap();
 
-        let good = FakeEmbedder::new();
+        let good = test_embedder();
         let report = embed_backfill(&pool, &good, Some("work"), None, 100)
             .await
             .unwrap();
@@ -235,7 +243,7 @@ mod tests {
         for i in 0..5 {
             cap(&pool, &format!("t-{i}"), "global").await;
         }
-        let good = FakeEmbedder::new();
+        let good = test_embedder();
         let report = embed_backfill(&pool, &good, None, None, 2).await.unwrap();
         assert!(
             report.embedded <= 2,
@@ -250,8 +258,7 @@ mod tests {
     async fn handles_embedder_failure_for_individual_thoughts(pool: PgPool) {
         cap(&pool, "stays pending", "global").await;
 
-        let still_bad =
-            FakeEmbedder::always_failing(EmbeddingModel::bge_m3(), FakeBehavior::Timeout);
+        let still_bad = FakeEmbedder::always_failing(test_embedding_model(), FakeBehavior::Timeout);
         let report = embed_backfill(&pool, &still_bad, None, None, 100)
             .await
             .unwrap();

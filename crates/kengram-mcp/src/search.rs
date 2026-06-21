@@ -447,10 +447,18 @@ mod tests {
     use super::*;
     use crate::capture::{CaptureRequest, capture};
     use crate::drain::drain_pending_embeddings;
-    use kengram_core::{TagKind, Tags};
+    use kengram_core::{EmbeddingModel, TagKind, Tags};
     use kengram_embed::{FakeBehavior, FakeEmbedder};
 
-    const TEST_EMBEDDER_MODEL_ID: &str = "bge-m3:1024";
+    const TEST_EMBEDDER_MODEL_ID: &str = "qwen3-embedding";
+
+    fn test_embedding_model() -> EmbeddingModel {
+        EmbeddingModel::new(TEST_EMBEDDER_MODEL_ID, 4096)
+    }
+
+    fn test_embedder() -> FakeEmbedder {
+        FakeEmbedder::with_model(test_embedding_model())
+    }
 
     /// Capture a thought — leaves it queued, not embedded.
     async fn cap(pool: &PgPool, content: &str, scope: &str) -> ThoughtId {
@@ -486,7 +494,7 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn search_thoughts_round_trip_with_fake_embedder(pool: PgPool) {
-        let embedder = FakeEmbedder::new();
+        let embedder = test_embedder();
         let id_a = cap_and_drain(&pool, &embedder, "alpha", "global").await;
         let _id_b = cap_and_drain(&pool, &embedder, "beta", "global").await;
 
@@ -517,7 +525,7 @@ mod tests {
     async fn search_thoughts_degrades_when_embedder_fails(pool: PgPool) {
         let id = cap(&pool, "the tcgplayer integration was painful", "work").await;
 
-        let bad = FakeEmbedder::always_failing(EmbeddingModel::bge_m3(), FakeBehavior::Unreachable);
+        let bad = FakeEmbedder::always_failing(test_embedding_model(), FakeBehavior::Unreachable);
         let resp = search_thoughts(
             &pool,
             &bad,
@@ -543,7 +551,7 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn search_thoughts_empty_query_errors(pool: PgPool) {
-        let embedder = FakeEmbedder::new();
+        let embedder = test_embedder();
         let err = search_thoughts(
             &pool,
             &embedder,
@@ -566,7 +574,7 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn search_thoughts_limit_out_of_bounds_errors(pool: PgPool) {
-        let embedder = FakeEmbedder::new();
+        let embedder = test_embedder();
         let err = search_thoughts(
             &pool,
             &embedder,
@@ -589,7 +597,7 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn search_thoughts_respects_scope(pool: PgPool) {
-        let embedder = FakeEmbedder::new();
+        let embedder = test_embedder();
         cap(&pool, "tcgplayer work", "work").await;
         cap(&pool, "tcgplayer personal", "personal").await;
 
@@ -636,7 +644,7 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn get_thought_indexed_after_drain(pool: PgPool) {
-        let embedder = FakeEmbedder::new();
+        let embedder = test_embedder();
         let id = cap_and_drain(&pool, &embedder, "hello", "global").await;
         let resp = get_thought(&pool, embedder.model(), id).await.unwrap();
         assert_eq!(resp.embedding_status, EmbeddingStatus::Indexed);
@@ -646,7 +654,7 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn get_thought_pending_when_unembedded(pool: PgPool) {
-        let embedder = FakeEmbedder::new();
+        let embedder = test_embedder();
         let id = cap(&pool, "hello", "global").await;
         let resp = get_thought(&pool, embedder.model(), id).await.unwrap();
         assert_eq!(resp.embedding_status, EmbeddingStatus::Pending);
@@ -655,7 +663,7 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn get_thought_not_found(pool: PgPool) {
-        let embedder = FakeEmbedder::new();
+        let embedder = test_embedder();
         let err = get_thought(&pool, embedder.model(), ThoughtId::new())
             .await
             .unwrap_err();
@@ -676,7 +684,7 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn search_thoughts_filters_by_tag_kind(pool: PgPool) {
-        let embedder = FakeEmbedder::new();
+        let embedder = test_embedder();
         let task_id = cap_with_tags(
             &pool,
             "needs doing alpha",
@@ -721,7 +729,7 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn search_thoughts_filters_by_tag_array_containment(pool: PgPool) {
-        let embedder = FakeEmbedder::new();
+        let embedder = test_embedder();
         let sarah_id = cap_with_tags(
             &pool,
             "meeting with Sarah and Ron",
@@ -766,7 +774,7 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn search_thoughts_empty_tag_filter_is_noop(pool: PgPool) {
-        let embedder = FakeEmbedder::new();
+        let embedder = test_embedder();
         cap(&pool, "alpha keyword", "global").await;
         cap(&pool, "beta keyword", "global").await;
 
@@ -793,7 +801,7 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn search_thoughts_response_carries_tags_per_hit(pool: PgPool) {
-        let embedder = FakeEmbedder::new();
+        let embedder = test_embedder();
         let id = cap_with_tags(
             &pool,
             "tagged content here",
@@ -890,7 +898,7 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn get_thought_carries_tags_and_provenance(pool: PgPool) {
-        let embedder = FakeEmbedder::new();
+        let embedder = test_embedder();
         let tags = Tags {
             topics: vec!["meeting".into()],
             kind: Some(TagKind::Session),

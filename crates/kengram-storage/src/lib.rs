@@ -122,6 +122,27 @@ fn ann_projection_index_name(projection_id: &str) -> String {
     }
 }
 
+async fn ann_projection_index_ready_on_conn(
+    conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>,
+    index_name: &str,
+) -> Result<(bool,), sqlx::Error> {
+    sqlx::query_as(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM pg_class c
+            JOIN pg_index i ON i.indexrelid = c.oid
+            WHERE c.relname = $1
+              AND i.indisready
+              AND i.indisvalid
+        )
+        "#,
+    )
+    .bind(index_name)
+    .fetch_one(&mut **conn)
+    .await
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
     #[error("database error: {0}")]
@@ -2092,21 +2113,7 @@ pub async fn ensure_ann_projection_index(
         .execute(&mut *conn)
         .await?;
 
-    let ready_before: Result<(bool,), sqlx::Error> = sqlx::query_as(
-        r#"
-        SELECT EXISTS (
-            SELECT 1
-            FROM pg_class c
-            JOIN pg_index i ON i.indexrelid = c.oid
-            WHERE c.relname = $1
-              AND i.indisready
-              AND i.indisvalid
-        )
-        "#,
-    )
-    .bind(&index_name)
-    .fetch_one(&mut *conn)
-    .await;
+    let ready_before = ann_projection_index_ready_on_conn(&mut conn, &index_name).await;
 
     let mut create_error: Option<sqlx::Error> = None;
     if matches!(ready_before, Ok((false,))) {
@@ -2116,21 +2123,7 @@ pub async fn ensure_ann_projection_index(
     }
 
     let ready_after: Result<(bool,), sqlx::Error> = if create_error.is_none() {
-        sqlx::query_as(
-            r#"
-            SELECT EXISTS (
-                SELECT 1
-                FROM pg_class c
-                JOIN pg_index i ON i.indexrelid = c.oid
-                WHERE c.relname = $1
-                  AND i.indisready
-                  AND i.indisvalid
-            )
-            "#,
-        )
-        .bind(&index_name)
-        .fetch_one(&mut *conn)
-        .await
+        ann_projection_index_ready_on_conn(&mut conn, &index_name).await
     } else {
         Ok((false,))
     };
@@ -2951,6 +2944,57 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].thought.id, id_b);
         assert_eq!(hits[0].thought.scope.as_str(), "scope-b");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_vector_knn_raw_fallback_covers_scope_prefix_projection_gap(pool: PgPool) {
+        let model = EmbeddingModel::new("qwen3-embedding", 4096);
+
+        let id_projected = insert_test_thought(&pool, "projected lake alpha", "lake.alpha").await;
+        let id_raw_only = insert_test_thought(&pool, "raw-only lake beta", "lake.beta").await;
+        let id_outside = insert_test_thought(&pool, "raw-only outside", "outside").await;
+
+        let v_projected = unit_vector_4096(0);
+        let v_raw_only = unit_vector_4096(1);
+        let v_outside = unit_vector_4096(2);
+
+        insert_thought_embedding(
+            &pool,
+            id_projected,
+            &Embedding::new(model.clone(), v_projected).unwrap(),
+        )
+        .await
+        .unwrap();
+        reconcile_ann_projections(&pool, &model).await.unwrap();
+
+        insert_raw_embedding_without_projection(
+            &pool,
+            id_raw_only.into_uuid(),
+            &model,
+            v_raw_only.clone(),
+        )
+        .await;
+        insert_raw_embedding_without_projection(&pool, id_outside.into_uuid(), &model, v_outside)
+            .await;
+
+        let hits = search_vector_knn(&pool, v_raw_only, &model, None, Some("lake."), 10)
+            .await
+            .unwrap();
+
+        let hit_ids = hits.iter().map(|hit| hit.thought.id).collect::<Vec<_>>();
+        assert!(
+            hit_ids.contains(&id_raw_only),
+            "prefix fallback must include raw-only rows under the requested scope_prefix"
+        );
+        assert!(
+            hit_ids.contains(&id_projected),
+            "prefix fallback should still include projected rows under the requested scope_prefix"
+        );
+        assert!(
+            !hit_ids.contains(&id_outside),
+            "prefix fallback must preserve the requested scope_prefix filter"
+        );
+        assert_eq!(hits[0].thought.id, id_raw_only);
     }
 
     #[sqlx::test(migrations = "../../migrations")]

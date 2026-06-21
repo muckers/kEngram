@@ -963,11 +963,17 @@ Tools: `capture`, `search_thoughts`, `recent_thoughts`, `list_scopes`, `get_thou
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kengram_core::{TagKind, Tags};
+    use kengram_core::{EmbeddingModel, TagKind, Tags};
     use kengram_embed::FakeEmbedder;
 
+    const TEST_EMBEDDER_MODEL_ID: &str = "qwen3-embedding";
+
+    fn test_embedder() -> FakeEmbedder {
+        FakeEmbedder::with_model(EmbeddingModel::new(TEST_EMBEDDER_MODEL_ID, 4096))
+    }
+
     fn server(pool: PgPool) -> KengramServer {
-        KengramServer::new(pool, Arc::new(FakeEmbedder::new()), None, None)
+        KengramServer::new(pool, Arc::new(test_embedder()), None, None)
     }
 
     /// Regression pin: the server-level instructions surface the `tags`
@@ -1122,7 +1128,7 @@ mod tests {
     fn server_with_tagger(pool: PgPool) -> KengramServer {
         KengramServer::new(
             pool,
-            Arc::new(FakeEmbedder::new()),
+            Arc::new(test_embedder()),
             None,
             Some("fake/tagger".to_string()),
         )
