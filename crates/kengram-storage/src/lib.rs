@@ -10,7 +10,7 @@ use kengram_core::{
     Metadata, RelationKind, Scope, ScopeError, ScopeVocab, Source, SourceError, Tags, Thought,
     ThoughtId, UnknownLinkSource, UnknownRelationKind,
 };
-use sqlx::PgPool;
+use sqlx::{PgPool, PgTransaction};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -23,6 +23,103 @@ pub mod target {
     pub const THOUGHT: &str = "thought";
     pub const ARTIFACT_CHUNK: &str = "artifact_chunk";
     pub const FACT: &str = "fact";
+}
+
+mod ann {
+    pub const HALF_3072_DIMS: usize = 3072;
+    pub const HALF_3072_DIMS_I32: i32 = 3072;
+    pub const PROJECTION_SUFFIX: &str = "halfvec:3072";
+}
+
+#[derive(Debug, Clone)]
+struct AnnProjection {
+    projection_id: String,
+    dimensions: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnnProjectionCoverage {
+    pub projection_id: String,
+    pub model_id: String,
+    pub model_version: i32,
+    pub embedding_count: i64,
+    pub projection_count: i64,
+    pub missing_count: i64,
+    pub inserted_missing: i64,
+    pub status: String,
+}
+
+fn ann_projection_for_model(model: &EmbeddingModel) -> Option<AnnProjection> {
+    if model.dimensions < ann::HALF_3072_DIMS {
+        return None;
+    }
+
+    Some(AnnProjection {
+        projection_id: format!("{}:{}", model.id, ann::PROJECTION_SUFFIX),
+        dimensions: ann::HALF_3072_DIMS,
+    })
+}
+
+fn project_halfvec_3072(
+    vector: &[f32],
+    dimensions: usize,
+) -> Result<pgvector::HalfVector, StorageError> {
+    if vector.len() < dimensions {
+        return Err(StorageError::InvalidAnnProjectionDimensions {
+            expected: dimensions,
+            got: vector.len(),
+        });
+    }
+
+    let prefix = &vector[..dimensions];
+    let norm = prefix
+        .iter()
+        .map(|v| f64::from(*v) * f64::from(*v))
+        .sum::<f64>()
+        .sqrt();
+    let projected = if norm > 0.0 {
+        prefix
+            .iter()
+            .map(|v| (*v as f64 / norm) as f32)
+            .collect::<Vec<_>>()
+    } else {
+        prefix.to_vec()
+    };
+
+    Ok(pgvector::HalfVector::from_f32_slice(&projected))
+}
+
+fn sql_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn sql_identifier(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+fn ann_projection_index_name(projection_id: &str) -> String {
+    let mut sanitized = projection_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+
+    while sanitized.contains("__") {
+        sanitized = sanitized.replace("__", "_");
+    }
+    sanitized = sanitized.trim_matches('_').to_string();
+
+    let base = format!("embedding_ann_projection_{sanitized}_hnsw");
+    if base.len() <= 63 {
+        base
+    } else {
+        base[..63].trim_end_matches('_').to_string()
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -52,6 +149,24 @@ pub enum StorageError {
         "invalid link target shape decoded from database: to_kind={0:?} but per-kind columns don't match"
     )]
     InvalidLinkTargetShape(String),
+
+    #[error(
+        "embedding vector too short for ANN projection: expected at least {expected} dims, got {got}"
+    )]
+    InvalidAnnProjectionDimensions { expected: usize, got: usize },
+
+    #[error(
+        "ANN projection coverage mismatch for {projection_id}: embeddings={embedding_count}, projections={projection_count}, missing={missing_count}"
+    )]
+    AnnProjectionCoverageMismatch {
+        projection_id: String,
+        embedding_count: i64,
+        projection_count: i64,
+        missing_count: i64,
+    },
+
+    #[error("ANN projection index {0} exists but is not ready/valid")]
+    AnnProjectionIndexNotReady(String),
 }
 
 /// Convert a BYTEA `content_fingerprint` blob from the database into the
@@ -167,7 +282,8 @@ pub async fn insert_embedding(
     model: &EmbeddingModel,
     vector: Vec<f32>,
 ) -> Result<(), StorageError> {
-    let pgv = pgvector::Vector::from(vector);
+    let mut tx = pool.begin().await?;
+    let pgv = pgvector::Vector::from(vector.clone());
     sqlx::query(
         r#"
         INSERT INTO embeddings (target_kind, target_id, model_id, model_version, vector)
@@ -180,9 +296,292 @@ pub async fn insert_embedding(
     .bind(&model.id)
     .bind(1_i32)
     .bind(pgv)
+    .execute(&mut *tx)
+    .await?;
+
+    insert_ann_projection(&mut tx, target_kind, target_id, model, &vector).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn insert_ann_projection(
+    tx: &mut PgTransaction<'_>,
+    target_kind: &'static str,
+    target_id: Uuid,
+    model: &EmbeddingModel,
+    vector: &[f32],
+) -> Result<(), StorageError> {
+    let Some(projection) = ann_projection_for_model(model) else {
+        return Ok(());
+    };
+
+    let halfvec = project_halfvec_3072(vector, projection.dimensions)?;
+    sqlx::query(
+        r#"
+        INSERT INTO embedding_ann_projections (
+            source_embedding_id,
+            target_kind,
+            target_id,
+            model_id,
+            model_version,
+            projection_id,
+            dimensions,
+            embedding
+        )
+        SELECT
+            e.id,
+            e.target_kind,
+            e.target_id,
+            e.model_id,
+            e.model_version,
+            $5,
+            $6,
+            $7
+        FROM embeddings e
+        WHERE e.target_kind = $1
+          AND e.target_id = $2
+          AND e.model_id = $3
+          AND e.model_version = $4
+        ON CONFLICT (target_kind, target_id, model_id, model_version, projection_id)
+        DO UPDATE SET
+            source_embedding_id = EXCLUDED.source_embedding_id,
+            dimensions = EXCLUDED.dimensions,
+            embedding = EXCLUDED.embedding
+        "#,
+    )
+    .bind(target_kind)
+    .bind(target_id)
+    .bind(&model.id)
+    .bind(1_i32)
+    .bind(&projection.projection_id)
+    .bind(ann::HALF_3072_DIMS_I32)
+    .bind(halfvec)
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(())
+}
+
+/// Reconcile the ANN projection sidecar for the active embedding model and
+/// assert full coverage. This is the deploy-window heal step: migration 0013
+/// backfills existing rows, atomic writes cover new rows after this PR, and
+/// this function catches any raw embeddings inserted between migrate and
+/// deploy or by future drift.
+pub async fn reconcile_ann_projections(
+    pool: &PgPool,
+    model: &EmbeddingModel,
+) -> Result<Option<AnnProjectionCoverage>, StorageError> {
+    let Some(projection) = ann_projection_for_model(model) else {
+        return Ok(None);
+    };
+
+    let result = sqlx::query(
+        r#"
+        INSERT INTO embedding_ann_projections (
+            source_embedding_id,
+            target_kind,
+            target_id,
+            model_id,
+            model_version,
+            projection_id,
+            dimensions,
+            embedding
+        )
+        SELECT
+            e.id,
+            e.target_kind,
+            e.target_id,
+            e.model_id,
+            e.model_version,
+            $2,
+            $3,
+            (l2_normalize(subvector(e.vector, 1, 3072)::vector(3072)))::halfvec(3072)
+        FROM embeddings e
+        WHERE e.model_id = $1
+          AND vector_dims(e.vector) >= 3072
+          AND NOT EXISTS (
+              SELECT 1
+              FROM embedding_ann_projections p
+              WHERE p.source_embedding_id = e.id
+                AND p.projection_id = $2
+          )
+        ON CONFLICT (target_kind, target_id, model_id, model_version, projection_id)
+        DO UPDATE SET
+            source_embedding_id = EXCLUDED.source_embedding_id,
+            dimensions = EXCLUDED.dimensions,
+            embedding = EXCLUDED.embedding
+        "#,
+    )
+    .bind(&model.id)
+    .bind(&projection.projection_id)
+    .bind(ann::HALF_3072_DIMS_I32)
     .execute(pool)
     .await?;
-    Ok(())
+
+    let inserted_missing = result.rows_affected() as i64;
+    let coverage =
+        record_ann_projection_coverage(pool, model, &projection, inserted_missing).await?;
+    assert_ann_projection_coverage_ok(&coverage)?;
+    Ok(Some(coverage))
+}
+
+/// Re-count ANN projection coverage without inserting missing rows. Worker
+/// ticks use this as the periodic SLO assertion; tests use it to prove raw-only
+/// drift is detected instead of being silently hidden by projection search.
+pub async fn assert_ann_projection_coverage(
+    pool: &PgPool,
+    model: &EmbeddingModel,
+) -> Result<Option<AnnProjectionCoverage>, StorageError> {
+    let Some(projection) = ann_projection_for_model(model) else {
+        return Ok(None);
+    };
+
+    let coverage = record_ann_projection_coverage(pool, model, &projection, 0).await?;
+    assert_ann_projection_coverage_ok(&coverage)?;
+    Ok(Some(coverage))
+}
+
+async fn record_ann_projection_coverage(
+    pool: &PgPool,
+    model: &EmbeddingModel,
+    projection: &AnnProjection,
+    inserted_missing: i64,
+) -> Result<AnnProjectionCoverage, StorageError> {
+    let (embedding_count, projection_count, missing_count): (i64, i64, i64) = sqlx::query_as(
+        r#"
+        SELECT
+            (
+                SELECT COUNT(*)
+                FROM embeddings e
+                WHERE e.model_id = $1
+                  AND vector_dims(e.vector) >= 3072
+            )::bigint AS embedding_count,
+            (
+                SELECT COUNT(*)
+                FROM embedding_ann_projections p
+                WHERE p.projection_id = $2
+                  AND p.model_id = $1
+            )::bigint AS projection_count,
+            (
+                SELECT COUNT(*)
+                FROM embeddings e
+                WHERE e.model_id = $1
+                  AND vector_dims(e.vector) >= 3072
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM embedding_ann_projections p
+                      WHERE p.source_embedding_id = e.id
+                        AND p.projection_id = $2
+                  )
+            )::bigint AS missing_count
+        "#,
+    )
+    .bind(&model.id)
+    .bind(&projection.projection_id)
+    .fetch_one(pool)
+    .await?;
+
+    let status = if missing_count == 0 && projection_count == embedding_count {
+        "ok".to_string()
+    } else {
+        "diverged".to_string()
+    };
+
+    sqlx::query(
+        r#"
+        INSERT INTO embedding_ann_projection_coverage (
+            projection_id,
+            model_id,
+            model_version,
+            embedding_count,
+            projection_count,
+            missing_count,
+            status,
+            last_reconciled_at,
+            last_checked_at
+        )
+        VALUES (
+            $1,
+            $2,
+            $3,
+            $4,
+            $5,
+            $6,
+            $7,
+            CASE WHEN $8::bigint > 0 THEN NOW() ELSE NULL END,
+            NOW()
+        )
+        ON CONFLICT (projection_id) DO UPDATE SET
+            model_id = EXCLUDED.model_id,
+            model_version = EXCLUDED.model_version,
+            embedding_count = EXCLUDED.embedding_count,
+            projection_count = EXCLUDED.projection_count,
+            missing_count = EXCLUDED.missing_count,
+            status = EXCLUDED.status,
+            last_reconciled_at = CASE
+                WHEN $8::bigint > 0 THEN NOW()
+                ELSE embedding_ann_projection_coverage.last_reconciled_at
+            END,
+            last_checked_at = NOW()
+        "#,
+    )
+    .bind(&projection.projection_id)
+    .bind(&model.id)
+    .bind(1_i32)
+    .bind(embedding_count)
+    .bind(projection_count)
+    .bind(missing_count)
+    .bind(&status)
+    .bind(inserted_missing)
+    .execute(pool)
+    .await?;
+
+    let coverage = AnnProjectionCoverage {
+        projection_id: projection.projection_id.clone(),
+        model_id: model.id.clone(),
+        model_version: 1,
+        embedding_count,
+        projection_count,
+        missing_count,
+        inserted_missing,
+        status,
+    };
+
+    if coverage.status == "ok" {
+        tracing::info!(
+            projection_id = %coverage.projection_id,
+            model_id = %coverage.model_id,
+            embedding_count = coverage.embedding_count,
+            projection_count = coverage.projection_count,
+            inserted_missing = coverage.inserted_missing,
+            "ANN projection coverage ok",
+        );
+    } else {
+        tracing::error!(
+            projection_id = %coverage.projection_id,
+            model_id = %coverage.model_id,
+            embedding_count = coverage.embedding_count,
+            projection_count = coverage.projection_count,
+            missing_count = coverage.missing_count,
+            inserted_missing = coverage.inserted_missing,
+            "ANN projection coverage diverged",
+        );
+    }
+
+    Ok(coverage)
+}
+
+fn assert_ann_projection_coverage_ok(coverage: &AnnProjectionCoverage) -> Result<(), StorageError> {
+    if coverage.missing_count == 0 && coverage.projection_count == coverage.embedding_count {
+        Ok(())
+    } else {
+        Err(StorageError::AnnProjectionCoverageMismatch {
+            projection_id: coverage.projection_id.clone(),
+            embedding_count: coverage.embedding_count,
+            projection_count: coverage.projection_count,
+            missing_count: coverage.missing_count,
+        })
+    }
 }
 
 /// Convenience: insert an embedding tied to a thought, taking the kengram-core
@@ -1471,9 +1870,9 @@ pub async fn retract_thought(
     })
 }
 
-/// Vector-similarity kNN over `embeddings` for the given model. Hits are
-/// returned in descending order of cosine similarity (`1 - cosine_distance`).
-/// Uses the per-model HNSW partial index (`embeddings_<model>_hnsw`).
+/// Vector-similarity kNN for the given model. Large raw vectors use the ANN
+/// projection sidecar when configured; smaller/non-projected models fall back
+/// to exact search over `embeddings.vector`.
 pub async fn search_vector_knn(
     pool: &PgPool,
     query_vector: Vec<f32>,
@@ -1482,8 +1881,64 @@ pub async fn search_vector_knn(
     scope_prefix: Option<&str>,
     limit: i64,
 ) -> Result<Vec<Hit>, StorageError> {
-    let pgv = pgvector::Vector::from(query_vector);
+    if let Some(projection) = ann_projection_for_model(model) {
+        if ann_projection_search_ready(pool, &projection.projection_id).await? {
+            if ann_projection_filter_has_missing_rows(
+                pool,
+                &projection.projection_id,
+                &model.id,
+                scope,
+                scope_prefix,
+            )
+            .await?
+            {
+                tracing::error!(
+                    model_id = %model.id,
+                    projection_id = %projection.projection_id,
+                    scope = ?scope,
+                    scope_prefix = ?scope_prefix,
+                    "ANN projection coverage gap overlaps requested filter; falling back to exact raw vector search"
+                );
+            } else {
+                let halfvec = project_halfvec_3072(&query_vector, projection.dimensions)?;
+                let rows: Vec<VectorSearchRow> = sqlx::query_as(
+                    r#"
+                SELECT t.id, t.scope, t.content, t.source, t.created_at, t.metadata,
+                       t.content_fingerprint, t.tags,
+                       t.tags_extractor_model, t.tags_extractor_version, t.tags_extracted_at,
+                       (p.embedding <=> $1) AS distance
+                FROM embedding_ann_projections p
+                JOIN thoughts t ON t.id = p.target_id
+                WHERE p.projection_id = $2
+                  AND p.model_id = $3
+                  AND p.target_kind = 'thought'
+                  AND ($4::text IS NULL OR t.scope = $4)
+                  AND ($5::text IS NULL OR t.scope LIKE $5 || '%')
+                  AND t.retracted_at IS NULL
+                ORDER BY p.embedding <=> $1
+                LIMIT $6
+                "#,
+                )
+                .bind(halfvec)
+                .bind(&projection.projection_id)
+                .bind(&model.id)
+                .bind(scope)
+                .bind(scope_prefix)
+                .bind(limit)
+                .fetch_all(pool)
+                .await?;
+                return vector_rows_to_hits(rows);
+            }
+        } else {
+            tracing::warn!(
+                model_id = %model.id,
+                projection_id = %projection.projection_id,
+                "ANN projection coverage is not marked complete; falling back to exact raw vector search"
+            );
+        }
+    }
 
+    let pgv = pgvector::Vector::from(query_vector);
     let rows: Vec<VectorSearchRow> = sqlx::query_as(
         r#"
         SELECT t.id, t.scope, t.content, t.source, t.created_at, t.metadata,
@@ -1508,6 +1963,73 @@ pub async fn search_vector_knn(
     .fetch_all(pool)
     .await?;
 
+    vector_rows_to_hits(rows)
+}
+
+async fn ann_projection_search_ready(
+    pool: &PgPool,
+    projection_id: &str,
+) -> Result<bool, StorageError> {
+    let (ready,): (bool,) = sqlx::query_as(
+        r#"
+        SELECT COALESCE((
+            SELECT true
+            FROM embedding_ann_projection_coverage
+            WHERE projection_id = $1
+              AND status = 'ok'
+              AND missing_count = 0
+            LIMIT 1
+        ), false)
+        "#,
+    )
+    .bind(projection_id)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(ready)
+}
+
+async fn ann_projection_filter_has_missing_rows(
+    pool: &PgPool,
+    projection_id: &str,
+    model_id: &str,
+    scope: Option<&str>,
+    scope_prefix: Option<&str>,
+) -> Result<bool, StorageError> {
+    let (exists,): (bool,) = sqlx::query_as(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM embeddings e
+            JOIN thoughts t
+              ON t.id = e.target_id
+             AND t.retracted_at IS NULL
+            WHERE e.model_id = $1
+              AND e.target_kind = 'thought'
+              AND vector_dims(e.vector) >= 3072
+              AND ($3::text IS NULL OR t.scope = $3)
+              AND ($4::text IS NULL OR t.scope LIKE $4 || '%')
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM embedding_ann_projections p
+                  WHERE p.source_embedding_id = e.id
+                    AND p.projection_id = $2
+              )
+            LIMIT 1
+        )
+        "#,
+    )
+    .bind(model_id)
+    .bind(projection_id)
+    .bind(scope)
+    .bind(scope_prefix)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(exists)
+}
+
+fn vector_rows_to_hits(rows: Vec<VectorSearchRow>) -> Result<Vec<Hit>, StorageError> {
     rows.into_iter()
         .map(|r| {
             let score = (1.0 - r.distance) as f32;
@@ -1527,6 +2049,138 @@ pub async fn search_vector_knn(
             Ok(Hit::from_vector_leg(thought, score))
         })
         .collect()
+}
+
+/// Runtime guard against the exact regression that produced the 4096-dim
+/// seqscan path: when a model has a configured ANN projection, startup ensures
+/// a matching per-projection HNSW index exists. Migrations still create the
+/// expected production index; this is the drift fuse for future model ids.
+pub async fn ensure_ann_projection_index(
+    pool: &PgPool,
+    model: &EmbeddingModel,
+) -> Result<(), StorageError> {
+    let Some(projection) = ann_projection_for_model(model) else {
+        tracing::warn!(
+            model_id = %model.id,
+            dimensions = model.dimensions,
+            "active embedding model has no ANN projection; vector search may use exact scan"
+        );
+        return Ok(());
+    };
+
+    let index_name = ann_projection_index_name(&projection.projection_id);
+    let ddl = format!(
+        r#"
+        CREATE INDEX CONCURRENTLY IF NOT EXISTS {}
+        ON embedding_ann_projections
+        USING hnsw (embedding halfvec_cosine_ops)
+        WITH (m = 16, ef_construction = 100)
+        WHERE projection_id = {}
+          AND target_kind = 'thought'
+        "#,
+        sql_identifier(&index_name),
+        sql_literal(&projection.projection_id)
+    );
+
+    let mut conn = pool.acquire().await?;
+    let lock_key = format!("kengram-ann-index:{}", projection.projection_id);
+    sqlx::query("SET lock_timeout = '5s'")
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query("SELECT pg_advisory_lock(hashtext($1)::bigint)")
+        .bind(&lock_key)
+        .execute(&mut *conn)
+        .await?;
+
+    let ready_before: Result<(bool,), sqlx::Error> = sqlx::query_as(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM pg_class c
+            JOIN pg_index i ON i.indexrelid = c.oid
+            WHERE c.relname = $1
+              AND i.indisready
+              AND i.indisvalid
+        )
+        "#,
+    )
+    .bind(&index_name)
+    .fetch_one(&mut *conn)
+    .await;
+
+    let mut create_error: Option<sqlx::Error> = None;
+    if matches!(ready_before, Ok((false,))) {
+        if let Err(err) = sqlx::query(&ddl).execute(&mut *conn).await {
+            create_error = Some(err);
+        }
+    }
+
+    let ready_after: Result<(bool,), sqlx::Error> = if create_error.is_none() {
+        sqlx::query_as(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM pg_class c
+                JOIN pg_index i ON i.indexrelid = c.oid
+                WHERE c.relname = $1
+                  AND i.indisready
+                  AND i.indisvalid
+            )
+            "#,
+        )
+        .bind(&index_name)
+        .fetch_one(&mut *conn)
+        .await
+    } else {
+        Ok((false,))
+    };
+
+    let analyze_result = if create_error.is_none() && matches!(ready_after, Ok((true,))) {
+        sqlx::query("ANALYZE embedding_ann_projections")
+            .execute(&mut *conn)
+            .await
+            .map(|_| ())
+    } else {
+        Ok(())
+    };
+    let unlock_result = sqlx::query("SELECT pg_advisory_unlock(hashtext($1)::bigint)")
+        .bind(&lock_key)
+        .execute(&mut *conn)
+        .await;
+
+    let ready_before = ready_before?;
+    if let Some(err) = create_error {
+        return Err(err.into());
+    }
+    let ready_after = ready_after?;
+    analyze_result?;
+    unlock_result?;
+
+    if !ready_after.0 {
+        return Err(StorageError::AnnProjectionIndexNotReady(index_name));
+    }
+
+    tracing::info!(
+        model_id = %model.id,
+        projection_id = %projection.projection_id,
+        index_name = %index_name,
+        existed_before = ready_before.0,
+        "ANN projection index ensured"
+    );
+
+    Ok(())
+}
+
+/// Full startup gate for ANN search. Reconciles any deploy-window gaps,
+/// asserts coverage, then ensures the per-projection HNSW index is present
+/// and valid. Serve/worker call this before accepting traffic.
+pub async fn ensure_ann_projection_ready(
+    pool: &PgPool,
+    model: &EmbeddingModel,
+) -> Result<Option<AnnProjectionCoverage>, StorageError> {
+    let coverage = reconcile_ann_projections(pool, model).await?;
+    ensure_ann_projection_index(pool, model).await?;
+    Ok(coverage)
 }
 
 #[derive(sqlx::FromRow)]
@@ -1557,6 +2211,7 @@ struct VectorSearchRow {
 pub struct CorpusStats {
     pub thoughts: ThoughtStats,
     pub embeddings: Vec<EmbeddingModelCount>,
+    pub ann_projections: Vec<AnnProjectionCoverage>,
     pub links: LinkStats,
     pub queues: QueueStats,
     pub scopes: Vec<ScopeSummary>,
@@ -1689,7 +2344,50 @@ pub async fn corpus_stats(
         })
         .collect();
 
-    // 3. Link stats — live/soft-deleted counts + group-by aggregates.
+    // 3. ANN projection coverage metrics. Populated by migration/startup and
+    // periodically refreshed by the worker; this is the operator-visible
+    // metric/SLO for projection drift.
+    let ann_rows: Vec<(String, String, i32, i64, i64, i64, String)> = sqlx::query_as(
+        r#"
+        SELECT
+            projection_id,
+            model_id,
+            model_version,
+            embedding_count,
+            projection_count,
+            missing_count,
+            status
+        FROM embedding_ann_projection_coverage
+        ORDER BY projection_id
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+    let ann_projections = ann_rows
+        .into_iter()
+        .map(
+            |(
+                projection_id,
+                model_id,
+                model_version,
+                embedding_count,
+                projection_count,
+                missing_count,
+                status,
+            )| AnnProjectionCoverage {
+                projection_id,
+                model_id,
+                model_version,
+                embedding_count,
+                projection_count,
+                missing_count,
+                inserted_missing: 0,
+                status,
+            },
+        )
+        .collect();
+
+    // 4. Link stats — live/soft-deleted counts + group-by aggregates.
     let l_row = sqlx::query!(
         r#"
         SELECT
@@ -1750,16 +2448,16 @@ pub async fn corpus_stats(
         by_source,
     };
 
-    // 4. Queue depths.
+    // 5. Queue depths.
     let queues = QueueStats {
         pending_embeddings: count_pending(pool).await?,
         pending_tags: count_pending_tags(pool).await?,
     };
 
-    // 5. Scopes summary (reuses list_scopes; scope_prefix only applies here).
+    // 6. Scopes summary (reuses list_scopes; scope_prefix only applies here).
     let scopes = list_scopes(pool, scope_prefix).await?;
 
-    // 6. Per-table sizes via pg_class system catalog. Restricted to public
+    // 7. Per-table sizes via pg_class system catalog. Restricted to public
     // schema regular tables (`relkind='r'`) so we don't surface pg_catalog
     // or sqlx's _sqlx_migrations table cruft. Runtime-checked query (the
     // macro doesn't introspect system catalogs).
@@ -1797,6 +2495,7 @@ pub async fn corpus_stats(
     Ok(CorpusStats {
         thoughts,
         embeddings,
+        ann_projections,
         links,
         queues,
         scopes,
@@ -2025,8 +2724,8 @@ mod tests {
         .await
         .unwrap();
 
-        let model = EmbeddingModel::bge_m3();
-        let vector = vec![0.0_f32; 1024];
+        let model = EmbeddingModel::new("qwen3-embedding", 4096);
+        let vector = vec![0.0_f32; 4096];
         insert_embedding(
             &pool,
             target::THOUGHT,
@@ -2075,8 +2774,8 @@ mod tests {
         .await
         .unwrap();
 
-        let model = EmbeddingModel::bge_m3();
-        let embedding = Embedding::new(model.clone(), vec![0.5_f32; 1024]).unwrap();
+        let model = EmbeddingModel::new("qwen3-embedding", 4096);
+        let embedding = Embedding::new(model.clone(), vec![0.5_f32; 4096]).unwrap();
         insert_thought_embedding(&pool, inserted.id, &embedding)
             .await
             .unwrap();
@@ -2169,21 +2868,271 @@ mod tests {
         assert!(hits.is_empty());
     }
 
-    fn unit_vector_1024(pos: usize) -> Vec<f32> {
-        let mut v = vec![0.0_f32; 1024];
+    fn unit_vector_4096(pos: usize) -> Vec<f32> {
+        let mut v = vec![0.0_f32; 4096];
         v[pos] = 1.0;
         v
     }
 
+    async fn insert_raw_embedding_without_projection(
+        pool: &PgPool,
+        target_id: Uuid,
+        model: &EmbeddingModel,
+        vector: Vec<f32>,
+    ) {
+        sqlx::query(
+            r#"
+            INSERT INTO embeddings (target_kind, target_id, model_id, model_version, vector)
+            VALUES ($1, $2, $3, $4, $5)
+            "#,
+        )
+        .bind(target::THOUGHT)
+        .bind(target_id)
+        .bind(&model.id)
+        .bind(1_i32)
+        .bind(pgvector::Vector::from(vector))
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
     #[sqlx::test(migrations = "../../migrations")]
     async fn search_vector_knn_finds_inserted_vector(pool: PgPool) {
-        let model = EmbeddingModel::new("test:1024", 1024);
+        let model = EmbeddingModel::new("test:4096", 4096);
 
         let id_a = insert_test_thought(&pool, "a", "global").await;
         let id_b = insert_test_thought(&pool, "b", "global").await;
 
-        let va = unit_vector_1024(0);
-        let vb = unit_vector_1024(1);
+        let va = unit_vector_4096(0);
+        let vb = unit_vector_4096(1);
+
+        insert_thought_embedding(
+            &pool,
+            id_a,
+            &Embedding::new(model.clone(), va.clone()).unwrap(),
+        )
+        .await
+        .unwrap();
+        insert_thought_embedding(&pool, id_b, &Embedding::new(model.clone(), vb).unwrap())
+            .await
+            .unwrap();
+
+        reconcile_ann_projections(&pool, &model).await.unwrap();
+
+        let hits = search_vector_knn(&pool, va, &model, None, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].thought.id, id_a);
+        assert!((hits[0].vector_score.unwrap() - 1.0).abs() < 1e-4);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_vector_knn_raw_fallback_covers_scoped_projection_gap(pool: PgPool) {
+        let model = EmbeddingModel::new("qwen3-embedding", 4096);
+
+        let id_a = insert_test_thought(&pool, "projected", "scope-a").await;
+        let id_b = insert_test_thought(&pool, "raw-only", "scope-b").await;
+
+        let va = unit_vector_4096(0);
+        let vb = unit_vector_4096(1);
+
+        insert_thought_embedding(&pool, id_a, &Embedding::new(model.clone(), va).unwrap())
+            .await
+            .unwrap();
+        reconcile_ann_projections(&pool, &model).await.unwrap();
+
+        insert_raw_embedding_without_projection(&pool, id_b.into_uuid(), &model, vb.clone()).await;
+
+        let hits = search_vector_knn(&pool, vb, &model, Some("scope-b"), None, 10)
+            .await
+            .unwrap();
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].thought.id, id_b);
+        assert_eq!(hits[0].thought.scope.as_str(), "scope-b");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn ensure_ann_projection_index_reuses_migration_index_name(pool: PgPool) {
+        let model = EmbeddingModel::new("qwen3-embedding", 4096);
+
+        ensure_ann_projection_index(&pool, &model).await.unwrap();
+
+        let names: Vec<(String,)> = sqlx::query_as(
+            r#"
+            SELECT c.relname::text
+            FROM pg_class c
+            JOIN pg_index i ON i.indexrelid = c.oid
+            WHERE c.relname LIKE 'embedding_ann_projection_qwen3%hnsw'
+              AND i.indisvalid
+              AND i.indisready
+            ORDER BY c.relname
+            "#,
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        let names = names.into_iter().map(|(name,)| name).collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec!["embedding_ann_projection_qwen3_embedding_halfvec_3072_hnsw"]
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn insert_embedding_creates_ann_projection_for_large_model(pool: PgPool) {
+        let model = EmbeddingModel::new("qwen3-embedding", 4096);
+        let id = insert_test_thought(&pool, "projection source", "global").await;
+        let target_id = id.into_uuid();
+
+        insert_embedding(
+            &pool,
+            target::THOUGHT,
+            target_id,
+            &model,
+            unit_vector_4096(0),
+        )
+        .await
+        .unwrap();
+
+        let (count,): (i64,) = sqlx::query_as(
+            r#"
+            SELECT COUNT(*)
+            FROM embedding_ann_projections
+            WHERE target_id = $1
+              AND projection_id = 'qwen3-embedding:halfvec:3072'
+            "#,
+        )
+        .bind(target_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(count, 1);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn reconcile_ann_projections_backfills_missing_projection_and_marks_ok(pool: PgPool) {
+        let model = EmbeddingModel::new("qwen3-embedding", 4096);
+        let id = insert_test_thought(&pool, "raw-only projection source", "scope-a").await;
+        let target_id = id.into_uuid();
+        insert_raw_embedding_without_projection(&pool, target_id, &model, unit_vector_4096(0))
+            .await;
+
+        let coverage = reconcile_ann_projections(&pool, &model)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(coverage.inserted_missing, 1);
+        assert_eq!(coverage.missing_count, 0);
+        assert_eq!(coverage.status, "ok");
+
+        let (count,): (i64,) = sqlx::query_as(
+            r#"
+            SELECT COUNT(*)
+            FROM embedding_ann_projections
+            WHERE target_id = $1
+              AND projection_id = 'qwen3-embedding:halfvec:3072'
+            "#,
+        )
+        .bind(target_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(count, 1);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn assert_ann_projection_coverage_detects_raw_only_drift(pool: PgPool) {
+        let model = EmbeddingModel::new("qwen3-embedding", 4096);
+        let id = insert_test_thought(&pool, "raw-only drift", "scope-b").await;
+        insert_raw_embedding_without_projection(&pool, id.into_uuid(), &model, unit_vector_4096(1))
+            .await;
+
+        let err = assert_ann_projection_coverage(&pool, &model)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            StorageError::AnnProjectionCoverageMismatch {
+                missing_count: 1,
+                ..
+            }
+        ));
+
+        let (status, missing_count): (String, i64) = sqlx::query_as(
+            r#"
+            SELECT status, missing_count
+            FROM embedding_ann_projection_coverage
+            WHERE projection_id = 'qwen3-embedding:halfvec:3072'
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(status, "diverged");
+        assert_eq!(missing_count, 1);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn insert_embedding_rolls_back_raw_row_when_projection_insert_fails(pool: PgPool) {
+        let model = EmbeddingModel::new("qwen3-embedding", 4096);
+        let id = insert_test_thought(&pool, "projection rollback", "global").await;
+        let target_id = id.into_uuid();
+
+        sqlx::query(
+            r#"
+            ALTER TABLE embedding_ann_projections
+            ADD CONSTRAINT force_projection_insert_failure
+            CHECK (projection_id <> 'qwen3-embedding:halfvec:3072')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let result = insert_embedding(
+            &pool,
+            target::THOUGHT,
+            target_id,
+            &model,
+            unit_vector_4096(0),
+        )
+        .await;
+
+        assert!(result.is_err());
+
+        let (embedding_count,): (i64,) = sqlx::query_as(
+            r#"
+            SELECT COUNT(*)
+            FROM embeddings
+            WHERE target_id = $1
+              AND model_id = 'qwen3-embedding'
+            "#,
+        )
+        .bind(target_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(embedding_count, 0);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_vector_knn_uses_ann_projection_for_large_model(pool: PgPool) {
+        let model = EmbeddingModel::new("qwen3-embedding", 4096);
+
+        let id_a = insert_test_thought(&pool, "a", "global").await;
+        let id_b = insert_test_thought(&pool, "b", "global").await;
+
+        let va = unit_vector_4096(0);
+        let vb = unit_vector_4096(1);
 
         insert_thought_embedding(
             &pool,
@@ -2206,11 +3155,11 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn search_vector_knn_filters_by_model(pool: PgPool) {
-        let model_a = EmbeddingModel::new("test-a:1024", 1024);
-        let model_b = EmbeddingModel::new("test-b:1024", 1024);
+        let model_a = EmbeddingModel::new("test-a:4096", 4096);
+        let model_b = EmbeddingModel::new("test-b:4096", 4096);
 
         let id = insert_test_thought(&pool, "thought", "global").await;
-        let va = unit_vector_1024(0);
+        let va = unit_vector_4096(0);
         insert_thought_embedding(
             &pool,
             id,
@@ -2228,13 +3177,13 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn find_unembedded_thoughts_returns_thoughts_without_embedding(pool: PgPool) {
-        let model = EmbeddingModel::new("test:1024", 1024);
+        let model = EmbeddingModel::new("test:4096", 4096);
 
         let id_a = insert_test_thought(&pool, "a", "global").await;
         let _id_b = insert_test_thought(&pool, "b", "global").await;
 
         // Embed only `a`.
-        let va = unit_vector_1024(0);
+        let va = unit_vector_4096(0);
         insert_thought_embedding(&pool, id_a, &Embedding::new(model.clone(), va).unwrap())
             .await
             .unwrap();
@@ -2321,12 +3270,12 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn enqueue_unembedded_thoughts_skips_already_embedded(pool: PgPool) {
-        let model = EmbeddingModel::new("test:1024", 1024);
+        let model = EmbeddingModel::new("test:4096", 4096);
         let id_a = insert_test_thought(&pool, "a", "global").await;
         let _id_b = insert_test_thought(&pool, "b", "global").await;
 
         // Embed only `a`.
-        let va = unit_vector_1024(0);
+        let va = unit_vector_4096(0);
         insert_thought_embedding(&pool, id_a, &Embedding::new(model.clone(), va).unwrap())
             .await
             .unwrap();

@@ -382,6 +382,9 @@ async fn run_serve(config: Config) -> anyhow::Result<()> {
         .with_context(|| format!("connecting to {}", config.database.url))?;
 
     let embedder = build_embedder(&config.embedder)?;
+    kengram_storage::ensure_ann_projection_ready(&pool, embedder.model())
+        .await
+        .context("ensuring ANN projection readiness")?;
     let reranker = build_reranker(&config.reranker)?;
     // Server only needs the tagger model_id (to stamp pending_tags rows).
     // The actual tagger HTTP client lives in the worker process.
@@ -502,6 +505,9 @@ async fn run_worker(config: Config) -> anyhow::Result<()> {
         .await
         .with_context(|| format!("connecting to {}", config.database.url))?;
     let embedder = build_embedder(&config.embedder)?;
+    kengram_storage::ensure_ann_projection_ready(&pool, embedder.model())
+        .await
+        .context("ensuring ANN projection readiness")?;
     let ResolvedTagger {
         tagger,
         model_id: tagger_model_id,
@@ -607,6 +613,7 @@ async fn embed_drainer_loop(
     cancel: CancellationToken,
 ) {
     let mut ticker = tokio::time::interval(interval);
+    let mut coverage_audit_ticks = 0_u64;
     // Skip the eager first tick that `interval` fires immediately so we wait
     // a full interval before the first drain.
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -628,6 +635,25 @@ async fn embed_drainer_loop(
                     ),
                     Ok(_) => {} // idle tick; stay quiet
                     Err(err) => tracing::error!(error = ?err, "embed drain tick failed"),
+                }
+                coverage_audit_ticks = coverage_audit_ticks.saturating_add(1);
+                if coverage_audit_ticks >= 12 {
+                    coverage_audit_ticks = 0;
+                    match kengram_storage::assert_ann_projection_coverage(&pool, embedder.model()).await {
+                        Ok(Some(coverage)) => tracing::info!(
+                            projection_id = %coverage.projection_id,
+                            model_id = %coverage.model_id,
+                            embedding_count = coverage.embedding_count,
+                            projection_count = coverage.projection_count,
+                            missing_count = coverage.missing_count,
+                            "ANN projection periodic coverage assertion passed",
+                        ),
+                        Ok(None) => {}
+                        Err(err) => tracing::error!(
+                            error = ?err,
+                            "ANN projection periodic coverage assertion failed",
+                        ),
+                    }
                 }
             }
         }
@@ -1127,6 +1153,23 @@ async fn run_stats(
             })
             .collect();
         println!("  Embeddings:  {}", parts.join("; "));
+    }
+    if !stats.ann_projections.is_empty() {
+        let parts: Vec<String> = stats
+            .ann_projections
+            .iter()
+            .map(|p| {
+                format!(
+                    "{} {} raw={} projected={} missing={}",
+                    p.projection_id,
+                    p.status,
+                    p.embedding_count,
+                    p.projection_count,
+                    p.missing_count
+                )
+            })
+            .collect();
+        println!("  ANN cover:   {}", parts.join("; "));
     }
     println!(
         "  Links:       {} live, {} soft-deleted",
