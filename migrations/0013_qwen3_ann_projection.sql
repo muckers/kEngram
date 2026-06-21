@@ -71,6 +71,9 @@ SELECT
     'Added embedding_ann_projections sidecar and backfilled qwen3-embedding 3072-dim halfvec projections. Raw 4096-dim embeddings remain source of truth.'
 FROM inserted;
 
+SET max_parallel_maintenance_workers = 0;
+SET maintenance_work_mem = '32MB';
+
 CREATE INDEX IF NOT EXISTS embedding_ann_projection_qwen3_embedding_halfvec_3072_hnsw
     ON embedding_ann_projections
     USING hnsw (embedding halfvec_cosine_ops)
