@@ -28,6 +28,7 @@ pub mod target {
 mod ann {
     pub const HALF_3072_DIMS: usize = 3072;
     pub const HALF_3072_DIMS_I32: i32 = 3072;
+    pub const HALF_3072_HNSW_EF_SEARCH: i32 = 1000;
     pub const PROJECTION_SUFFIX: &str = "halfvec:3072";
 }
 
@@ -120,6 +121,15 @@ fn ann_projection_index_name(projection_id: &str) -> String {
     } else {
         base[..63].trim_end_matches('_').to_string()
     }
+}
+
+async fn set_ann_projection_ef_search(tx: &mut PgTransaction<'_>) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT set_config('hnsw.ef_search', $1, true)")
+        .bind(ann::HALF_3072_HNSW_EF_SEARCH.to_string())
+        .execute(&mut **tx)
+        .await?;
+
+    Ok(())
 }
 
 async fn ann_projection_index_ready_on_conn(
@@ -1922,6 +1932,8 @@ pub async fn search_vector_knn(
                 );
             } else {
                 let halfvec = project_halfvec_3072(&query_vector, projection.dimensions)?;
+                let mut tx = pool.begin().await?;
+                set_ann_projection_ef_search(&mut tx).await?;
                 let rows: Vec<VectorSearchRow> = sqlx::query_as(
                     r#"
                 SELECT t.id, t.scope, t.content, t.source, t.created_at, t.metadata,
@@ -1946,8 +1958,9 @@ pub async fn search_vector_knn(
                 .bind(scope)
                 .bind(scope_prefix)
                 .bind(limit)
-                .fetch_all(pool)
+                .fetch_all(&mut *tx)
                 .await?;
+                tx.commit().await?;
                 return vector_rows_to_hits(rows);
             }
         } else {
@@ -3195,6 +3208,20 @@ mod tests {
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].thought.id, id_a);
         assert!((hits[0].vector_score.unwrap() - 1.0).abs() < 1e-4);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn ann_projection_search_sets_measured_hnsw_ef_search(pool: PgPool) {
+        let mut tx = pool.begin().await.unwrap();
+
+        set_ann_projection_ef_search(&mut tx).await.unwrap();
+
+        let (value,): (String,) = sqlx::query_as("SELECT current_setting('hnsw.ef_search')")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+
+        assert_eq!(value, ann::HALF_3072_HNSW_EF_SEARCH.to_string());
     }
 
     #[sqlx::test(migrations = "../../migrations")]
