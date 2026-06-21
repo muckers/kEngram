@@ -2,12 +2,13 @@
 //!
 //! `search_thoughts` is the hybrid retrieval path: vector kNN ∪ trigram
 //! similarity, fused by RRF, then recency-boosted, then optionally reranked
-//! by a cross-encoder model over the top `candidate_pool` candidates. If
-//! the embedder is unreachable, the vector leg is skipped and
-//! `vector_search_available` flips to `false`. If the reranker is
-//! unreachable or not configured, the rerank stage is skipped and
-//! `rerank_used` flips to `false`; trigram + vector + RRF results still
-//! come back.
+//! by a cross-encoder model over the top `candidate_pool` candidates. If the
+//! embedder is unreachable, the vector leg is skipped and
+//! `vector_search_available` flips to `false`. The trigram leg is bounded and
+//! opportunistic; timeout/errors soft-fail to an empty leg so the fast vector
+//! path can still return. If the reranker is unreachable or not configured, the
+//! rerank stage is skipped and `rerank_used` flips to `false`; available legs
+//! still come back.
 //!
 //! M4: SearchRequest carries an optional `tag_filter` JSONB-containment
 //! expression. The filter is applied post-fuse in Rust (mirroring Postgres'
@@ -27,11 +28,14 @@ use time::OffsetDateTime;
 pub const DEFAULT_SEARCH_LIMIT: usize = 10;
 pub const MAX_SEARCH_LIMIT: usize = 100;
 pub const DEFAULT_TOP_K_PER_LEG: usize = 50;
-/// Default `candidate_pool` for the rerank stage: retrieve top-32 via RRF +
-/// recency, rerank those 32 to produce the final top-`limit`. Matches TEI's
-/// default `--max-client-batch-size` of 32 so the default request shape
-/// works out of the box.
-pub const DEFAULT_RERANK_CANDIDATE_POOL: usize = 32;
+pub const DEFAULT_TRIGRAM_TOP_K: usize = 10;
+pub const DEFAULT_TRIGRAM_STATEMENT_TIMEOUT_MS: u64 = 300;
+/// Default `candidate_pool` for the rerank stage: retrieve top-10 via RRF +
+/// recency, rerank those 10 to produce the final top-`limit`. The corpus-scale
+/// latency cutover validated this against the 18-query real-recall set: it
+/// preserves the approved vector recall while keeping end-to-end p50 below the
+/// 1.5s SLO on yeti.
+pub const DEFAULT_RERANK_CANDIDATE_POOL: usize = 10;
 
 #[derive(Debug, Clone)]
 pub struct SearchRequest {
@@ -217,15 +221,30 @@ pub async fn search_thoughts(
         }
     };
 
-    // Trigram leg (errors propagate).
-    let trigram_hits = kengram_storage::search_trigram(
+    // Trigram leg: bounded and opportunistic. pg_trgm similarity over very
+    // large blobs can be non-selective, so this leg must not break the SLO for
+    // the already-fast vector + rerank path.
+    let trigram_hits = match kengram_storage::search_trigram_bounded(
         pool,
         &request.query,
         scope_filter,
         scope_prefix_filter,
-        DEFAULT_TOP_K_PER_LEG as i64,
+        DEFAULT_TRIGRAM_TOP_K as i64,
+        DEFAULT_TRIGRAM_STATEMENT_TIMEOUT_MS,
     )
-    .await?;
+    .await
+    {
+        Ok(hits) => hits,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                query_canceled = e.is_query_canceled(),
+                timeout_ms = DEFAULT_TRIGRAM_STATEMENT_TIMEOUT_MS,
+                "bounded trigram query failed; continuing with available search legs only",
+            );
+            vec![]
+        }
+    };
 
     // RRF fuse → recency boost.
     let mut fused = rrf_fuse(vec![vector_hits, trigram_hits], DEFAULT_RRF_K);

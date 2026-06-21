@@ -132,6 +132,18 @@ async fn set_ann_projection_ef_search(tx: &mut PgTransaction<'_>) -> Result<(), 
     Ok(())
 }
 
+async fn set_statement_timeout(
+    tx: &mut PgTransaction<'_>,
+    timeout_ms: u64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT set_config('statement_timeout', $1, true)")
+        .bind(format!("{timeout_ms}ms"))
+        .execute(&mut **tx)
+        .await?;
+
+    Ok(())
+}
+
 async fn ann_projection_index_ready_on_conn(
     conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>,
     index_name: &str,
@@ -198,6 +210,16 @@ pub enum StorageError {
 
     #[error("ANN projection index {0} exists but is not ready/valid")]
     AnnProjectionIndexNotReady(String),
+}
+
+impl StorageError {
+    pub fn is_query_canceled(&self) -> bool {
+        matches!(
+            self,
+            StorageError::Database(sqlx::Error::Database(db))
+                if db.code().is_some_and(|code| code == "57014")
+        )
+    }
 }
 
 /// Convert a BYTEA `content_fingerprint` blob from the database into the
@@ -890,6 +912,63 @@ pub async fn search_trigram(
     )
     .fetch_all(pool)
     .await?;
+
+    rows.into_iter()
+        .map(|r| {
+            let thought = Thought {
+                id: ThoughtId::from(r.id),
+                scope: Scope::new(r.scope)?,
+                content: r.content,
+                source: Source::new(r.source)?,
+                created_at: r.created_at,
+                metadata: Metadata::from(r.metadata),
+                content_fingerprint: fingerprint_from_bytes(r.content_fingerprint)?,
+                tags: tags_from_value(r.tags)?,
+                tags_extractor_model: r.tags_extractor_model,
+                tags_extractor_version: r.tags_extractor_version,
+                tags_extracted_at: r.tags_extracted_at,
+            };
+            Ok(Hit::from_trigram_leg(thought, r.sim))
+        })
+        .collect()
+}
+
+/// Trigram search bounded by a transaction-local statement timeout. This is
+/// intended for opportunistic lexical contribution to hybrid search; callers
+/// should soft-fail timeout/budget errors when a faster leg has usable hits.
+pub async fn search_trigram_bounded(
+    pool: &PgPool,
+    query: &str,
+    scope: Option<&str>,
+    scope_prefix: Option<&str>,
+    limit: i64,
+    timeout_ms: u64,
+) -> Result<Vec<Hit>, StorageError> {
+    let mut tx = pool.begin().await?;
+    set_statement_timeout(&mut tx, timeout_ms).await?;
+
+    let rows = sqlx::query!(
+        r#"
+        SELECT id, scope, content, source, created_at, metadata,
+               content_fingerprint, tags,
+               tags_extractor_model, tags_extractor_version, tags_extracted_at,
+               similarity(content, $1) AS "sim!: f32"
+        FROM thoughts
+        WHERE similarity(content, $1) > 0.1
+          AND ($2::text IS NULL OR scope = $2)
+          AND ($3::text IS NULL OR scope LIKE $3 || '%')
+          AND retracted_at IS NULL
+        ORDER BY similarity(content, $1) DESC
+        LIMIT $4
+        "#,
+        query,
+        scope,
+        scope_prefix,
+        limit,
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
 
     rows.into_iter()
         .map(|r| {
@@ -2872,6 +2951,31 @@ mod tests {
             .await
             .unwrap();
         assert!(hits.is_empty());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_trigram_bounded_sets_statement_timeout(pool: PgPool) {
+        let mut tx = pool.begin().await.unwrap();
+
+        set_statement_timeout(&mut tx, 300).await.unwrap();
+
+        let (value,): (String,) = sqlx::query_as("SELECT current_setting('statement_timeout')")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+
+        assert_eq!(value, "300ms");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_trigram_bounded_finds_exact_match(pool: PgPool) {
+        insert_test_thought(&pool, "remembering tcgplayer integration", "work").await;
+
+        let hits = search_trigram_bounded(&pool, "tcgplayer", None, None, 10, 300)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].thought.content.contains("tcgplayer"));
     }
 
     fn unit_vector_4096(pos: usize) -> Vec<f32> {
