@@ -81,8 +81,9 @@ pub struct SearchHit {
     pub vector_score: Option<f32>,
     /// Raw rank from the current lexical leg (`None` if not in that leg).
     pub lexical_score: Option<f32>,
-    /// Legacy raw `similarity` from the old trigram leg. The current hybrid
-    /// path leaves this `None`; kept so existing clients don't break.
+    /// Legacy lexical score field from the old trigram leg. FTS hits mirror
+    /// `lexical_score` here so existing clients keep seeing a lexical-leg
+    /// signal while they migrate.
     pub trigram_score: Option<f32>,
     /// RRF aggregate (optionally adjusted by recency boost).
     pub rrf_score: Option<f32>,
@@ -195,7 +196,8 @@ async fn search_thoughts_with_tuning(
     lexical_timeout_ms: u64,
     default_candidate_pool: usize,
 ) -> Result<SearchResponse, ReadError> {
-    if request.query.is_empty() {
+    let query = request.query.trim().to_string();
+    if query.is_empty() {
         return Err(ReadError::EmptyQuery);
     }
     let limit = request.limit.unwrap_or(DEFAULT_SEARCH_LIMIT);
@@ -213,7 +215,7 @@ async fn search_thoughts_with_tuning(
 
     // Vector leg (soft-fail to empty + flag).
     let (vector_hits, vector_search_available) = match embedder
-        .embed(std::slice::from_ref(&request.query))
+        .embed(std::slice::from_ref(&query))
         .await
     {
         Ok(mut vectors) => {
@@ -248,7 +250,7 @@ async fn search_thoughts_with_tuning(
     // the whole hybrid search into a 5xx.
     let lexical_hits = bounded_fts_hits(
         pool,
-        &request.query,
+        &query,
         scope_filter,
         scope_prefix_filter,
         lexical_top_k,
@@ -287,7 +289,7 @@ async fn search_thoughts_with_tuning(
     let candidate_pool = request.candidate_pool.unwrap_or(default_candidate_pool);
     let rerank_used = match (rerank_enabled, reranker) {
         (true, Some(rr)) => {
-            apply_rerank_to_thought_hits(rr, &request.query, &mut fused, candidate_pool).await
+            apply_rerank_to_thought_hits(rr, &query, &mut fused, candidate_pool).await
         }
         _ => false,
     };
@@ -672,24 +674,26 @@ mod tests {
     #[sqlx::test(migrations = "../../migrations")]
     async fn search_thoughts_empty_query_errors(pool: PgPool) {
         let embedder = test_embedder();
-        let err = search_thoughts(
-            &pool,
-            &embedder,
-            None,
-            SearchRequest {
-                query: String::new(),
-                scope: None,
-                scope_prefix: None,
-                limit: None,
-                recency_half_life_days: None,
-                rerank: None,
-                candidate_pool: None,
-                tag_filter: None,
-            },
-        )
-        .await
-        .unwrap_err();
-        assert!(matches!(err, ReadError::EmptyQuery));
+        for query in ["", "   \n\t  "] {
+            let err = search_thoughts(
+                &pool,
+                &embedder,
+                None,
+                SearchRequest {
+                    query: query.to_string(),
+                    scope: None,
+                    scope_prefix: None,
+                    limit: None,
+                    recency_half_life_days: None,
+                    rerank: None,
+                    candidate_pool: None,
+                    tag_filter: None,
+                },
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(err, ReadError::EmptyQuery));
+        }
     }
 
     #[sqlx::test(migrations = "../../migrations")]

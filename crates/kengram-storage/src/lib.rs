@@ -98,6 +98,25 @@ fn sql_identifier(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
 }
 
+fn normalize_fts_query(query: &str) -> Option<String> {
+    let normalized = query
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>();
+    let trimmed = normalized.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed
+        .chars()
+        .all(|c| c.is_ascii_punctuation() || c.is_whitespace())
+    {
+        return None;
+    }
+
+    Some(trimmed.to_string())
+}
+
 fn ann_projection_index_name(projection_id: &str) -> String {
     let mut sanitized = projection_id
         .chars()
@@ -944,6 +963,10 @@ pub async fn search_fts(
     scope_prefix: Option<&str>,
     limit: i64,
 ) -> Result<Vec<Hit>, StorageError> {
+    let Some(query) = normalize_fts_query(query) else {
+        return Ok(Vec::new());
+    };
+
     let rows = sqlx::query!(
         r#"
         WITH fts AS (
@@ -1003,6 +1026,10 @@ pub async fn search_fts_bounded(
     limit: i64,
     timeout_ms: u64,
 ) -> Result<Vec<Hit>, StorageError> {
+    let Some(query) = normalize_fts_query(query) else {
+        return Ok(Vec::new());
+    };
+
     let mut tx = pool.begin().await?;
     if let Err(e) = set_statement_timeout(&mut tx, timeout_ms).await {
         if let Err(rollback_err) = tx.rollback().await {
@@ -3048,7 +3075,7 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert!(hits[0].thought.content.contains("tcgplayer"));
         assert!(hits[0].lexical_score.unwrap() > 0.0);
-        assert_eq!(hits[0].trigram_score, None);
+        assert_eq!(hits[0].trigram_score, hits[0].lexical_score);
     }
 
     #[sqlx::test(migrations = "../../migrations")]
@@ -3070,6 +3097,27 @@ mod tests {
             .await
             .unwrap();
         assert!(hits.is_empty());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_fts_returns_empty_for_empty_or_operator_only_queries(pool: PgPool) {
+        insert_test_thought(&pool, "remembering tcgplayer integration", "work").await;
+
+        for query in ["", "   ", "&", "|", "!", "&&", "||", " ! | & "] {
+            let hits = search_fts(&pool, query, None, None, 10).await.unwrap();
+            assert!(hits.is_empty(), "query {query:?} should not hit FTS");
+        }
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_fts_normalizes_control_chars_before_querying(pool: PgPool) {
+        insert_test_thought(&pool, "remembering tcgplayer integration", "work").await;
+
+        let hits = search_fts(&pool, "\u{0000}\u{0007}tcgplayer\u{001f}", None, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].thought.content.contains("tcgplayer"));
     }
 
     #[sqlx::test(migrations = "../../migrations")]
@@ -3096,6 +3144,7 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert!(hits[0].thought.content.contains("tcgplayer"));
         assert!(hits[0].lexical_score.unwrap() > 0.0);
+        assert_eq!(hits[0].trigram_score, hits[0].lexical_score);
     }
 
     #[sqlx::test(migrations = "../../migrations")]

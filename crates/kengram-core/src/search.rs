@@ -53,8 +53,9 @@ pub struct Hit {
     /// `ts_rank_cd`; older trigram-only callers leave it unset.
     pub lexical_score: Option<f32>,
     /// Raw `similarity` (pg_trgm symmetric n-gram Jaccard) from the trigram
-    /// leg. Kept for wire compatibility with older clients; the production
-    /// hybrid lexical leg now uses `lexical_score`.
+    /// leg. Kept for wire compatibility with older clients; FTS hits also
+    /// alias their `lexical_score` here so legacy consumers do not silently
+    /// lose the lexical-leg signal.
     pub trigram_score: Option<f32>,
     /// Reciprocal Rank Fusion aggregate, optionally adjusted by
     /// [`recency_boost`]. Set by [`rrf_fuse`]; `None` on raw leg hits
@@ -84,14 +85,14 @@ impl Hit {
     }
 
     /// Construct a hit produced by the lexical FTS leg. The raw Postgres FTS
-    /// rank lands in `lexical_score`; vector + trigram + rerank + RRF fields
-    /// default to `None`.
+    /// rank lands in `lexical_score`; it is also mirrored to legacy
+    /// `trigram_score` for wire compatibility until consumers migrate.
     pub fn from_lexical_leg(thought: Thought, rank: f32) -> Self {
         Self {
             thought,
             vector_score: None,
             lexical_score: Some(rank),
-            trigram_score: None,
+            trigram_score: Some(rank),
             rrf_score: None,
             rerank_score: None,
         }
@@ -261,7 +262,8 @@ mod tests {
     fn rrf_preserves_per_leg_scores_when_present() {
         // Build a vector-leg hit and a lexical-leg hit for two different
         // thoughts. After fusion, each hit should carry the per-leg score
-        // from its origin (and None for the other leg).
+        // from its origin. FTS hits also mirror their lexical rank to the
+        // legacy trigram field for wire compatibility.
         let v_hit = Hit::from_vector_leg(thought(1, "vec only", 0), 0.85);
         let l_hit = Hit::from_lexical_leg(thought(2, "lex only", 0), 0.42);
         let out = rrf_fuse(vec![vec![v_hit], vec![l_hit]], 60.0);
@@ -276,7 +278,7 @@ mod tests {
         let l = &by_content["lex only"];
         assert_eq!(l.vector_score, None);
         assert_eq!(l.lexical_score, Some(0.42));
-        assert_eq!(l.trigram_score, None);
+        assert_eq!(l.trigram_score, Some(0.42));
     }
 
     #[test]
@@ -289,7 +291,7 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].vector_score, Some(0.91));
         assert_eq!(out[0].lexical_score, Some(0.33));
-        assert_eq!(out[0].trigram_score, None);
+        assert_eq!(out[0].trigram_score, Some(0.33));
     }
 
     #[test]
