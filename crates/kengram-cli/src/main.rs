@@ -391,9 +391,9 @@ async fn run_serve(config: Config) -> anyhow::Result<()> {
         .with_context(|| format!("connecting to {}", config.database.url))?;
 
     let embedder = build_embedder(&config.embedder)?;
-    kengram_storage::ensure_ann_projection_ready(&pool, embedder.model())
+    kengram_storage::ensure_vector_search_ready(&pool, embedder.model())
         .await
-        .context("ensuring ANN projection readiness")?;
+        .context("ensuring vector search readiness")?;
     let reranker = build_reranker(&config.reranker)?;
     // Server only needs the tagger model_id (to stamp pending_tags rows).
     // The actual tagger HTTP client lives in the worker process.
@@ -514,9 +514,9 @@ async fn run_worker(config: Config) -> anyhow::Result<()> {
         .await
         .with_context(|| format!("connecting to {}", config.database.url))?;
     let embedder = build_embedder(&config.embedder)?;
-    kengram_storage::ensure_ann_projection_ready(&pool, embedder.model())
+    kengram_storage::ensure_vector_search_ready(&pool, embedder.model())
         .await
-        .context("ensuring ANN projection readiness")?;
+        .context("ensuring vector search readiness")?;
     let ResolvedTagger {
         tagger,
         model_id: tagger_model_id,

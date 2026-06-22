@@ -32,6 +32,16 @@ mod ann {
     pub const PROJECTION_SUFFIX: &str = "halfvec:3072";
 }
 
+mod bge {
+    pub const MODEL_ID: &str = "bge-m3:1024";
+    pub const DIMS: usize = 1024;
+    pub const DIMS_I32: i32 = 1024;
+    pub const MODEL_VERSION: i32 = 1;
+    pub const HNSW_EF_SEARCH: i32 = 1000;
+    pub const THOUGHT_TABLE: &str = "thought_embeddings_bge_m3";
+    pub const THOUGHT_HNSW_INDEX: &str = "thought_embeddings_bge_m3_hnsw";
+}
+
 #[derive(Debug, Clone)]
 struct AnnProjection {
     projection_id: String,
@@ -51,6 +61,9 @@ pub struct AnnProjectionCoverage {
 }
 
 fn ann_projection_for_model(model: &EmbeddingModel) -> Option<AnnProjection> {
+    if is_bge_m3_1024(model) {
+        return None;
+    }
     if model.dimensions < ann::HALF_3072_DIMS {
         return None;
     }
@@ -59,6 +72,10 @@ fn ann_projection_for_model(model: &EmbeddingModel) -> Option<AnnProjection> {
         projection_id: format!("{}:{}", model.id, ann::PROJECTION_SUFFIX),
         dimensions: ann::HALF_3072_DIMS,
     })
+}
+
+fn is_bge_m3_1024(model: &EmbeddingModel) -> bool {
+    model.id == bge::MODEL_ID && model.dimensions == bge::DIMS
 }
 
 fn project_halfvec_3072(
@@ -151,6 +168,15 @@ async fn set_ann_projection_ef_search(tx: &mut PgTransaction<'_>) -> Result<(), 
     Ok(())
 }
 
+async fn set_bge_hnsw_ef_search(tx: &mut PgTransaction<'_>) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT set_config('hnsw.ef_search', $1, true)")
+        .bind(bge::HNSW_EF_SEARCH.to_string())
+        .execute(&mut **tx)
+        .await?;
+
+    Ok(())
+}
+
 async fn set_statement_timeout(
     tx: &mut PgTransaction<'_>,
     timeout_ms: u64,
@@ -217,6 +243,16 @@ pub enum StorageError {
     )]
     InvalidAnnProjectionDimensions { expected: usize, got: usize },
 
+    #[error("embedding vector dimensions mismatch for {model_id}: expected {expected}, got {got}")]
+    InvalidEmbeddingDimensions {
+        model_id: String,
+        expected: usize,
+        got: usize,
+    },
+
+    #[error("bge-m3 sidecar only supports thought embeddings, got target_kind={0}")]
+    UnsupportedBgeTargetKind(String),
+
     #[error(
         "ANN projection coverage mismatch for {projection_id}: embeddings={embedding_count}, projections={projection_count}, missing={missing_count}"
     )]
@@ -229,6 +265,12 @@ pub enum StorageError {
 
     #[error("ANN projection index {0} exists but is not ready/valid")]
     AnnProjectionIndexNotReady(String),
+
+    #[error("bge-m3 sidecar index {0} is missing or not ready/valid")]
+    BgeSidecarIndexNotReady(String),
+
+    #[error("bge-m3 sidecar table {0} is missing")]
+    BgeSidecarTableMissing(String),
 }
 
 impl StorageError {
@@ -354,6 +396,10 @@ pub async fn insert_embedding(
     model: &EmbeddingModel,
     vector: Vec<f32>,
 ) -> Result<(), StorageError> {
+    if is_bge_m3_1024(model) {
+        return insert_bge_embedding(pool, target_kind, target_id, model, vector).await;
+    }
+
     let mut tx = pool.begin().await?;
     let pgv = pgvector::Vector::from(vector.clone());
     sqlx::query(
@@ -372,6 +418,56 @@ pub async fn insert_embedding(
     .await?;
 
     insert_ann_projection(&mut tx, target_kind, target_id, model, &vector).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn insert_bge_embedding(
+    pool: &PgPool,
+    target_kind: &'static str,
+    target_id: Uuid,
+    model: &EmbeddingModel,
+    vector: Vec<f32>,
+) -> Result<(), StorageError> {
+    if target_kind != target::THOUGHT {
+        return Err(StorageError::UnsupportedBgeTargetKind(
+            target_kind.to_string(),
+        ));
+    }
+    if vector.len() != bge::DIMS {
+        return Err(StorageError::InvalidEmbeddingDimensions {
+            model_id: model.id.clone(),
+            expected: bge::DIMS,
+            got: vector.len(),
+        });
+    }
+
+    let mut tx = pool.begin().await?;
+    let pgv = pgvector::Vector::from(vector);
+    sqlx::query(
+        r#"
+        INSERT INTO thought_embeddings_bge_m3 (
+            thought_id,
+            model_id,
+            model_version,
+            dimensions,
+            embedding
+        )
+        VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (thought_id, model_id, model_version)
+        DO UPDATE SET
+            dimensions = EXCLUDED.dimensions,
+            embedding = EXCLUDED.embedding,
+            created_at = NOW()
+        "#,
+    )
+    .bind(target_id)
+    .bind(bge::MODEL_ID)
+    .bind(bge::MODEL_VERSION)
+    .bind(bge::DIMS_I32)
+    .bind(pgv)
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await?;
     Ok(())
 }
@@ -713,6 +809,26 @@ pub async fn thought_has_embedding(
     id: ThoughtId,
     model: &EmbeddingModel,
 ) -> Result<bool, StorageError> {
+    if is_bge_m3_1024(model) {
+        let (exists,): (bool,) = sqlx::query_as(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM thought_embeddings_bge_m3
+                WHERE thought_id = $1
+                  AND model_id = $2
+                  AND model_version = $3
+            )
+            "#,
+        )
+        .bind(id.into_uuid())
+        .bind(bge::MODEL_ID)
+        .bind(bge::MODEL_VERSION)
+        .fetch_one(pool)
+        .await?;
+        return Ok(exists);
+    }
+
     let row = sqlx::query!(
         r#"
         SELECT EXISTS (
@@ -749,6 +865,31 @@ pub async fn fetch_thought_with_provenance(
     id: ThoughtId,
     model: &EmbeddingModel,
 ) -> Result<Option<ThoughtWithProvenance>, StorageError> {
+    if is_bge_m3_1024(model) {
+        let row: Option<ThoughtProvenanceRow> = sqlx::query_as(
+            r#"
+            SELECT t.id, t.scope, t.content, t.source, t.created_at, t.metadata,
+                   t.content_fingerprint, t.tags,
+                   t.tags_extractor_model, t.tags_extractor_version, t.tags_extracted_at,
+                   t.retracted_at, t.retracted_reason,
+                   b.created_at AS embedded_at
+            FROM thoughts t
+            LEFT JOIN thought_embeddings_bge_m3 b
+              ON b.thought_id = t.id
+             AND b.model_id = $2
+             AND b.model_version = $3
+            WHERE t.id = $1
+            "#,
+        )
+        .bind(id.into_uuid())
+        .bind(bge::MODEL_ID)
+        .bind(bge::MODEL_VERSION)
+        .fetch_optional(pool)
+        .await?;
+
+        return row.map(thought_provenance_row_to_result).transpose();
+    }
+
     let row = sqlx::query!(
         r#"
         SELECT t.id, t.scope, t.content, t.source, t.created_at, t.metadata,
@@ -769,10 +910,48 @@ pub async fn fetch_thought_with_provenance(
     .fetch_optional(pool)
     .await?;
 
-    let Some(r) = row else {
-        return Ok(None);
-    };
+    row.map(|r| {
+        thought_provenance_row_to_result(ThoughtProvenanceRow {
+            id: r.id,
+            scope: r.scope,
+            content: r.content,
+            source: r.source,
+            created_at: r.created_at,
+            metadata: r.metadata,
+            content_fingerprint: r.content_fingerprint,
+            tags: r.tags,
+            tags_extractor_model: r.tags_extractor_model,
+            tags_extractor_version: r.tags_extractor_version,
+            tags_extracted_at: r.tags_extracted_at,
+            retracted_at: r.retracted_at,
+            retracted_reason: r.retracted_reason,
+            embedded_at: r.embedded_at,
+        })
+    })
+    .transpose()
+}
 
+#[derive(sqlx::FromRow)]
+struct ThoughtProvenanceRow {
+    id: Uuid,
+    scope: String,
+    content: String,
+    source: String,
+    created_at: OffsetDateTime,
+    metadata: serde_json::Value,
+    content_fingerprint: Vec<u8>,
+    tags: serde_json::Value,
+    tags_extractor_model: Option<String>,
+    tags_extractor_version: Option<i32>,
+    tags_extracted_at: Option<OffsetDateTime>,
+    retracted_at: Option<OffsetDateTime>,
+    retracted_reason: Option<String>,
+    embedded_at: Option<OffsetDateTime>,
+}
+
+fn thought_provenance_row_to_result(
+    r: ThoughtProvenanceRow,
+) -> Result<ThoughtWithProvenance, StorageError> {
     let thought = Thought {
         id: ThoughtId::from(r.id),
         scope: Scope::new(r.scope)?,
@@ -793,13 +972,13 @@ pub async fn fetch_thought_with_provenance(
         EmbeddingStatus::Pending
     };
 
-    Ok(Some(ThoughtWithProvenance {
+    Ok(ThoughtWithProvenance {
         thought,
         embedding_status,
         embedded_at: r.embedded_at,
         retracted_at: r.retracted_at,
         retracted_reason: r.retracted_reason,
-    }))
+    })
 }
 
 /// Recent thoughts in (optional) scope, ordered newest-first.
@@ -1109,6 +1288,34 @@ pub async fn find_unembedded_thoughts(
     scope: Option<&str>,
     limit: i64,
 ) -> Result<Vec<Thought>, StorageError> {
+    if is_bge_m3_1024(model) {
+        let rows: Vec<ThoughtRow> = sqlx::query_as(
+            r#"
+            SELECT t.id, t.scope, t.content, t.source, t.created_at, t.metadata,
+                   t.content_fingerprint, t.tags,
+                   t.tags_extractor_model, t.tags_extractor_version, t.tags_extracted_at
+            FROM thoughts t
+            LEFT JOIN thought_embeddings_bge_m3 b
+              ON b.thought_id = t.id
+             AND b.model_id = $1
+             AND b.model_version = $2
+            WHERE b.thought_id IS NULL
+              AND ($3::text IS NULL OR t.scope = $3)
+              AND t.retracted_at IS NULL
+            ORDER BY t.created_at ASC
+            LIMIT $4
+            "#,
+        )
+        .bind(bge::MODEL_ID)
+        .bind(bge::MODEL_VERSION)
+        .bind(scope)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+
+        return rows.into_iter().map(thought_row_to_thought).collect();
+    }
+
     let rows = sqlx::query!(
         r#"
         SELECT t.id, t.scope, t.content, t.source, t.created_at, t.metadata,
@@ -1253,6 +1460,35 @@ pub async fn enqueue_unembedded_thoughts(
     scope_prefix: Option<&str>,
     limit: i64,
 ) -> Result<usize, StorageError> {
+    if model_id == bge::MODEL_ID {
+        let result = sqlx::query(
+            r#"
+            INSERT INTO pending_embeddings (target_kind, target_id, model_id)
+            SELECT 'thought', t.id, $1
+            FROM thoughts t
+            LEFT JOIN thought_embeddings_bge_m3 b
+              ON b.thought_id = t.id
+             AND b.model_id = $1
+             AND b.model_version = $2
+            WHERE b.thought_id IS NULL
+              AND ($3::text IS NULL OR t.scope = $3)
+              AND ($4::text IS NULL OR t.scope LIKE $4 || '%')
+              AND t.retracted_at IS NULL
+            ORDER BY t.created_at ASC
+            LIMIT $5
+            ON CONFLICT (target_kind, target_id, model_id) DO NOTHING
+            "#,
+        )
+        .bind(model_id)
+        .bind(bge::MODEL_VERSION)
+        .bind(scope)
+        .bind(scope_prefix)
+        .bind(limit)
+        .execute(pool)
+        .await?;
+        return Ok(result.rows_affected() as usize);
+    }
+
     let result = sqlx::query!(
         r#"
         INSERT INTO pending_embeddings (target_kind, target_id, model_id)
@@ -2102,6 +2338,10 @@ pub async fn search_vector_knn(
     scope_prefix: Option<&str>,
     limit: i64,
 ) -> Result<Vec<Hit>, StorageError> {
+    if is_bge_m3_1024(model) {
+        return search_bge_vector_knn(pool, query_vector, scope, scope_prefix, limit).await;
+    }
+
     if let Some(projection) = ann_projection_for_model(model) {
         if ann_projection_search_ready(pool, &projection.projection_id).await? {
             if ann_projection_filter_has_missing_rows(
@@ -2186,6 +2426,56 @@ pub async fn search_vector_knn(
     .bind(limit)
     .fetch_all(pool)
     .await?;
+
+    vector_rows_to_hits(rows)
+}
+
+async fn search_bge_vector_knn(
+    pool: &PgPool,
+    query_vector: Vec<f32>,
+    scope: Option<&str>,
+    scope_prefix: Option<&str>,
+    limit: i64,
+) -> Result<Vec<Hit>, StorageError> {
+    if query_vector.len() != bge::DIMS {
+        return Err(StorageError::InvalidEmbeddingDimensions {
+            model_id: bge::MODEL_ID.to_string(),
+            expected: bge::DIMS,
+            got: query_vector.len(),
+        });
+    }
+
+    assert_bge_vector_search_ready(pool).await?;
+
+    let pgv = pgvector::Vector::from(query_vector);
+    let mut tx = pool.begin().await?;
+    set_bge_hnsw_ef_search(&mut tx).await?;
+    let rows: Vec<VectorSearchRow> = sqlx::query_as(
+        r#"
+        SELECT t.id, t.scope, t.content, t.source, t.created_at, t.metadata,
+               t.content_fingerprint, t.tags,
+               t.tags_extractor_model, t.tags_extractor_version, t.tags_extracted_at,
+               (b.embedding <=> $1::vector(1024)) AS distance
+        FROM thought_embeddings_bge_m3 b
+        JOIN thoughts t ON t.id = b.thought_id
+        WHERE b.model_id = $2
+          AND b.model_version = $3
+          AND ($4::text IS NULL OR t.scope = $4)
+          AND ($5::text IS NULL OR t.scope LIKE $5 || '%')
+          AND t.retracted_at IS NULL
+        ORDER BY b.embedding <=> $1::vector(1024)
+        LIMIT $6
+        "#,
+    )
+    .bind(pgv)
+    .bind(bge::MODEL_ID)
+    .bind(bge::MODEL_VERSION)
+    .bind(scope)
+    .bind(scope_prefix)
+    .bind(limit)
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
 
     vector_rows_to_hits(rows)
 }
@@ -2379,6 +2669,64 @@ pub async fn ensure_ann_projection_ready(
     Ok(coverage)
 }
 
+/// Generic startup gate for the active vector-search path. Qwen-sized models
+/// use the halfvec projection sidecar; bge-m3:1024 uses its typed vector(1024)
+/// thought sidecar and fails closed if that table or HNSW index is not valid.
+pub async fn ensure_vector_search_ready(
+    pool: &PgPool,
+    model: &EmbeddingModel,
+) -> Result<Option<AnnProjectionCoverage>, StorageError> {
+    if is_bge_m3_1024(model) {
+        assert_bge_vector_search_ready(pool).await?;
+        return Ok(None);
+    }
+
+    ensure_ann_projection_ready(pool, model).await
+}
+
+async fn assert_bge_vector_search_ready(pool: &PgPool) -> Result<(), StorageError> {
+    if !table_exists(pool, bge::THOUGHT_TABLE).await? {
+        return Err(StorageError::BgeSidecarTableMissing(
+            bge::THOUGHT_TABLE.to_string(),
+        ));
+    }
+
+    if !index_ready(pool, bge::THOUGHT_HNSW_INDEX).await? {
+        return Err(StorageError::BgeSidecarIndexNotReady(
+            bge::THOUGHT_HNSW_INDEX.to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+async fn table_exists(pool: &PgPool, table_name: &str) -> Result<bool, StorageError> {
+    let (exists,): (bool,) = sqlx::query_as("SELECT to_regclass($1) IS NOT NULL")
+        .bind(format!("public.{table_name}"))
+        .fetch_one(pool)
+        .await?;
+    Ok(exists)
+}
+
+async fn index_ready(pool: &PgPool, index_name: &str) -> Result<bool, StorageError> {
+    let (ready,): (bool,) = sqlx::query_as(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM pg_class c
+            JOIN pg_index i ON i.indexrelid = c.oid
+            WHERE c.relname = $1
+              AND i.indisready
+              AND i.indisvalid
+        )
+        "#,
+    )
+    .bind(index_name)
+    .fetch_one(pool)
+    .await?;
+    Ok(ready)
+}
+
 #[derive(sqlx::FromRow)]
 struct VectorSearchRow {
     id: Uuid,
@@ -2393,6 +2741,37 @@ struct VectorSearchRow {
     tags_extractor_version: Option<i32>,
     tags_extracted_at: Option<OffsetDateTime>,
     distance: f64,
+}
+
+#[derive(sqlx::FromRow)]
+struct ThoughtRow {
+    id: Uuid,
+    scope: String,
+    content: String,
+    source: String,
+    created_at: OffsetDateTime,
+    metadata: serde_json::Value,
+    content_fingerprint: Vec<u8>,
+    tags: serde_json::Value,
+    tags_extractor_model: Option<String>,
+    tags_extractor_version: Option<i32>,
+    tags_extracted_at: Option<OffsetDateTime>,
+}
+
+fn thought_row_to_thought(r: ThoughtRow) -> Result<Thought, StorageError> {
+    Ok(Thought {
+        id: ThoughtId::from(r.id),
+        scope: Scope::new(r.scope)?,
+        content: r.content,
+        source: Source::new(r.source)?,
+        created_at: r.created_at,
+        metadata: Metadata::from(r.metadata),
+        content_fingerprint: fingerprint_from_bytes(r.content_fingerprint)?,
+        tags: tags_from_value(r.tags)?,
+        tags_extractor_model: r.tags_extractor_model,
+        tags_extractor_version: r.tags_extractor_version,
+        tags_extracted_at: r.tags_extracted_at,
+    })
 }
 
 // -- M6.0: corpus stats (operator-facing telemetry) ---------------------
@@ -3185,6 +3564,12 @@ mod tests {
         v
     }
 
+    fn unit_vector_1024(pos: usize) -> Vec<f32> {
+        let mut v = vec![0.0_f32; 1024];
+        v[pos] = 1.0;
+        v
+    }
+
     async fn insert_raw_embedding_without_projection(
         pool: &PgPool,
         target_id: Uuid,
@@ -3376,6 +3761,53 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../../migrations")]
+    async fn insert_embedding_routes_bge_m3_to_typed_sidecar_only(pool: PgPool) {
+        let model = EmbeddingModel::bge_m3();
+        let id = insert_test_thought(&pool, "bge sidecar source", "global").await;
+        let target_id = id.into_uuid();
+
+        insert_thought_embedding(
+            &pool,
+            id,
+            &Embedding::new(model.clone(), unit_vector_1024(0)).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert!(thought_has_embedding(&pool, id, &model).await.unwrap());
+
+        let (sidecar_count,): (i64,) = sqlx::query_as(
+            r#"
+            SELECT COUNT(*)
+            FROM thought_embeddings_bge_m3
+            WHERE thought_id = $1
+              AND model_id = 'bge-m3:1024'
+              AND model_version = 1
+            "#,
+        )
+        .bind(target_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let (raw_count,): (i64,) = sqlx::query_as(
+            r#"
+            SELECT COUNT(*)
+            FROM embeddings
+            WHERE target_kind = 'thought'
+              AND target_id = $1
+              AND model_id = 'bge-m3:1024'
+            "#,
+        )
+        .bind(target_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(sidecar_count, 1);
+        assert_eq!(raw_count, 0, "bge-m3 must not hit vector(4096)");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
     async fn reconcile_ann_projections_backfills_missing_projection_and_marks_ok(pool: PgPool) {
         let model = EmbeddingModel::new("qwen3-embedding", 4096);
         let id = insert_test_thought(&pool, "raw-only projection source", "scope-a").await;
@@ -3513,6 +3945,55 @@ mod tests {
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].thought.id, id_a);
         assert!((hits[0].vector_score.unwrap() - 1.0).abs() < 1e-4);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_vector_knn_uses_bge_m3_typed_sidecar(pool: PgPool) {
+        let model = EmbeddingModel::bge_m3();
+
+        let id_a = insert_test_thought(&pool, "bge a", "global").await;
+        let id_b = insert_test_thought(&pool, "bge b", "global").await;
+
+        let va = unit_vector_1024(0);
+        let vb = unit_vector_1024(1);
+
+        insert_thought_embedding(
+            &pool,
+            id_a,
+            &Embedding::new(model.clone(), va.clone()).unwrap(),
+        )
+        .await
+        .unwrap();
+        insert_thought_embedding(&pool, id_b, &Embedding::new(model.clone(), vb).unwrap())
+            .await
+            .unwrap();
+
+        ensure_vector_search_ready(&pool, &model).await.unwrap();
+        let hits = search_vector_knn(&pool, va, &model, None, None, 10)
+            .await
+            .unwrap();
+
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].thought.id, id_a);
+        assert!((hits[0].vector_score.unwrap() - 1.0).abs() < 1e-4);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn ensure_vector_search_ready_fails_closed_for_missing_bge_index(pool: PgPool) {
+        let model = EmbeddingModel::bge_m3();
+
+        sqlx::query("DROP INDEX thought_embeddings_bge_m3_hnsw")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let err = ensure_vector_search_ready(&pool, &model).await.unwrap_err();
+
+        assert!(matches!(
+            err,
+            StorageError::BgeSidecarIndexNotReady(ref name)
+                if name == "thought_embeddings_bge_m3_hnsw"
+        ));
     }
 
     #[sqlx::test(migrations = "../../migrations")]
@@ -3660,6 +4141,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(enqueued, 1, "only `b` should be enqueued");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn enqueue_unembedded_thoughts_uses_bge_m3_sidecar(pool: PgPool) {
+        let model = EmbeddingModel::bge_m3();
+        let id_a = insert_test_thought(&pool, "bge embedded", "global").await;
+        let _id_b = insert_test_thought(&pool, "bge unembedded", "global").await;
+
+        insert_thought_embedding(
+            &pool,
+            id_a,
+            &Embedding::new(model.clone(), unit_vector_1024(0)).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let enqueued = enqueue_unembedded_thoughts(&pool, &model.id, None, None, 100)
+            .await
+            .unwrap();
+        assert_eq!(
+            enqueued, 1,
+            "only the sidecar-missing thought should enqueue"
+        );
+
+        let rows: Vec<(Uuid,)> = sqlx::query_as(
+            r#"
+            SELECT target_id
+            FROM pending_embeddings
+            WHERE model_id = 'bge-m3:1024'
+            "#,
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_ne!(rows[0].0, id_a.into_uuid());
     }
 
     // -- M4: tag-sidecar tests ------------------------------------------------
