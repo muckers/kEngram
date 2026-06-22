@@ -30,6 +30,8 @@ pub struct BackfillReport {
     /// Number that failed during embed/persist. Each failure is logged
     /// with pending_id + reason; the row stays in the queue for the worker.
     pub failed: usize,
+    /// Characters actually sent to the embedder during this backfill run.
+    pub input_chars: usize,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -55,7 +57,10 @@ pub async fn embed_backfill(
         kengram_storage::enqueue_unembedded_thoughts(pool, model_id, scope, scope_prefix, limit)
             .await?;
 
-    const BATCH: i64 = 16;
+    // Gemini embedding quotas count each content in batchEmbedContents toward
+    // the per-minute request bucket. Keep the batch under the published 3k/min
+    // lane even when calls return quickly.
+    const BATCH: i64 = 48;
     let mut report = BackfillReport {
         healed,
         ..Default::default()
@@ -70,6 +75,7 @@ pub async fn embed_backfill(
         }
         report.embedded += drain.embedded;
         report.failed += drain.failed;
+        report.input_chars += drain.input_chars;
         budget -= drain.found as i64;
         if drain.embedded == 0 {
             break;

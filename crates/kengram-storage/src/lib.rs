@@ -6,10 +6,12 @@
 //! the way of the macro (currently: only `insert_embedding`).
 
 use kengram_core::{
-    Embedding, EmbeddingModel, EmbeddingStatus, Hit, LinkDirection, LinkId, LinkSource, LinkTarget,
-    Metadata, RelationKind, Scope, ScopeError, ScopeVocab, Source, SourceError, Tags, Thought,
-    ThoughtId, UnknownLinkSource, UnknownRelationKind,
+    CLEAN_EMBED_STRATEGY, Embedding, EmbeddingModel, EmbeddingStatus, Hit, LinkDirection, LinkId,
+    LinkSource, LinkTarget, Metadata, RelationKind, Scope, ScopeError, ScopeVocab, Source,
+    SourceError, Tags, Thought, ThoughtId, UnknownLinkSource, UnknownRelationKind,
+    gemini_clean_embed_text,
 };
+use sha2::{Digest, Sha256};
 use sqlx::{PgPool, PgTransaction};
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -42,6 +44,16 @@ mod bge {
     pub const THOUGHT_HNSW_INDEX: &str = "thought_embeddings_bge_m3_hnsw";
 }
 
+mod gemini_clean {
+    pub const MODEL_ID: &str = "gemini-embedding-001";
+    pub const DIMS: usize = 3072;
+    pub const DIMS_I32: i32 = 3072;
+    pub const MODEL_VERSION: i32 = 1;
+    pub const HNSW_EF_SEARCH: i32 = 1000;
+    pub const THOUGHT_TABLE: &str = "thought_embeddings_gemini_clean_v1";
+    pub const THOUGHT_HNSW_INDEX: &str = "thought_embeddings_gemini_clean_v1_hnsw";
+}
+
 #[derive(Debug, Clone)]
 struct AnnProjection {
     projection_id: String,
@@ -64,6 +76,9 @@ fn ann_projection_for_model(model: &EmbeddingModel) -> Option<AnnProjection> {
     if is_bge_m3_1024(model) {
         return None;
     }
+    if is_gemini_clean_3072(model) {
+        return None;
+    }
     if model.dimensions < ann::HALF_3072_DIMS {
         return None;
     }
@@ -76,6 +91,10 @@ fn ann_projection_for_model(model: &EmbeddingModel) -> Option<AnnProjection> {
 
 fn is_bge_m3_1024(model: &EmbeddingModel) -> bool {
     model.id == bge::MODEL_ID && model.dimensions == bge::DIMS
+}
+
+fn is_gemini_clean_3072(model: &EmbeddingModel) -> bool {
+    model.id == gemini_clean::MODEL_ID && model.dimensions == gemini_clean::DIMS
 }
 
 fn project_halfvec_3072(
@@ -105,6 +124,22 @@ fn project_halfvec_3072(
     };
 
     Ok(pgvector::HalfVector::from_f32_slice(&projected))
+}
+
+fn exact_halfvec(vector: &[f32], dimensions: usize) -> Result<pgvector::HalfVector, StorageError> {
+    if vector.len() != dimensions {
+        return Err(StorageError::InvalidAnnProjectionDimensions {
+            expected: dimensions,
+            got: vector.len(),
+        });
+    }
+    Ok(pgvector::HalfVector::from_f32_slice(vector))
+}
+
+fn sha256_hex(input: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(input.as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 fn sql_literal(value: &str) -> String {
@@ -171,6 +206,15 @@ async fn set_ann_projection_ef_search(tx: &mut PgTransaction<'_>) -> Result<(), 
 async fn set_bge_hnsw_ef_search(tx: &mut PgTransaction<'_>) -> Result<(), sqlx::Error> {
     sqlx::query("SELECT set_config('hnsw.ef_search', $1, true)")
         .bind(bge::HNSW_EF_SEARCH.to_string())
+        .execute(&mut **tx)
+        .await?;
+
+    Ok(())
+}
+
+async fn set_gemini_clean_hnsw_ef_search(tx: &mut PgTransaction<'_>) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT set_config('hnsw.ef_search', $1, true)")
+        .bind(gemini_clean::HNSW_EF_SEARCH.to_string())
         .execute(&mut **tx)
         .await?;
 
@@ -253,6 +297,9 @@ pub enum StorageError {
     #[error("bge-m3 sidecar only supports thought embeddings, got target_kind={0}")]
     UnsupportedBgeTargetKind(String),
 
+    #[error("Gemini clean sidecar only supports thought embeddings, got target_kind={0}")]
+    UnsupportedGeminiCleanTargetKind(String),
+
     #[error(
         "ANN projection coverage mismatch for {projection_id}: embeddings={embedding_count}, projections={projection_count}, missing={missing_count}"
     )]
@@ -271,6 +318,12 @@ pub enum StorageError {
 
     #[error("bge-m3 sidecar table {0} is missing")]
     BgeSidecarTableMissing(String),
+
+    #[error("Gemini clean sidecar index {0} is missing or not ready/valid")]
+    GeminiCleanSidecarIndexNotReady(String),
+
+    #[error("Gemini clean sidecar table {0} is missing")]
+    GeminiCleanSidecarTableMissing(String),
 }
 
 impl StorageError {
@@ -399,6 +452,9 @@ pub async fn insert_embedding(
     if is_bge_m3_1024(model) {
         return insert_bge_embedding(pool, target_kind, target_id, model, vector).await;
     }
+    if is_gemini_clean_3072(model) {
+        return insert_gemini_clean_embedding(pool, target_kind, target_id, model, vector).await;
+    }
 
     let mut tx = pool.begin().await?;
     let pgv = pgvector::Vector::from(vector.clone());
@@ -466,6 +522,80 @@ async fn insert_bge_embedding(
     .bind(bge::MODEL_VERSION)
     .bind(bge::DIMS_I32)
     .bind(pgv)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn insert_gemini_clean_embedding(
+    pool: &PgPool,
+    target_kind: &'static str,
+    target_id: Uuid,
+    model: &EmbeddingModel,
+    vector: Vec<f32>,
+) -> Result<(), StorageError> {
+    if target_kind != target::THOUGHT {
+        return Err(StorageError::UnsupportedGeminiCleanTargetKind(
+            target_kind.to_string(),
+        ));
+    }
+    if vector.len() != gemini_clean::DIMS {
+        return Err(StorageError::InvalidEmbeddingDimensions {
+            model_id: model.id.clone(),
+            expected: gemini_clean::DIMS,
+            got: vector.len(),
+        });
+    }
+
+    let (content, content_fingerprint): (String, Vec<u8>) = sqlx::query_as(
+        r#"
+        SELECT content, content_fingerprint
+        FROM thoughts
+        WHERE id = $1
+        "#,
+    )
+    .bind(target_id)
+    .fetch_one(pool)
+    .await?;
+    let clean = gemini_clean_embed_text(&content);
+    let clean_sha256 = sha256_hex(&clean.text);
+    let halfvec = exact_halfvec(&vector, gemini_clean::DIMS)?;
+
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        r#"
+        INSERT INTO thought_embeddings_gemini_clean_v1 (
+            thought_id,
+            model_id,
+            model_version,
+            dimensions,
+            clean_strategy,
+            clean_reason,
+            content_fingerprint,
+            clean_sha256,
+            embedding
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        ON CONFLICT (thought_id, model_id, model_version, clean_strategy)
+        DO UPDATE SET
+            dimensions = EXCLUDED.dimensions,
+            clean_reason = EXCLUDED.clean_reason,
+            content_fingerprint = EXCLUDED.content_fingerprint,
+            clean_sha256 = EXCLUDED.clean_sha256,
+            embedding = EXCLUDED.embedding,
+            created_at = NOW()
+        "#,
+    )
+    .bind(target_id)
+    .bind(gemini_clean::MODEL_ID)
+    .bind(gemini_clean::MODEL_VERSION)
+    .bind(gemini_clean::DIMS_I32)
+    .bind(CLEAN_EMBED_STRATEGY)
+    .bind(clean.reason)
+    .bind(content_fingerprint)
+    .bind(clean_sha256)
+    .bind(halfvec)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -828,6 +958,27 @@ pub async fn thought_has_embedding(
         .await?;
         return Ok(exists);
     }
+    if is_gemini_clean_3072(model) {
+        let (exists,): (bool,) = sqlx::query_as(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM thought_embeddings_gemini_clean_v1
+                WHERE thought_id = $1
+                  AND model_id = $2
+                  AND model_version = $3
+                  AND clean_strategy = $4
+            )
+            "#,
+        )
+        .bind(id.into_uuid())
+        .bind(gemini_clean::MODEL_ID)
+        .bind(gemini_clean::MODEL_VERSION)
+        .bind(CLEAN_EMBED_STRATEGY)
+        .fetch_one(pool)
+        .await?;
+        return Ok(exists);
+    }
 
     let row = sqlx::query!(
         r#"
@@ -884,6 +1035,32 @@ pub async fn fetch_thought_with_provenance(
         .bind(id.into_uuid())
         .bind(bge::MODEL_ID)
         .bind(bge::MODEL_VERSION)
+        .fetch_optional(pool)
+        .await?;
+
+        return row.map(thought_provenance_row_to_result).transpose();
+    }
+    if is_gemini_clean_3072(model) {
+        let row: Option<ThoughtProvenanceRow> = sqlx::query_as(
+            r#"
+            SELECT t.id, t.scope, t.content, t.source, t.created_at, t.metadata,
+                   t.content_fingerprint, t.tags,
+                   t.tags_extractor_model, t.tags_extractor_version, t.tags_extracted_at,
+                   t.retracted_at, t.retracted_reason,
+                   g.created_at AS embedded_at
+            FROM thoughts t
+            LEFT JOIN thought_embeddings_gemini_clean_v1 g
+              ON g.thought_id = t.id
+             AND g.model_id = $2
+             AND g.model_version = $3
+             AND g.clean_strategy = $4
+            WHERE t.id = $1
+            "#,
+        )
+        .bind(id.into_uuid())
+        .bind(gemini_clean::MODEL_ID)
+        .bind(gemini_clean::MODEL_VERSION)
+        .bind(CLEAN_EMBED_STRATEGY)
         .fetch_optional(pool)
         .await?;
 
@@ -1315,6 +1492,35 @@ pub async fn find_unembedded_thoughts(
 
         return rows.into_iter().map(thought_row_to_thought).collect();
     }
+    if is_gemini_clean_3072(model) {
+        let rows: Vec<ThoughtRow> = sqlx::query_as(
+            r#"
+            SELECT t.id, t.scope, t.content, t.source, t.created_at, t.metadata,
+                   t.content_fingerprint, t.tags,
+                   t.tags_extractor_model, t.tags_extractor_version, t.tags_extracted_at
+            FROM thoughts t
+            LEFT JOIN thought_embeddings_gemini_clean_v1 g
+              ON g.thought_id = t.id
+             AND g.model_id = $1
+             AND g.model_version = $2
+             AND g.clean_strategy = $3
+            WHERE g.thought_id IS NULL
+              AND ($4::text IS NULL OR t.scope = $4)
+              AND t.retracted_at IS NULL
+            ORDER BY t.created_at ASC
+            LIMIT $5
+            "#,
+        )
+        .bind(gemini_clean::MODEL_ID)
+        .bind(gemini_clean::MODEL_VERSION)
+        .bind(CLEAN_EMBED_STRATEGY)
+        .bind(scope)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+
+        return rows.into_iter().map(thought_row_to_thought).collect();
+    }
 
     let rows = sqlx::query!(
         r#"
@@ -1395,12 +1601,24 @@ pub async fn claim_pending(
     pool: &PgPool,
     batch_size: i64,
 ) -> Result<Vec<PendingJob>, StorageError> {
+    claim_pending_for_model(pool, batch_size, None).await
+}
+
+/// Atomically claim up to `batch_size` pending embedding jobs for one active
+/// model. Workers/backfills must not repeatedly mark other model lanes failed
+/// just because they share the same queue table.
+pub async fn claim_pending_for_model(
+    pool: &PgPool,
+    batch_size: i64,
+    model_id: Option<&str>,
+) -> Result<Vec<PendingJob>, StorageError> {
     let rows = sqlx::query!(
         r#"
         UPDATE pending_embeddings p
         SET attempts = p.attempts + 1, last_attempt_at = NOW()
         FROM (
             SELECT id FROM pending_embeddings
+            WHERE ($2::text IS NULL OR model_id = $2)
             ORDER BY enqueued_at ASC
             LIMIT $1
             FOR UPDATE SKIP LOCKED
@@ -1409,6 +1627,7 @@ pub async fn claim_pending(
         RETURNING p.id, p.target_kind, p.target_id, p.model_id, p.attempts
         "#,
         batch_size,
+        model_id,
     )
     .fetch_all(pool)
     .await?;
@@ -1481,6 +1700,36 @@ pub async fn enqueue_unembedded_thoughts(
         )
         .bind(model_id)
         .bind(bge::MODEL_VERSION)
+        .bind(scope)
+        .bind(scope_prefix)
+        .bind(limit)
+        .execute(pool)
+        .await?;
+        return Ok(result.rows_affected() as usize);
+    }
+    if model_id == gemini_clean::MODEL_ID {
+        let result = sqlx::query(
+            r#"
+            INSERT INTO pending_embeddings (target_kind, target_id, model_id)
+            SELECT 'thought', t.id, $1
+            FROM thoughts t
+            LEFT JOIN thought_embeddings_gemini_clean_v1 g
+              ON g.thought_id = t.id
+             AND g.model_id = $1
+             AND g.model_version = $2
+             AND g.clean_strategy = $3
+            WHERE g.thought_id IS NULL
+              AND ($4::text IS NULL OR t.scope = $4)
+              AND ($5::text IS NULL OR t.scope LIKE $5 || '%')
+              AND t.retracted_at IS NULL
+            ORDER BY t.created_at ASC
+            LIMIT $6
+            ON CONFLICT (target_kind, target_id, model_id) DO NOTHING
+            "#,
+        )
+        .bind(model_id)
+        .bind(gemini_clean::MODEL_VERSION)
+        .bind(CLEAN_EMBED_STRATEGY)
         .bind(scope)
         .bind(scope_prefix)
         .bind(limit)
@@ -2341,6 +2590,10 @@ pub async fn search_vector_knn(
     if is_bge_m3_1024(model) {
         return search_bge_vector_knn(pool, query_vector, scope, scope_prefix, limit).await;
     }
+    if is_gemini_clean_3072(model) {
+        return search_gemini_clean_vector_knn(pool, query_vector, scope, scope_prefix, limit)
+            .await;
+    }
 
     if let Some(projection) = ann_projection_for_model(model) {
         if ann_projection_search_ready(pool, &projection.projection_id).await? {
@@ -2470,6 +2723,58 @@ async fn search_bge_vector_knn(
     .bind(pgv)
     .bind(bge::MODEL_ID)
     .bind(bge::MODEL_VERSION)
+    .bind(scope)
+    .bind(scope_prefix)
+    .bind(limit)
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+
+    vector_rows_to_hits(rows)
+}
+
+async fn search_gemini_clean_vector_knn(
+    pool: &PgPool,
+    query_vector: Vec<f32>,
+    scope: Option<&str>,
+    scope_prefix: Option<&str>,
+    limit: i64,
+) -> Result<Vec<Hit>, StorageError> {
+    if query_vector.len() != gemini_clean::DIMS {
+        return Err(StorageError::InvalidEmbeddingDimensions {
+            model_id: gemini_clean::MODEL_ID.to_string(),
+            expected: gemini_clean::DIMS,
+            got: query_vector.len(),
+        });
+    }
+
+    assert_gemini_clean_vector_search_ready(pool).await?;
+
+    let halfvec = exact_halfvec(&query_vector, gemini_clean::DIMS)?;
+    let mut tx = pool.begin().await?;
+    set_gemini_clean_hnsw_ef_search(&mut tx).await?;
+    let rows: Vec<VectorSearchRow> = sqlx::query_as(
+        r#"
+        SELECT t.id, t.scope, t.content, t.source, t.created_at, t.metadata,
+               t.content_fingerprint, t.tags,
+               t.tags_extractor_model, t.tags_extractor_version, t.tags_extracted_at,
+               (g.embedding <=> $1::halfvec(3072)) AS distance
+        FROM thought_embeddings_gemini_clean_v1 g
+        JOIN thoughts t ON t.id = g.thought_id
+        WHERE g.model_id = $2
+          AND g.model_version = $3
+          AND g.clean_strategy = $4
+          AND ($5::text IS NULL OR t.scope = $5)
+          AND ($6::text IS NULL OR t.scope LIKE $6 || '%')
+          AND t.retracted_at IS NULL
+        ORDER BY g.embedding <=> $1::halfvec(3072)
+        LIMIT $7
+        "#,
+    )
+    .bind(halfvec)
+    .bind(gemini_clean::MODEL_ID)
+    .bind(gemini_clean::MODEL_VERSION)
+    .bind(CLEAN_EMBED_STRATEGY)
     .bind(scope)
     .bind(scope_prefix)
     .bind(limit)
@@ -2680,6 +2985,10 @@ pub async fn ensure_vector_search_ready(
         assert_bge_vector_search_ready(pool).await?;
         return Ok(None);
     }
+    if is_gemini_clean_3072(model) {
+        assert_gemini_clean_vector_search_ready(pool).await?;
+        return Ok(None);
+    }
 
     ensure_ann_projection_ready(pool, model).await
 }
@@ -2694,6 +3003,22 @@ async fn assert_bge_vector_search_ready(pool: &PgPool) -> Result<(), StorageErro
     if !index_ready(pool, bge::THOUGHT_HNSW_INDEX).await? {
         return Err(StorageError::BgeSidecarIndexNotReady(
             bge::THOUGHT_HNSW_INDEX.to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+async fn assert_gemini_clean_vector_search_ready(pool: &PgPool) -> Result<(), StorageError> {
+    if !table_exists(pool, gemini_clean::THOUGHT_TABLE).await? {
+        return Err(StorageError::GeminiCleanSidecarTableMissing(
+            gemini_clean::THOUGHT_TABLE.to_string(),
+        ));
+    }
+
+    if !index_ready(pool, gemini_clean::THOUGHT_HNSW_INDEX).await? {
+        return Err(StorageError::GeminiCleanSidecarIndexNotReady(
+            gemini_clean::THOUGHT_HNSW_INDEX.to_string(),
         ));
     }
 
@@ -3570,6 +3895,12 @@ mod tests {
         v
     }
 
+    fn unit_vector_3072(pos: usize) -> Vec<f32> {
+        let mut v = vec![0.0_f32; 3072];
+        v[pos] = 1.0;
+        v
+    }
+
     async fn insert_raw_embedding_without_projection(
         pool: &PgPool,
         target_id: Uuid,
@@ -3808,6 +4139,60 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../../migrations")]
+    async fn insert_embedding_routes_gemini_clean_to_typed_sidecar_only(pool: PgPool) {
+        let model = EmbeddingModel::new("gemini-embedding-001", 3072);
+        let id = insert_test_thought(
+            &pool,
+            "Spec document: knox/specs/a.md\nOwner: knox\nChunk: 1\n\n## Body\nFact.",
+            "global",
+        )
+        .await;
+        let target_id = id.into_uuid();
+
+        insert_thought_embedding(
+            &pool,
+            id,
+            &Embedding::new(model.clone(), unit_vector_3072(0)).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert!(thought_has_embedding(&pool, id, &model).await.unwrap());
+
+        let (sidecar_count, clean_reason): (i64, Option<String>) = sqlx::query_as(
+            r#"
+            SELECT COUNT(*), MAX(clean_reason)
+            FROM thought_embeddings_gemini_clean_v1
+            WHERE thought_id = $1
+              AND model_id = 'gemini-embedding-001'
+              AND model_version = 1
+              AND clean_strategy = 'kengram-clean-v1'
+            "#,
+        )
+        .bind(target_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let (raw_count,): (i64,) = sqlx::query_as(
+            r#"
+            SELECT COUNT(*)
+            FROM embeddings
+            WHERE target_kind = 'thought'
+              AND target_id = $1
+              AND model_id = 'gemini-embedding-001'
+            "#,
+        )
+        .bind(target_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(sidecar_count, 1);
+        assert_eq!(clean_reason.as_deref(), Some("document_envelope"));
+        assert_eq!(raw_count, 0, "Gemini clean must not hit vector(4096)");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
     async fn reconcile_ann_projections_backfills_missing_projection_and_marks_ok(pool: PgPool) {
         let model = EmbeddingModel::new("qwen3-embedding", 4096);
         let id = insert_test_thought(&pool, "raw-only projection source", "scope-a").await;
@@ -3979,6 +4364,37 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../../migrations")]
+    async fn search_vector_knn_uses_gemini_clean_typed_sidecar(pool: PgPool) {
+        let model = EmbeddingModel::new("gemini-embedding-001", 3072);
+
+        let id_a = insert_test_thought(&pool, "gemini clean a", "global").await;
+        let id_b = insert_test_thought(&pool, "gemini clean b", "global").await;
+
+        let va = unit_vector_3072(0);
+        let vb = unit_vector_3072(1);
+
+        insert_thought_embedding(
+            &pool,
+            id_a,
+            &Embedding::new(model.clone(), va.clone()).unwrap(),
+        )
+        .await
+        .unwrap();
+        insert_thought_embedding(&pool, id_b, &Embedding::new(model.clone(), vb).unwrap())
+            .await
+            .unwrap();
+
+        ensure_vector_search_ready(&pool, &model).await.unwrap();
+        let hits = search_vector_knn(&pool, va, &model, None, None, 10)
+            .await
+            .unwrap();
+
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].thought.id, id_a);
+        assert!((hits[0].vector_score.unwrap() - 1.0).abs() < 1e-4);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
     async fn ensure_vector_search_ready_fails_closed_for_missing_bge_index(pool: PgPool) {
         let model = EmbeddingModel::bge_m3();
 
@@ -3993,6 +4409,24 @@ mod tests {
             err,
             StorageError::BgeSidecarIndexNotReady(ref name)
                 if name == "thought_embeddings_bge_m3_hnsw"
+        ));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn ensure_vector_search_ready_fails_closed_for_missing_gemini_clean_index(pool: PgPool) {
+        let model = EmbeddingModel::new("gemini-embedding-001", 3072);
+
+        sqlx::query("DROP INDEX thought_embeddings_gemini_clean_v1_hnsw")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let err = ensure_vector_search_ready(&pool, &model).await.unwrap_err();
+
+        assert!(matches!(
+            err,
+            StorageError::GeminiCleanSidecarIndexNotReady(ref name)
+                if name == "thought_embeddings_gemini_clean_v1_hnsw"
         ));
     }
 
@@ -4089,6 +4523,56 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../../migrations")]
+    async fn claim_pending_for_model_skips_other_model_lanes(pool: PgPool) {
+        let id_bge = insert_test_thought(&pool, "bge", "global").await;
+        let id_gemini = insert_test_thought(&pool, "gemini", "global").await;
+
+        enqueue_embedding(&pool, target::THOUGHT, id_bge.into_uuid(), "bge-m3:1024")
+            .await
+            .unwrap();
+        enqueue_embedding(
+            &pool,
+            target::THOUGHT,
+            id_gemini.into_uuid(),
+            "gemini-embedding-001",
+        )
+        .await
+        .unwrap();
+
+        let claimed = claim_pending_for_model(&pool, 10, Some("gemini-embedding-001"))
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].model_id, "gemini-embedding-001");
+        assert_eq!(claimed[0].target_id, id_gemini.into_uuid());
+
+        let rows = sqlx::query!(
+            r#"
+            SELECT target_id, model_id, attempts
+            FROM pending_embeddings
+            ORDER BY model_id
+            "#
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+
+        let bge = rows
+            .iter()
+            .find(|row| row.model_id == "bge-m3:1024")
+            .expect("bge row remains queued");
+        assert_eq!(bge.target_id, id_bge.into_uuid());
+        assert_eq!(bge.attempts, 0);
+
+        let gemini = rows
+            .iter()
+            .find(|row| row.model_id == "gemini-embedding-001")
+            .expect("gemini row was claimed");
+        assert_eq!(gemini.attempts, 1);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
     async fn mark_embedded_removes_from_queue(pool: PgPool) {
         let id = insert_test_thought(&pool, "to embed", "global").await;
         enqueue_embedding(&pool, target::THOUGHT, id.into_uuid(), "bge-m3:1024")
@@ -4170,6 +4654,42 @@ mod tests {
             SELECT target_id
             FROM pending_embeddings
             WHERE model_id = 'bge-m3:1024'
+            "#,
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_ne!(rows[0].0, id_a.into_uuid());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn enqueue_unembedded_thoughts_uses_gemini_clean_sidecar(pool: PgPool) {
+        let model = EmbeddingModel::new("gemini-embedding-001", 3072);
+        let id_a = insert_test_thought(&pool, "gemini embedded", "global").await;
+        let _id_b = insert_test_thought(&pool, "gemini unembedded", "global").await;
+
+        insert_thought_embedding(
+            &pool,
+            id_a,
+            &Embedding::new(model.clone(), unit_vector_3072(0)).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let enqueued = enqueue_unembedded_thoughts(&pool, &model.id, None, None, 100)
+            .await
+            .unwrap();
+        assert_eq!(
+            enqueued, 1,
+            "only the Gemini sidecar-missing thought should enqueue"
+        );
+
+        let rows: Vec<(Uuid,)> = sqlx::query_as(
+            r#"
+            SELECT target_id
+            FROM pending_embeddings
+            WHERE model_id = 'gemini-embedding-001'
             "#,
         )
         .fetch_all(&pool)

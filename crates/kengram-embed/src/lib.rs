@@ -6,6 +6,8 @@
 //!   OpenAI, Voyage. Endpoint and model name come from config.
 //! - [`FakeEmbedder`] is a deterministic in-memory embedder for tests; it
 //!   does not require Ollama / TEI to be running.
+//! - [`GeminiEmbedder`] talks to Google Gemini's `batchEmbedContents` endpoint
+//!   with retrieval document/query task types.
 //!
 //! Rerankers (M3 Phase B step 2):
 //! - [`TeiReranker`] talks to Hugging Face's text-embeddings-inference
@@ -16,12 +18,14 @@
 
 pub mod fake;
 pub mod fake_reranker;
+pub mod gemini;
 pub mod openai_compatible;
 pub mod reranker;
 pub mod tei_reranker;
 
 pub use fake::{FakeBehavior, FakeEmbedder};
 pub use fake_reranker::{FakeReranker, FakeRerankerBehavior, FakeRerankerScoring, RecordedRerank};
+pub use gemini::{GeminiConfig, GeminiEmbedder};
 pub use openai_compatible::{OpenAICompatibleConfig, OpenAICompatibleEmbedder};
 pub use reranker::{RerankScore, Reranker, RerankerError};
 pub use tei_reranker::{TeiReranker, TeiRerankerConfig};

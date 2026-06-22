@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        UPDATE pending_embeddings p\n        SET attempts = p.attempts + 1, last_attempt_at = NOW()\n        FROM (\n            SELECT id FROM pending_embeddings\n            ORDER BY enqueued_at ASC\n            LIMIT $1\n            FOR UPDATE SKIP LOCKED\n        ) AS sub\n        WHERE p.id = sub.id\n        RETURNING p.id, p.target_kind, p.target_id, p.model_id, p.attempts\n        ",
+  "query": "\n        UPDATE pending_embeddings p\n        SET attempts = p.attempts + 1, last_attempt_at = NOW()\n        FROM (\n            SELECT id FROM pending_embeddings\n            WHERE ($2::text IS NULL OR model_id = $2)\n            ORDER BY enqueued_at ASC\n            LIMIT $1\n            FOR UPDATE SKIP LOCKED\n        ) AS sub\n        WHERE p.id = sub.id\n        RETURNING p.id, p.target_kind, p.target_id, p.model_id, p.attempts\n        ",
   "describe": {
     "columns": [
       {
@@ -31,7 +31,8 @@
     ],
     "parameters": {
       "Left": [
-        "Int8"
+        "Int8",
+        "Text"
       ]
     },
     "nullable": [
@@ -42,5 +43,5 @@
       false
     ]
   },
-  "hash": "9f59f76f1b3553499d722d496cbe0c20ec8cb4eb162e859a17c2294ce638d848"
+  "hash": "a40acf0fb18a7beedf216aabf8a48d8be4ca57a6c9a8b24a13bcabe49ac086be"
 }

@@ -1,0 +1,2 @@
+DROP INDEX IF EXISTS thought_embeddings_gemini_clean_v1_model_idx;
+DROP TABLE IF EXISTS thought_embeddings_gemini_clean_v1;

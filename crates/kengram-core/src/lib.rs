@@ -3,6 +3,7 @@
 //! Pure logic, no I/O. Implementations live in `kengram-storage` (Postgres),
 //! `kengram-embed` (TEI/Ollama/OpenAI), and `kengram-mcp` (rmcp tool handlers).
 
+pub mod clean_text;
 pub mod embedder;
 pub mod embedding;
 pub mod metadata;
@@ -15,6 +16,10 @@ pub mod tagger;
 pub mod tags;
 pub mod thought;
 
+pub use clean_text::{
+    CLEAN_EMBED_STRATEGY, CleanEmbedText, GEMINI_CLEAN_EMBED_MAX_CHARS, clean_embed_text,
+    gemini_clean_embed_text,
+};
 pub use embedder::{Embedder, EmbedderError};
 pub use embedding::{Embedding, EmbeddingError, EmbeddingModel, EmbeddingStatus};
 pub use metadata::Metadata;

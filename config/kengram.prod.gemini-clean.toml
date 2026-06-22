@@ -1,0 +1,33 @@
+# Production-sidecar config for the Gemini clean-text embedding run.
+#
+# Do not commit API keys here. Set GEMINI_API_KEY or GOOGLE_API_KEY in the
+# invoking environment, or inject KENGRAM_EMBEDDER__API_KEY through launchd.
+
+[server]
+bind = "127.0.0.1:8088"
+allowed_hosts = ["localhost", "127.0.0.1", "::1"]
+
+[database]
+url = "postgres://kengram:kengram@localhost:5432/kengram_prod"
+max_connections = 10
+
+[embedder]
+provider = "gemini"
+endpoint = "https://generativelanguage.googleapis.com/v1beta"
+model = "models/gemini-embedding-001"
+model_id = "gemini-embedding-001"
+dimensions = 3072
+timeout_seconds = 60
+
+[worker]
+tick_interval_seconds = 5
+batch_size = 16
+
+[reranker]
+provider = "tei"
+endpoint = "http://localhost:8080"
+model_id = "BAAI/bge-reranker-v2-m3"
+timeout_seconds = 30
+
+[tagger]
+provider = ""

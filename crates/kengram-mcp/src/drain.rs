@@ -16,7 +16,7 @@
 use crate::finalize;
 use kengram_core::{
     Embedder, EmbedderError, Embedding, EmbeddingError, ExtractedRelation, LinkSource, Tagger,
-    ThoughtId,
+    ThoughtId, gemini_clean_embed_text,
 };
 use sqlx::PgPool;
 
@@ -28,6 +28,8 @@ pub struct DrainReport {
     pub embedded: usize,
     /// Number that failed embed/persist.
     pub failed: usize,
+    /// Characters actually sent to the embedder this drain call.
+    pub input_chars: usize,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -44,31 +46,32 @@ pub async fn drain_pending_embeddings(
     embedder: &dyn Embedder,
     batch_size: i64,
 ) -> Result<DrainReport, DrainError> {
-    let jobs = kengram_storage::claim_pending(pool, batch_size).await?;
+    let jobs =
+        kengram_storage::claim_pending_for_model(pool, batch_size, Some(&embedder.model().id))
+            .await?;
     let mut report = DrainReport {
         found: jobs.len(),
         ..Default::default()
     };
 
+    let mut items = Vec::new();
     for job in jobs {
-        match process_embed_job(pool, embedder, &job).await {
-            Ok(()) => report.embedded += 1,
-            Err(err) => {
-                tracing::warn!(
-                    pending_id = %job.id,
-                    target_kind = %job.target_kind,
-                    target_id = %job.target_id,
-                    attempts = job.attempts,
-                    reason = %err,
-                    "embed-drain: job failed; row stays queued",
-                );
-                let _ = kengram_storage::mark_failed(pool, job.id, &err.to_string()).await;
-                report.failed += 1;
-            }
+        match prepare_embed_job(pool, embedder, job).await {
+            Ok(item) => items.push(item),
+            Err((job, err)) => mark_embed_job_failed(pool, &job, &err, &mut report).await,
         }
     }
 
+    if !items.is_empty() {
+        process_prepared_embed_jobs(pool, embedder, items, &mut report).await;
+    }
+
     Ok(report)
+}
+
+struct PreparedEmbedJob {
+    job: kengram_storage::PendingJob,
+    text: String,
 }
 
 #[derive(Debug)]
@@ -79,7 +82,6 @@ enum EmbedJobError {
     Embedder(EmbedderError),
     Embedding(EmbeddingError),
     Storage(kengram_storage::StorageError),
-    EmptyEmbedderOutput,
 }
 
 impl std::fmt::Display for EmbedJobError {
@@ -94,59 +96,131 @@ impl std::fmt::Display for EmbedJobError {
             Self::Embedder(e) => write!(f, "embedder: {e}"),
             Self::Embedding(e) => write!(f, "embedding: {e}"),
             Self::Storage(e) => write!(f, "storage: {e}"),
-            Self::EmptyEmbedderOutput => f.write_str("embedder returned no vectors"),
         }
     }
 }
 
-async fn process_embed_job(
+async fn prepare_embed_job(
     pool: &PgPool,
     embedder: &dyn Embedder,
-    job: &kengram_storage::PendingJob,
-) -> Result<(), EmbedJobError> {
+    job: kengram_storage::PendingJob,
+) -> Result<PreparedEmbedJob, (kengram_storage::PendingJob, EmbedJobError)> {
     let active_model = &embedder.model().id;
     if &job.model_id != active_model {
-        return Err(EmbedJobError::ModelMismatch {
-            expected: active_model.clone(),
-            got: job.model_id.clone(),
-        });
+        let got = job.model_id.clone();
+        return Err((
+            job,
+            EmbedJobError::ModelMismatch {
+                expected: active_model.clone(),
+                got,
+            },
+        ));
     }
 
-    // M4: only thoughts are embeddable; facts are gone.
-    let text = match job.target_kind.as_str() {
-        kengram_storage::target::THOUGHT => {
-            let thought_id = ThoughtId::from(job.target_id);
-            let thought = kengram_storage::fetch_thought(pool, thought_id)
-                .await
-                .map_err(EmbedJobError::Storage)?
-                .ok_or(EmbedJobError::SourceMissing)?;
-            thought.content
-        }
-        _ => {
-            return Err(EmbedJobError::UnsupportedTargetKind(
-                job.target_kind.clone(),
-            ));
+    if job.target_kind != kengram_storage::target::THOUGHT {
+        return Err((
+            job.clone(),
+            EmbedJobError::UnsupportedTargetKind(job.target_kind.clone()),
+        ));
+    }
+
+    let thought_id = ThoughtId::from(job.target_id);
+    let thought = match kengram_storage::fetch_thought(pool, thought_id).await {
+        Ok(Some(thought)) => thought,
+        Ok(None) => return Err((job, EmbedJobError::SourceMissing)),
+        Err(err) => return Err((job, EmbedJobError::Storage(err))),
+    };
+
+    let text = if embedder.model().id == "gemini-embedding-001" {
+        gemini_clean_embed_text(&thought.content).text
+    } else {
+        thought.content
+    };
+
+    Ok(PreparedEmbedJob { job, text })
+}
+
+async fn process_prepared_embed_jobs(
+    pool: &PgPool,
+    embedder: &dyn Embedder,
+    items: Vec<PreparedEmbedJob>,
+    report: &mut DrainReport,
+) {
+    let texts = items
+        .iter()
+        .map(|item| item.text.clone())
+        .collect::<Vec<_>>();
+    report.input_chars += texts.iter().map(|text| text.chars().count()).sum::<usize>();
+
+    let vectors = match embedder.embed_documents(&texts).await {
+        Ok(vectors) => vectors,
+        Err(err) => {
+            let err = EmbedJobError::Embedder(err);
+            for item in items {
+                mark_embed_job_failed(pool, &item.job, &err, report).await;
+            }
+            return;
         }
     };
 
-    let texts = vec![text];
-    let mut vectors = embedder
-        .embed(&texts)
-        .await
-        .map_err(EmbedJobError::Embedder)?;
-    let vector = vectors.pop().ok_or(EmbedJobError::EmptyEmbedderOutput)?;
-    let embedding =
-        Embedding::new(embedder.model().clone(), vector).map_err(EmbedJobError::Embedding)?;
+    if vectors.len() != items.len() {
+        let err = EmbedJobError::Embedder(EmbedderError::MalformedResponse(format!(
+            "expected {} embeddings, got {}",
+            items.len(),
+            vectors.len()
+        )));
+        for item in items {
+            mark_embed_job_failed(pool, &item.job, &err, report).await;
+        }
+        return;
+    }
 
-    kengram_storage::insert_thought_embedding(pool, ThoughtId::from(job.target_id), &embedding)
-        .await
-        .map_err(EmbedJobError::Storage)?;
+    for (item, vector) in items.into_iter().zip(vectors.into_iter()) {
+        let embedding = match Embedding::new(embedder.model().clone(), vector) {
+            Ok(embedding) => embedding,
+            Err(err) => {
+                mark_embed_job_failed(pool, &item.job, &EmbedJobError::Embedding(err), report)
+                    .await;
+                continue;
+            }
+        };
 
-    kengram_storage::mark_embedded(pool, job.id)
+        if let Err(err) = kengram_storage::insert_thought_embedding(
+            pool,
+            ThoughtId::from(item.job.target_id),
+            &embedding,
+        )
         .await
-        .map_err(EmbedJobError::Storage)?;
+        {
+            mark_embed_job_failed(pool, &item.job, &EmbedJobError::Storage(err), report).await;
+            continue;
+        }
 
-    Ok(())
+        if let Err(err) = kengram_storage::mark_embedded(pool, item.job.id).await {
+            mark_embed_job_failed(pool, &item.job, &EmbedJobError::Storage(err), report).await;
+            continue;
+        }
+
+        report.embedded += 1;
+    }
+}
+
+async fn mark_embed_job_failed(
+    pool: &PgPool,
+    job: &kengram_storage::PendingJob,
+    err: &EmbedJobError,
+    report: &mut DrainReport,
+) {
+    tracing::warn!(
+        pending_id = %job.id,
+        target_kind = %job.target_kind,
+        target_id = %job.target_id,
+        attempts = job.attempts,
+        reason = %err,
+        "embed-drain: job failed; row stays queued",
+    );
+    let _ = kengram_storage::mark_failed(pool, job.id, &err.to_string()).await;
+    report.failed += 1;
 }
 
 // -- tag drainer ------------------------------------------------------------
@@ -434,12 +508,14 @@ pub async fn apply_tagger_relations(
 mod tests {
     use super::*;
     use crate::capture::{CaptureRequest, capture};
+    use async_trait::async_trait;
     use kengram_core::{
         EmbeddingModel, ExtractedTarget, LinkTarget, RelationKind, Scope, Source, TagKind,
         TagOutput, Tags,
     };
     use kengram_embed::{FakeBehavior, FakeEmbedder};
     use kengram_extract::{FakeBehavior as TaggerFakeBehavior, FakeTagger};
+    use std::sync::{Arc, Mutex};
 
     const TEST_EMBEDDER_MODEL_ID: &str = "qwen3-embedding";
 
@@ -451,10 +527,47 @@ mod tests {
         FakeEmbedder::with_model(test_embedding_model())
     }
 
+    #[derive(Debug, Clone)]
+    struct RecordingEmbedder {
+        model: EmbeddingModel,
+        seen: Arc<Mutex<Vec<Vec<String>>>>,
+    }
+
+    impl RecordingEmbedder {
+        fn new(model: EmbeddingModel) -> Self {
+            Self {
+                model,
+                seen: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn seen_batches(&self) -> Vec<Vec<String>> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl Embedder for RecordingEmbedder {
+        fn model(&self) -> &EmbeddingModel {
+            &self.model
+        }
+
+        async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedderError> {
+            {
+                self.seen.lock().unwrap().push(texts.to_vec());
+            }
+            Ok(vec![vec![0.0_f32; self.model.dimensions]; texts.len()])
+        }
+    }
+
     async fn capture_one(pool: &PgPool, content: &str) -> ThoughtId {
+        capture_with_model(pool, TEST_EMBEDDER_MODEL_ID, content).await
+    }
+
+    async fn capture_with_model(pool: &PgPool, model_id: &str, content: &str) -> ThoughtId {
         capture(
             pool,
-            TEST_EMBEDDER_MODEL_ID,
+            model_id,
             None,
             CaptureRequest {
                 content: content.to_string(),
@@ -488,6 +601,27 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn drain_embeds_clean_document_text(pool: PgPool) {
+        let raw = "Spec document: knox/specs/a.md\nOwner: knox\nChunk: 1\n\n## Body\nFact only.";
+        let model = EmbeddingModel::new("gemini-embedding-001", 3072);
+        let id = capture_with_model(&pool, &model.id, raw).await;
+        let embedder = RecordingEmbedder::new(model.clone());
+
+        let report = drain_pending_embeddings(&pool, &embedder, 10)
+            .await
+            .unwrap();
+        assert_eq!(report.embedded, 1);
+        assert!(
+            kengram_storage::thought_has_embedding(&pool, id, &model)
+                .await
+                .unwrap()
+        );
+
+        let seen = embedder.seen_batches();
+        assert_eq!(seen, vec![vec!["## Body\nFact only.".to_string()]]);
     }
 
     #[sqlx::test(migrations = "../../migrations")]
@@ -536,27 +670,22 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../../migrations")]
-    async fn drain_marks_failed_when_model_id_mismatch(pool: PgPool) {
+    async fn drain_skips_pending_rows_for_other_models(pool: PgPool) {
         let _id = capture_one(&pool, "mismatched model").await;
 
         let other = FakeEmbedder::with_model(EmbeddingModel::new("other:1024", 1024));
         let report = drain_pending_embeddings(&pool, &other, 10).await.unwrap();
-        assert_eq!(report.found, 1);
+        assert_eq!(report.found, 0);
         assert_eq!(report.embedded, 0);
-        assert_eq!(report.failed, 1);
+        assert_eq!(report.failed, 0);
 
-        let row = sqlx::query!(r#"SELECT last_error FROM pending_embeddings"#,)
+        let row = sqlx::query!(r#"SELECT attempts, last_error FROM pending_embeddings"#,)
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert!(
-            row.last_error
-                .as_deref()
-                .map(|e| e.contains("model_id") || e.contains("model="))
-                .unwrap_or(false),
-            "expected model-mismatch message, got {:?}",
-            row.last_error
-        );
+        assert_eq!(row.attempts, 0);
+        assert!(row.last_error.is_none());
+        assert_eq!(kengram_storage::count_pending(&pool).await.unwrap(), 1);
     }
 
     #[sqlx::test(migrations = "../../migrations")]

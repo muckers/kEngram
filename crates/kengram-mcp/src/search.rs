@@ -214,14 +214,8 @@ async fn search_thoughts_with_tuning(
     let scope_prefix_filter = request.scope_prefix.as_deref();
 
     // Vector leg (soft-fail to empty + flag).
-    let (vector_hits, vector_search_available) = match embedder
-        .embed(std::slice::from_ref(&query))
-        .await
-    {
-        Ok(mut vectors) => {
-            let v = vectors
-                .pop()
-                .expect("non-empty input must yield at least one vector");
+    let (vector_hits, vector_search_available) = match embedder.embed_query(&query).await {
+        Ok(v) => {
             match kengram_storage::search_vector_knn(
                 pool,
                 v,
