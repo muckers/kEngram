@@ -59,7 +59,7 @@ opencode, ChatGPT — reads and writes the *same* memory.
 - **By wording** — exact terms, names, acronyms
 - **Merge** the two into one ranked list
 - **Re-rank** the top hits for relevance
-- **Favor** more recent memories
+- **Recency** — newer memories get a boost in the blend
 
 <!-- reset_layout -->
 
