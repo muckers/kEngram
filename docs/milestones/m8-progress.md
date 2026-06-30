@@ -86,6 +86,19 @@ End state: M8 success criteria met; browser end-to-end pass clean.
 
 ## History
 
+- **2026-06-30** — UX pass + search-quality fixes (post-review iteration with Ron). Frontend:
+  trailing-dot hierarchical scope search (`rjf.` → `scope_prefix`); graph rework to a readable
+  radial breadthfirst layout (labels below nodes + dark halo + ellipsis, `spacingFactor` tuned to
+  0.6); roomier result cards; a result-limit selector (25/50/100); and a **relevance** selector
+  (Focused/Balanced/Broad → `min_score` floor, default Focused) that drops the weak vector-kNN tail
+  the reranker scored ~0. Two real correctness fixes surfaced by that testing, both in the shared
+  retrieval core (benefit MCP agents too, no wire-shape change): (1) `search_thoughts` now scales the
+  per-leg fetch and rerank `candidate_pool` to `limit`, so `limit > 32` is honored instead of being
+  silently capped at the default-32 pool; (2) `TeiReranker` now **chunks** oversized rerank batches
+  to `max_batch` (configurable `[reranker].max_batch`, default 32 = TEI's `--max-client-batch-size`)
+  and merges with offset, fixing the HTTP-422 that the limit fix exposed. Caddy verified already
+  correct (tailnet-only `default_bind`, blanket `:8081` reverse_proxy covers all web paths) — no
+  change needed for the cutover. All gates green; relevance floor + chunking verified live.
 - **2026-06-30** — Phases 3–5 landed (frontend). Phase 3: askama `base` + search/thought/scopes/scope
   templates, a `rust-embed` static handler, `app.css`, and `app.js` (vanilla) — `/` and `/thought/{id}`
   hydrate from `/api`, `/scopes` + `/scope/{name}` render server-side. Phase 4: vendored

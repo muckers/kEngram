@@ -147,6 +147,12 @@ pub struct RerankerConfig {
     /// Kengram-side stable identity. Conventionally `<vendor>/<model>`.
     pub model_id: String,
     pub timeout_seconds: u64,
+    /// Max candidates per `/rerank` request. Must not exceed the TEI server's
+    /// `--max-client-batch-size` (default 32) or TEI returns HTTP 422. Larger
+    /// candidate sets (e.g. a search with `limit > 32`) are split into batches
+    /// of this size and merged client-side. Raise both this and TEI's flag
+    /// together if you want fewer round-trips on big result sets.
+    pub max_batch: usize,
 }
 
 impl Default for RerankerConfig {
@@ -159,6 +165,7 @@ impl Default for RerankerConfig {
             endpoint: "http://localhost:8080".to_string(),
             model_id: "BAAI/bge-reranker-v2-m3".to_string(),
             timeout_seconds: 30,
+            max_batch: 32,
         }
     }
 }

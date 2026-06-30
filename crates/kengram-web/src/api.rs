@@ -54,6 +54,10 @@ pub(crate) struct SearchParams {
     candidate_pool: Option<usize>,
     /// JSON-encoded tags containment filter, e.g. `{"kind":"task"}`.
     tag_filter: Option<String>,
+    /// Relevance floor: drop hits whose cross-encoder rerank score is below
+    /// this (0.0–1.0). No-op when the reranker didn't run (scores absent), so
+    /// an embedder/reranker outage never yields a mystery-empty page.
+    min_score: Option<f32>,
 }
 
 /// `GET /api/search` — hybrid search (vector + trigram, RRF, recency, optional
@@ -79,7 +83,16 @@ pub(crate) async fn search(
         candidate_pool: p.candidate_pool,
         tag_filter,
     };
-    let resp = search_thoughts(&st.pool, st.embedder.as_ref(), st.reranker.as_deref(), req).await?;
+    let mut resp =
+        search_thoughts(&st.pool, st.embedder.as_ref(), st.reranker.as_deref(), req).await?;
+    // Relevance floor (web-only): the reranker reorders but never filters, so
+    // vector kNN's weak tail otherwise pads the list up to `limit`. Drop hits
+    // the cross-encoder scored below the floor; absent a score (reranker off),
+    // keep the hit so an outage doesn't blank the page.
+    if let Some(floor) = p.min_score {
+        resp.results
+            .retain(|h| h.rerank_score.is_none_or(|s| s >= floor));
+    }
     Ok(Json(search_response_json(&resp)))
 }
 

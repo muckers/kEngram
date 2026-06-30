@@ -86,13 +86,20 @@ function initSearch() {
   const form = $("#search-form");
   const input = $("#search-input");
   const scope = $("#search-scope");
+  const limitSel = $("#search-limit");
+  const relevanceSel = $("#search-relevance");
   const status = $("#search-status");
 
   async function run() {
     const q = input.value.trim();
     if (!q) { $("#search-results").replaceChildren(); status.textContent = ""; return; }
-    const params = new URLSearchParams({ q, limit: "25" });
-    if (scope.value.trim()) params.set("scope", scope.value.trim());
+    const params = new URLSearchParams({ q, limit: (limitSel && limitSel.value) || "25" });
+    // Trailing dot = hierarchical: "rjf." searches the whole rjf.* subtree
+    // (scope_prefix); "rjf.tech" stays an exact-scope match.
+    const sc = scope.value.trim();
+    if (sc.endsWith(".")) params.set("scope_prefix", sc);
+    else if (sc) params.set("scope", sc);
+    if (relevanceSel && relevanceSel.value) params.set("min_score", relevanceSel.value);
     // keep the URL shareable
     history.replaceState(null, "", `/?${params.toString()}`);
     status.textContent = "Searching…";
@@ -111,6 +118,8 @@ function initSearch() {
   const debounced = () => { clearTimeout(timer); timer = setTimeout(run, 250); };
   input.addEventListener("input", debounced);
   scope.addEventListener("input", debounced);
+  if (limitSel) limitSel.addEventListener("change", run);
+  if (relevanceSel) relevanceSel.addEventListener("change", run);
 
   if (input.value.trim()) run(); // server seeded `q` from the URL
 }
@@ -213,7 +222,21 @@ async function expandNode(cy, id) {
     }
   }
   cy.add(add);
-  cy.layout({ name: "cose", animate: false, fit: true, padding: 30 }).run();
+  // Radial breadthfirst from the root: root in the center, neighbors fanned out
+  // on rings. Force-directed (cose) collapses a small neighborhood into a knot
+  // with overlapping edge labels; a radial tree spreads it with room to read.
+  cy.layout({
+    name: "breadthfirst",
+    roots: "node[?root]",
+    circle: true,
+    // Lower spacingFactor = shorter edges → `fit` frames the graph near 1:1 so
+    // nodes/labels stay readable instead of being shrunk to fit long edges.
+    spacingFactor: 0.6,
+    avoidOverlap: true,
+    fit: true,
+    padding: 40,
+    animate: false,
+  }).run();
   status.textContent = add.length ? "" : "No further links from this node.";
 }
 
@@ -233,11 +256,17 @@ window.initGraph = function () {
   if (!window.cytoscape) { $("#graph-status").textContent = "cytoscape failed to load."; return; }
   const cy = window.cytoscape({
     container,
+    minZoom: 0.2,
+    maxZoom: 3,
     style: [
       { selector: "node", style: {
-        label: "data(label)", "font-size": "9px", color: "#e6e8ec",
-        "background-color": "#3a4356", "text-wrap": "wrap", "text-max-width": "120px",
-        width: "18px", height: "18px",
+        label: "data(label)", "font-size": "11px", color: "#e6e8ec",
+        // Label sits BELOW the node (not on top of it) with a dark halo so it
+        // stays legible over edges and neighbouring labels.
+        "text-valign": "bottom", "text-halign": "center", "text-margin-y": 6,
+        "text-outline-width": 2, "text-outline-color": "#0f1115",
+        "text-wrap": "ellipsis", "text-max-width": "160px",
+        "background-color": "#3a4356", width: "26px", height: "26px",
       }},
       { selector: 'node[kind="thought"]', style: { "background-color": "#6ea8fe" } },
       { selector: 'node[kind="entity"]', style: { "background-color": "#9fe0b8", shape: "round-rectangle" } },
@@ -245,8 +274,9 @@ window.initGraph = function () {
       { selector: 'node[kind="url"]', style: { "background-color": "#c6b8e0", shape: "diamond" } },
       { selector: "node[?root]", style: { "border-width": "3px", "border-color": "#ffffff" } },
       { selector: "edge", style: {
-        label: "data(label)", "font-size": "7px", color: "#8b93a1", width: 1,
-        "line-color": "#2a2f3a", "target-arrow-color": "#2a2f3a",
+        label: "data(label)", "font-size": "9px", color: "#aab2c0",
+        "text-outline-width": 2, "text-outline-color": "#0f1115",
+        width: 1.5, "line-color": "#3a4150", "target-arrow-color": "#3a4150",
         "target-arrow-shape": "triangle", "curve-style": "bezier", "text-rotation": "autorotate",
       }},
     ],

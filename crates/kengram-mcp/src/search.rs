@@ -185,6 +185,10 @@ pub async fn search_thoughts(
     let scope_filter = request.scope.as_ref().map(Scope::as_str);
     let scope_prefix_filter = request.scope_prefix.as_deref();
 
+    // Each leg must fetch at least `limit` candidates so the fused pool can
+    // satisfy the request; the per-leg default is the floor for small limits.
+    let leg_k = DEFAULT_TOP_K_PER_LEG.max(limit) as i64;
+
     // Vector leg (soft-fail to empty + flag).
     let (vector_hits, vector_search_available) = match embedder
         .embed(std::slice::from_ref(&request.query))
@@ -200,7 +204,7 @@ pub async fn search_thoughts(
                 embedder.model(),
                 scope_filter,
                 scope_prefix_filter,
-                DEFAULT_TOP_K_PER_LEG as i64,
+                leg_k,
             )
             .await
             {
@@ -223,7 +227,7 @@ pub async fn search_thoughts(
         &request.query,
         scope_filter,
         scope_prefix_filter,
-        DEFAULT_TOP_K_PER_LEG as i64,
+        leg_k,
     )
     .await?;
 
@@ -255,9 +259,12 @@ pub async fn search_thoughts(
 
     // Optional rerank stage.
     let rerank_enabled = request.rerank.unwrap_or(true);
+    // Default the rerank pool to at least `limit` (capped by the sensible
+    // floor) so a large `limit` isn't silently truncated to the default-32
+    // pool. An explicit caller-supplied `candidate_pool` still wins.
     let candidate_pool = request
         .candidate_pool
-        .unwrap_or(DEFAULT_RERANK_CANDIDATE_POOL);
+        .unwrap_or(DEFAULT_RERANK_CANDIDATE_POOL.max(limit));
     let rerank_used = match (rerank_enabled, reranker) {
         (true, Some(rr)) => {
             apply_rerank_to_thought_hits(rr, &request.query, &mut fused, candidate_pool).await

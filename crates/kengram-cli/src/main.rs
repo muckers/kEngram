@@ -252,6 +252,7 @@ fn build_reranker(c: &RerankerConfig) -> anyhow::Result<Option<Arc<dyn Reranker>
                 endpoint: c.endpoint.clone(),
                 model_id: c.model_id.clone(),
                 timeout: Duration::from_secs(c.timeout_seconds),
+                max_batch: c.max_batch,
             })
             .with_context(|| format!("constructing reranker for endpoint {}", c.endpoint))?;
             tracing::info!(

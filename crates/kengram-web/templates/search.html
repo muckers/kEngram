@@ -5,8 +5,18 @@
 <form id="search-form" class="search-form" autocomplete="off">
   <input id="search-input" name="q" type="search" placeholder="Search thoughts…"
          value="{{ q }}" autofocus />
-  <input id="search-scope" name="scope" type="text" placeholder="scope (optional)"
+  <input id="search-scope" name="scope" type="text" placeholder="scope — trailing . = subtree"
          value="{{ scope }}" />
+  <select id="search-relevance" name="relevance" title="Relevance — how strong a match results must be">
+    <option value="0.5">Focused</option>
+    <option value="0.1">Balanced</option>
+    <option value="0.01">Broad</option>
+  </select>
+  <select id="search-limit" name="limit" title="Max results">
+    <option value="25">25</option>
+    <option value="50">50</option>
+    <option value="100">100</option>
+  </select>
   <button type="submit">Search</button>
 </form>
 <div id="search-banner" class="banner" hidden></div>
