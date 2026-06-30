@@ -16,6 +16,7 @@ kengram-storage.workspace = true
 kengram-embed.workspace = true
 kengram-extract.workspace = true
 kengram-mcp.workspace = true
+kengram-web.workspace = true
 
 anyhow.workspace = true
 axum.workspace = true

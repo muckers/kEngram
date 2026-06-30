@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block title %}Scopes · kEngram{% endblock %}
+{% block page %}scopes{% endblock %}
+{% block content %}
+<h1>Scopes</h1>
+{% if scopes.is_empty() %}
+<p class="muted">No scopes yet.</p>
+{% else %}
+<ul class="scope-list">
+  {% for s in scopes %}
+  <li>
+    <a href="/scope/{{ s.scope }}">{{ s.scope }}</a>
+    <span class="count">{{ s.thought_count }}</span>
+    <span class="muted">last active {{ s.last_activity }}</span>
+  </li>
+  {% endfor %}
+</ul>
+{% endif %}
+{% endblock %}

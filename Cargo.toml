@@ -9,10 +9,11 @@ members = [
   "crates/kengram-cli",
   "crates/kengram-tagger-protocol",
   "crates/kengram-tagger-deterministic",
+  "crates/kengram-web",
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 publish = false
 authors = ["Ron Forrester <ron.forrester@me.com>"]
@@ -26,6 +27,7 @@ kengram-embed           = { path = "crates/kengram-embed" }
 kengram-extract         = { path = "crates/kengram-extract" }
 kengram-mcp             = { path = "crates/kengram-mcp" }
 kengram-tagger-protocol = { path = "crates/kengram-tagger-protocol" }
+kengram-web             = { path = "crates/kengram-web" }
 
 # Async runtime + traits
 tokio       = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "sync"] }

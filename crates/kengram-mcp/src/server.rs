@@ -30,11 +30,11 @@ use std::sync::Arc;
 
 use crate::capture::{self, CaptureError, CaptureRequest, MAX_CONTENT_LEN};
 use crate::link::{self, LinkError, LinkThoughtsRequest, MAX_LINK_NOTE_LEN};
-use crate::relate::{self, GetRelatedThoughtsRequest, RelateError};
+use crate::relate::{self, GetRelatedThoughtsRequest, RelateError, related_thoughts_response_json};
 use crate::retract::{self, RetractError, RetractThoughtRequest};
 use crate::search::{
-    self, GetThoughtResponse, ListScopesRequest, ListScopesResponse, ReadError, RecentRequest,
-    RecentResponse, SearchRequest, SearchResponse,
+    self, ListScopesRequest, ReadError, RecentRequest, SearchRequest, get_thought_response_json,
+    list_scopes_response_json, recent_response_json, search_response_json,
 };
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -703,137 +703,6 @@ fn map_relate_error(err: RelateError) -> String {
             "internal database error".to_string()
         }
     }
-}
-
-fn related_thoughts_response_json(
-    resp: &crate::relate::GetRelatedThoughtsResponse,
-) -> serde_json::Value {
-    fn hit_to_json(h: &crate::relate::RelatedTargetHit) -> serde_json::Value {
-        // Thought-target hits carry thought_id + scope + content_preview +
-        // thought_created_at + retracted; non-thought hits leave those null.
-        let thought_id = match &h.target {
-            LinkTarget::Thought(id) => Some(id.to_string()),
-            _ => None,
-        };
-        serde_json::json!({
-            "link_id": h.link_id.to_string(),
-            "relation": h.relation.as_str(),
-            "to_kind": h.target.kind_str(),
-            "to_value": h.target.value_str(),
-            "thought_id": thought_id,
-            "scope": h.scope.as_ref().map(|s| s.as_str()),
-            "content_preview": h.content_preview,
-            "content_truncated": h.content_truncated,
-            "thought_created_at": h.thought_created_at.map(|t| {
-                t.format(&time::format_description::well_known::Rfc3339)
-                    .unwrap_or_default()
-            }),
-            "link_created_at": h.link_created_at
-                .format(&time::format_description::well_known::Rfc3339)
-                .unwrap_or_default(),
-            "link_source": h.link_source.as_str(),
-            "note": h.note,
-            "retracted": h.retracted,
-        })
-    }
-
-    let outbound: Vec<_> = resp.outbound.iter().map(hit_to_json).collect();
-    let inbound: Vec<_> = resp.inbound.iter().map(hit_to_json).collect();
-    serde_json::json!({
-        "thought_id": resp.thought_id.to_string(),
-        "outbound": outbound,
-        "inbound": inbound,
-    })
-}
-
-fn search_response_json(resp: &SearchResponse) -> serde_json::Value {
-    let results: Vec<serde_json::Value> = resp
-        .results
-        .iter()
-        .map(|h| {
-            serde_json::json!({
-                "thought_id": h.thought_id.to_string(),
-                "content": h.content,
-                "scope": h.scope.as_str(),
-                "source": h.source.as_str(),
-                "created_at": h.created_at.format(&time::format_description::well_known::Rfc3339).unwrap_or_default(),
-                "metadata": h.metadata.as_value(),
-                "tags": h.tags,
-                "vector_score": h.vector_score,
-                "trigram_score": h.trigram_score,
-                "rrf_score": h.rrf_score,
-                "rerank_score": h.rerank_score,
-            })
-        })
-        .collect();
-    serde_json::json!({
-        "results": results,
-        "vector_search_available": resp.vector_search_available,
-        "rerank_used": resp.rerank_used,
-    })
-}
-
-fn recent_response_json(resp: &RecentResponse) -> serde_json::Value {
-    let results: Vec<serde_json::Value> = resp
-        .results
-        .iter()
-        .map(|t| {
-            serde_json::json!({
-                "thought_id": t.id.to_string(),
-                "content": t.content,
-                "scope": t.scope.as_str(),
-                "source": t.source.as_str(),
-                "created_at": t.created_at.format(&time::format_description::well_known::Rfc3339).unwrap_or_default(),
-                "metadata": t.metadata.as_value(),
-            })
-        })
-        .collect();
-    serde_json::json!({ "results": results })
-}
-
-fn list_scopes_response_json(resp: &ListScopesResponse) -> serde_json::Value {
-    let scopes: Vec<serde_json::Value> = resp
-        .scopes
-        .iter()
-        .map(|s| {
-            serde_json::json!({
-                "scope": s.scope,
-                "thought_count": s.thought_count,
-                "first_activity_at": s
-                    .first_activity_at
-                    .format(&time::format_description::well_known::Rfc3339)
-                    .unwrap_or_default(),
-                "last_activity_at": s
-                    .last_activity_at
-                    .format(&time::format_description::well_known::Rfc3339)
-                    .unwrap_or_default(),
-            })
-        })
-        .collect();
-    serde_json::json!({ "scopes": scopes })
-}
-
-fn get_thought_response_json(resp: &GetThoughtResponse) -> serde_json::Value {
-    serde_json::json!({
-        "thought": {
-            "thought_id": resp.thought.id.to_string(),
-            "content": resp.thought.content,
-            "scope": resp.thought.scope.as_str(),
-            "source": resp.thought.source.as_str(),
-            "created_at": resp.thought.created_at.format(&time::format_description::well_known::Rfc3339).unwrap_or_default(),
-            "metadata": resp.thought.metadata.as_value(),
-        },
-        "provenance": {
-            "embedding_status": resp.embedding_status,
-            "embedded_at": resp.embedded_at.and_then(|t| t.format(&time::format_description::well_known::Rfc3339).ok()),
-            "tags": resp.thought.tags,
-            "tags_extractor_model": resp.thought.tags_extractor_model,
-            "tags_extractor_version": resp.thought.tags_extractor_version,
-            "tags_extracted_at": resp.thought.tags_extracted_at.and_then(|t| t.format(&time::format_description::well_known::Rfc3339).ok()),
-            "retracted_at": resp.retracted_at.and_then(|t| t.format(&time::format_description::well_known::Rfc3339).ok()),
-            "retracted_reason": resp.retracted_reason,
-        },
-    })
 }
 
 #[tool_handler(router = self.tool_router)]

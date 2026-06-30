@@ -28,6 +28,14 @@ pub struct Config {
     /// drainer task. Flip `provider = "openai-compatible"` to enable.
     pub tagger: TaggerConfig,
     pub reranker: RerankerConfig,
+    /// M8: the read-only human web surface. Disabled by default; flip
+    /// `enabled = true` to have `serve` mount the search/visualize UI and its
+    /// read-only `/api/*` routes onto the same axum server that serves `/mcp`.
+    /// The UI reuses the MCP read orchestrators and never mutates; `psql`
+    /// remains the write/admin interface. Exposure is governed by
+    /// `[server].bind` + `[server].allowed_hosts` (the web routes get the same
+    /// Host-header guard as `/mcp`).
+    pub web: WebConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -139,6 +147,12 @@ pub struct RerankerConfig {
     /// Kengram-side stable identity. Conventionally `<vendor>/<model>`.
     pub model_id: String,
     pub timeout_seconds: u64,
+    /// Max candidates per `/rerank` request. Must not exceed the TEI server's
+    /// `--max-client-batch-size` (default 32) or TEI returns HTTP 422. Larger
+    /// candidate sets (e.g. a search with `limit > 32`) are split into batches
+    /// of this size and merged client-side. Raise both this and TEI's flag
+    /// together if you want fewer round-trips on big result sets.
+    pub max_batch: usize,
 }
 
 impl Default for RerankerConfig {
@@ -151,8 +165,19 @@ impl Default for RerankerConfig {
             endpoint: "http://localhost:8080".to_string(),
             model_id: "BAAI/bge-reranker-v2-m3".to_string(),
             timeout_seconds: 30,
+            max_batch: 32,
         }
     }
+}
+
+/// M8 read-only web surface. Off by default (`Default` gives `enabled: false`),
+/// so existing deployments serve only `/mcp` until the operator opts in.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WebConfig {
+    /// When true, `serve` mounts the human search/visualize UI + read-only
+    /// `/api/*` routes alongside `/mcp`.
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -388,6 +413,26 @@ mod tests {
                 .allowed_hosts
                 .contains(&"repromax:8081".to_string())
         );
+    }
+
+    #[test]
+    fn web_surface_disabled_by_default() {
+        let c = Config::default();
+        assert!(!c.web.enabled);
+    }
+
+    #[test]
+    fn web_enabled_round_trips_from_toml() {
+        let toml = r#"
+            [web]
+            enabled = true
+        "#;
+        let c: Config = Figment::new()
+            .merge(Serialized::defaults(Config::default()))
+            .merge(Toml::string(toml))
+            .extract()
+            .unwrap();
+        assert!(c.web.enabled);
     }
 
     #[test]

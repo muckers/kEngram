@@ -164,6 +164,53 @@ pub async fn get_related_thoughts(
     })
 }
 
+/// Canonical JSON wire shape for a `get_related_thoughts` response.
+///
+/// This is the single source of truth for the related-thoughts wire shape:
+/// both the MCP `get_related_thoughts` tool and the read-only web `/api` layer
+/// serialize through it, so the two surfaces stay byte-identical. (The response
+/// types are intentionally not `Serialize` — this hand-written mapper flattens
+/// the polymorphic `LinkTarget` into `to_kind`/`to_value` and formats
+/// timestamps as RFC3339, which a derive could not reproduce.)
+pub fn related_thoughts_response_json(resp: &GetRelatedThoughtsResponse) -> serde_json::Value {
+    fn hit_to_json(h: &RelatedTargetHit) -> serde_json::Value {
+        // Thought-target hits carry thought_id + scope + content_preview +
+        // thought_created_at + retracted; non-thought hits leave those null.
+        let thought_id = match &h.target {
+            LinkTarget::Thought(id) => Some(id.to_string()),
+            _ => None,
+        };
+        serde_json::json!({
+            "link_id": h.link_id.to_string(),
+            "relation": h.relation.as_str(),
+            "to_kind": h.target.kind_str(),
+            "to_value": h.target.value_str(),
+            "thought_id": thought_id,
+            "scope": h.scope.as_ref().map(|s| s.as_str()),
+            "content_preview": h.content_preview,
+            "content_truncated": h.content_truncated,
+            "thought_created_at": h.thought_created_at.map(|t| {
+                t.format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_default()
+            }),
+            "link_created_at": h.link_created_at
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_default(),
+            "link_source": h.link_source.as_str(),
+            "note": h.note,
+            "retracted": h.retracted,
+        })
+    }
+
+    let outbound: Vec<_> = resp.outbound.iter().map(hit_to_json).collect();
+    let inbound: Vec<_> = resp.inbound.iter().map(hit_to_json).collect();
+    serde_json::json!({
+        "thought_id": resp.thought_id.to_string(),
+        "outbound": outbound,
+        "inbound": inbound,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

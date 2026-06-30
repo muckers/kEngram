@@ -185,6 +185,10 @@ pub async fn search_thoughts(
     let scope_filter = request.scope.as_ref().map(Scope::as_str);
     let scope_prefix_filter = request.scope_prefix.as_deref();
 
+    // Each leg must fetch at least `limit` candidates so the fused pool can
+    // satisfy the request; the per-leg default is the floor for small limits.
+    let leg_k = DEFAULT_TOP_K_PER_LEG.max(limit) as i64;
+
     // Vector leg (soft-fail to empty + flag).
     let (vector_hits, vector_search_available) = match embedder
         .embed(std::slice::from_ref(&request.query))
@@ -200,7 +204,7 @@ pub async fn search_thoughts(
                 embedder.model(),
                 scope_filter,
                 scope_prefix_filter,
-                DEFAULT_TOP_K_PER_LEG as i64,
+                leg_k,
             )
             .await
             {
@@ -223,7 +227,7 @@ pub async fn search_thoughts(
         &request.query,
         scope_filter,
         scope_prefix_filter,
-        DEFAULT_TOP_K_PER_LEG as i64,
+        leg_k,
     )
     .await?;
 
@@ -255,9 +259,12 @@ pub async fn search_thoughts(
 
     // Optional rerank stage.
     let rerank_enabled = request.rerank.unwrap_or(true);
+    // Default the rerank pool to at least `limit` (capped by the sensible
+    // floor) so a large `limit` isn't silently truncated to the default-32
+    // pool. An explicit caller-supplied `candidate_pool` still wins.
     let candidate_pool = request
         .candidate_pool
-        .unwrap_or(DEFAULT_RERANK_CANDIDATE_POOL);
+        .unwrap_or(DEFAULT_RERANK_CANDIDATE_POOL.max(limit));
     let rerank_used = match (rerank_enabled, reranker) {
         (true, Some(rr)) => {
             apply_rerank_to_thought_hits(rr, &request.query, &mut fused, candidate_pool).await
@@ -439,6 +446,111 @@ pub async fn get_thought(
         embedded_at: prov.embedded_at,
         retracted_at: prov.retracted_at,
         retracted_reason: prov.retracted_reason,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Canonical JSON wire shapes.
+//
+// These hand-written mappers are the single source of truth for the read-tool
+// wire shapes: both the MCP tool handlers (`server.rs`) and the read-only web
+// `/api` layer serialize through them, so the two surfaces emit byte-identical
+// JSON. The response types above are intentionally not `Serialize` — a derive
+// would diverge (e.g. raw `OffsetDateTime`/id formatting) from the RFC3339 +
+// `as_value()` shape these produce.
+// ---------------------------------------------------------------------------
+
+/// Canonical JSON for a `search_thoughts` response.
+pub fn search_response_json(resp: &SearchResponse) -> serde_json::Value {
+    let results: Vec<serde_json::Value> = resp
+        .results
+        .iter()
+        .map(|h| {
+            serde_json::json!({
+                "thought_id": h.thought_id.to_string(),
+                "content": h.content,
+                "scope": h.scope.as_str(),
+                "source": h.source.as_str(),
+                "created_at": h.created_at.format(&time::format_description::well_known::Rfc3339).unwrap_or_default(),
+                "metadata": h.metadata.as_value(),
+                "tags": h.tags,
+                "vector_score": h.vector_score,
+                "trigram_score": h.trigram_score,
+                "rrf_score": h.rrf_score,
+                "rerank_score": h.rerank_score,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "results": results,
+        "vector_search_available": resp.vector_search_available,
+        "rerank_used": resp.rerank_used,
+    })
+}
+
+/// Canonical JSON for a `recent_thoughts` response.
+pub fn recent_response_json(resp: &RecentResponse) -> serde_json::Value {
+    let results: Vec<serde_json::Value> = resp
+        .results
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "thought_id": t.id.to_string(),
+                "content": t.content,
+                "scope": t.scope.as_str(),
+                "source": t.source.as_str(),
+                "created_at": t.created_at.format(&time::format_description::well_known::Rfc3339).unwrap_or_default(),
+                "metadata": t.metadata.as_value(),
+            })
+        })
+        .collect();
+    serde_json::json!({ "results": results })
+}
+
+/// Canonical JSON for a `list_scopes` response.
+pub fn list_scopes_response_json(resp: &ListScopesResponse) -> serde_json::Value {
+    let scopes: Vec<serde_json::Value> = resp
+        .scopes
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "scope": s.scope,
+                "thought_count": s.thought_count,
+                "first_activity_at": s
+                    .first_activity_at
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_default(),
+                "last_activity_at": s
+                    .last_activity_at
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_default(),
+            })
+        })
+        .collect();
+    serde_json::json!({ "scopes": scopes })
+}
+
+/// Canonical JSON for a `get_thought` response (thought + provenance).
+pub fn get_thought_response_json(resp: &GetThoughtResponse) -> serde_json::Value {
+    serde_json::json!({
+        "thought": {
+            "thought_id": resp.thought.id.to_string(),
+            "content": resp.thought.content,
+            "scope": resp.thought.scope.as_str(),
+            "source": resp.thought.source.as_str(),
+            "created_at": resp.thought.created_at.format(&time::format_description::well_known::Rfc3339).unwrap_or_default(),
+            "metadata": resp.thought.metadata.as_value(),
+        },
+        "provenance": {
+            "embedding_status": resp.embedding_status,
+            "embedded_at": resp.embedded_at.and_then(|t| t.format(&time::format_description::well_known::Rfc3339).ok()),
+            "tags": resp.thought.tags,
+            "tags_extractor_model": resp.thought.tags_extractor_model,
+            "tags_extractor_version": resp.thought.tags_extractor_version,
+            "tags_extracted_at": resp.thought.tags_extracted_at.and_then(|t| t.format(&time::format_description::well_known::Rfc3339).ok()),
+            "retracted_at": resp.retracted_at.and_then(|t| t.format(&time::format_description::well_known::Rfc3339).ok()),
+            "retracted_reason": resp.retracted_reason,
+        },
     })
 }
 

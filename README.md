@@ -181,7 +181,7 @@ Any client speaking streamable-HTTP can point at `http://127.0.0.1:8081/mcp` dir
 
 ## What you get (MCP surface)
 
-**Status:** everything through M6 is shipped — capture & search, hybrid retrieval with cross-encoder rerank, the tagging sidecar, and the relational link graph — plus the first M7 surface, `kengram backup` / `restore` (M7.0). The rest of M7 (operational maturity — Prometheus metrics, Tier 2 auth, eval suite) is open work and a good first place to contribute. See the [Roadmap](#roadmap) for the per-milestone breakdown.
+**Status:** everything through M6 is shipped — capture & search, hybrid retrieval with cross-encoder rerank, the tagging sidecar, and the relational link graph — plus `kengram backup` / `restore` (M7.0), the tagger-quality eval harness (M7.1), and the read-only [web UI](#web-ui-read-only-m8) (M8). The rest of M7 (operational maturity — Prometheus metrics, Tier 2 auth, eval suite) is open work and a good first place to contribute. See the [Roadmap](#roadmap) for the per-milestone breakdown.
 
 | Tool | What it does |
 |---|---|
@@ -196,6 +196,17 @@ Any client speaking streamable-HTTP can point at `http://127.0.0.1:8081/mcp` dir
 | `list_scopes` | Enumerate scopes currently in use (each with `thought_count`, `first_activity_at`, `last_activity_at`), sorted most-recently-used first. Optional `prefix` filter. Pair with `scope_prefix` on `search_thoughts` / `recent_thoughts` to query across a namespace. |
 
 CLI subcommands: `kengram serve`, `kengram worker`, `kengram migrate`, `kengram embed-backfill`, `kengram tag`, `kengram stats`, `kengram bench`, `kengram audit migrations`, `kengram backup`, `kengram restore`. Operational details in [Operator workflows](DEVELOPMENT.md#operator-workflows) in DEVELOPMENT.md.
+
+## Web UI (read-only, M8)
+
+The MCP surface is built for agents; **M8 adds a human-facing read-only web UI** for browsing the same corpus. It's served by `kengram serve` on the same `[server].bind` address (under `/` and `/api/*`), gated behind `[web].enabled` (default `false`):
+
+- **Search** — the full hybrid pipeline (vector + trigram, RRF, rerank) with a trailing-dot scope filter (`rjf.` searches the whole `rjf.*` subtree), a result-limit selector, and a relevance floor (Focused / Balanced / Broad).
+- **Thought detail** — content, provenance, tags, and link-graph neighbors.
+- **Graph** — an interactive cytoscape visualization of the relation graph; click a node to expand its links.
+- **Scope browser** — every scope with counts and activity, drilling into its thoughts.
+
+It is **read-only by construction**: the five `/api/*` endpoints reuse the same `kengram-mcp` orchestrators as the MCP tools (so `/api/*` JSON is byte-identical to `/mcp`) and there are no write routes — `psql` stays the write/admin interface and `/mcp` the agent interface. There is **no per-user auth**: the UI inherits the same trust boundary as `/mcp` (the `[server].allowed_hosts` allowlist plus your network perimeter — e.g. a Tailnet-only reverse proxy). Only enable it where you trust the perimeter to read the whole corpus. Built with Rust SSR (askama) + vanilla JS — no Node/TypeScript toolchain. See [Enable the web UI](DEVELOPMENT.md#enable-the-web-ui-read-only) in DEVELOPMENT.md.
 
 ## How tagging works
 
@@ -281,6 +292,7 @@ crates/
 ├── kengram-tagger-protocol/      # wire types for the HTTP tagger-sidecar contract
 ├── kengram-tagger-deterministic/ # reference non-LLM tagger sidecar (opt-in)
 ├── kengram-mcp/                  # capture/search/get/recent/retract/link/unlink/related/scopes orchestrators + rmcp wiring
+├── kengram-web/                  # read-only web UI (M8): SSR pages + /api/* reusing the kengram-mcp orchestrators
 └── kengram-cli/                  # binary; serve/migrate/worker/embed-backfill/tag/stats/bench/audit/backup/restore subcommands
 migrations/                       # sqlx migrations (numbered)
 docs/                             # design doc + per-milestone scope/progress
@@ -302,7 +314,8 @@ Built across seven capability milestones (M1 → M7), preceded by an environment
 | [M4.1 — v2 tagging](docs/milestones/m4.1-tagging-v2.md) | ✅ | Split `topics` into `entities` + `topics`; scope-aware controlled-vocabulary injection. |
 | [M5 — selective relations](docs/milestones/m5-selective-relations.md) | ✅ | Thought-to-thought graph layer with seven closed-vocabulary relations. M5.1 added `supports`. M5.2 added polymorphic targets, soft-delete with three-way unlink status, and operator audit (`migration_audit` + `kengram audit migrations`). |
 | [M6 — stats CLI + tagger-extracted relations](docs/milestones/m6-stats-and-tagger-relations.md) | ✅ | `kengram stats` CLI for corpus + storage telemetry. v5+ tagger auto-emits non-thought relations (URLs / entities / persons) from prose with `source='tagger'`. The original M6 (artifacts) was dropped after a live-corpus measurement showed kengram occupies a high-signal-density sweet spot. |
-| [M7 — operational maturity](docs/milestones/m7-operational-maturity.md) | 🚧 | **Shipped (M7.0):** `kengram backup` / `kengram restore` with manifest sidecar + compatibility checks. **Open:** Prometheus `/metrics`, Tier 2 bearer-token auth, eval suite, backup retention cron, tunnel deployment guide. |
+| [M7 — operational maturity](docs/milestones/m7-operational-maturity.md) | 🚧 | **Shipped (M7.0):** `kengram backup` / `kengram restore` with manifest sidecar + compatibility checks. **Shipped (M7.1):** tagger-quality eval harness + cross-model sweep. **Open:** Prometheus `/metrics`, Tier 2 bearer-token auth, eval suite, backup retention cron, tunnel deployment guide. |
+| [M8 — human read surface](docs/milestones/m8-human-read-surface.md) | ✅ | Read-only web UI (search / thought detail / link graph / scope browser) served by `kengram serve` behind `[web].enabled`; five read-only `/api/*` endpoints reusing the MCP orchestrators. Rust SSR + vanilla JS, no Node. |
 
 Per-milestone progress is tracked in `docs/milestones/m{N}-progress.md`.
 

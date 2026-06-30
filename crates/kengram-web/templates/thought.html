@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block title %}Thought · kEngram{% endblock %}
+{% block page %}thought{% endblock %}
+{% block content %}
+<article id="thought" class="thought" data-thought-id="{{ thought_id }}">
+  <div class="muted">Loading thought {{ thought_id }}…</div>
+</article>
+<section class="related">
+  <h2>Related</h2>
+  <p><a id="graph-link" href="/graph?root={{ thought_id }}">View in graph →</a></p>
+  <div id="related"></div>
+</section>
+{% endblock %}

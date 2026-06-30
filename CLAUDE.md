@@ -4,7 +4,7 @@
 
 kEngram is a self-hosted, MCP-native AI memory service. It stores agent "thoughts" and extracted facts in Postgres + pgvector, and exposes a small set of MCP tools (capture, search, etc.) so any MCP-capable client — Claude Code, opencode, Claude Desktop, ChatGPT — reads and writes the same persistent backing store.
 
-The system is being built across seven capability milestones (M1 → M7), preceded by an environment milestone (M0). All milestones through M6.1 are shipped as of 2026-05-18, plus M7.0 (the `kengram backup` / `restore` surface); the rest of M7 (operational maturity) is the next focus. The terminal-state design lives in `DESIGN.md`; per-milestone scope and success criteria live in `docs/milestones/`.
+The system is being built across seven capability milestones (M1 → M7), preceded by an environment milestone (M0); a read-only web read surface (M8) followed. All milestones through M6.1 are shipped as of 2026-05-18, plus M7.0 (`kengram backup` / `restore`), M7.1 (tagger eval harness), and M8 (read-only web UI) — the latter two released as **v0.3.0** on 2026-06-30; the rest of M7 (operational maturity) is the next focus. The terminal-state design lives in `DESIGN.md`; per-milestone scope and success criteria live in `docs/milestones/`.
 
 ## Documents
 
@@ -53,13 +53,14 @@ If you find yourself reasoning about a design choice that the design doc already
 │   ├── kengram-tagger-protocol/      # wire types for the HTTP tagger-sidecar contract
 │   ├── kengram-tagger-deterministic/ # reference non-LLM tagger sidecar (opt-in)
 │   ├── kengram-mcp/         # rmcp tools + the embed/tag drainers and finalize pipeline
+│   ├── kengram-web/         # read-only web UI (M8): SSR pages + /api/* over the kengram-mcp orchestrators
 │   └── kengram-cli/         # the only binary; axum + transport, config, subcommands
 ├── migrations/             # sqlx migrations, numbered (0001_initial.sql, ...)
 └── config/
     └── kengram.example.toml
 ```
 
-Eight crates. `kengram-cli` is the only binary; the rest are libraries with no `main`. Each library crate exposes a small, well-named API surface; cross-crate calls go through trait abstractions where the design doc indicates (`Embedder`, `Tagger`, `Reranker`). (The workspace started at five crates in M1; `kengram-extract` landed with the facts pipeline, and the two `kengram-tagger-*` crates with the pluggable-tagger work.)
+Nine crates. `kengram-cli` is the only binary; the rest are libraries with no `main`. Each library crate exposes a small, well-named API surface; cross-crate calls go through trait abstractions where the design doc indicates (`Embedder`, `Tagger`, `Reranker`). (The workspace started at five crates in M1; `kengram-extract` landed with the facts pipeline, the two `kengram-tagger-*` crates with the pluggable-tagger work, and `kengram-web` with the M8 read surface.)
 
 ## Conventions
 
@@ -78,7 +79,7 @@ Eight crates. `kengram-cli` is the only binary; the rest are libraries with no `
 - Do not make kEngram operate vLLM or TEI. Those are external services with their own systemd units. kEngram only *consumes* their HTTP APIs.
 - Do not add a "hosted mode" or multi-tenant abstractions. Single user, single active session is a design assumption (§1 of the design doc).
 - Do not introduce an ORM (Diesel, SeaORM). `sqlx` is the choice and the reasons (compile-time checking, async-native, no macro magic) are intentional.
-- Do not implement a web UI in v0. Postgres + `psql` is the admin interface.
+- A **read-only** web UI is in scope as of **M8** (`docs/milestones/m8-human-read-surface.md`): a human search/visualize surface served by the `kengram` binary, reusing the MCP orchestrators behind read-only `/api/*` routes. It does NOT write — `psql` remains the write/admin interface and `/mcp` the agent interface. Do not add write/mutation routes to the web surface.
 - Do not implement any reflector or re-embedding flow that cannot be re-run. Idempotency is required.
 - Do not invent an MCP tool that's not in the current milestone's MCP surface (see the milestone doc) without raising it as a design question first. The full tool set lives in §8 of the design doc, but tools ship by milestone.
 - Do not edit `thoughts` rows once written. They are immutable. (§10 of the design doc explains why.)
@@ -107,13 +108,14 @@ cargo test --workspace --features integration  # requires running Postgres + TEI
 
 ## Current state
 
-- ✅ **M0–M6.1 shipped** (as of 2026-05-18). Eight-crate workspace; migrations `0001`–`0011`. Live: the capture/search MCP surface, hybrid retrieval (vector kNN + trigram, RRF fusion, cross-encoder rerank), thought retraction, the relational link graph (`thought_links`, M5/M6.1), and the LLM tagging sidecar (M4) with a worker that drains `pending_embeddings` + `pending_tags`.
+- ✅ **M0–M6.1 shipped** (as of 2026-05-18). Nine-crate workspace; migrations `0001`–`0011`. Live: the capture/search MCP surface, hybrid retrieval (vector kNN + trigram, RRF fusion, cross-encoder rerank), thought retraction, the relational link graph (`thought_links`, M5/M6.1), and the LLM tagging sidecar (M4) with a worker that drains `pending_embeddings` + `pending_tags`.
 - ✅ **Tagger at prompt v16** (`BUNDLED_TAGGER_VERSION`). Post-M6.1 dogfood iteration added: the `decision_record` kind, forward-looking `action_items`, deterministic scope-identifier / relationship-noun filters + a `metadata.decision_type` override in the shared `kengram_mcp::finalize` seam (run by both the worker drainer and `kengram tag`), provenance binding (the version stamp can't drift from the prompt), and an entities cap of 15. An opt-in deterministic NER backend lives in `kengram-tagger-deterministic`. Iteration log: `docs/tagger-improvements.md`; cross-model eval harness: `./tagger-sweep.sh`.
-- 🚧 **M7 (operational maturity)** is in progress — M7.0 backup/restore (`kengram backup` / `restore`) shipped 2026-05-18; remaining: Prometheus `/metrics`, Tier 2 auth, eval suite. Day-to-day work right now is dogfooding the live corpus and refining the tagger.
+- ✅ **M7.1 + M8 shipped, released as v0.3.0** (2026-06-30). M7.1: tagger-quality golden-corpus eval harness + cross-model sweep. M8 (`kengram-web`, the 9th crate): a read-only human web UI — search / thought-detail / interactive link-graph / scope-browser — served by `kengram serve` behind `[web].enabled` (default false), with five read-only `/api/*` endpoints that reuse the `kengram-mcp` orchestrators (so `/api/*` JSON == `/mcp` JSON). Rust SSR (askama) + vanilla JS, no Node. The v0 "no web UI" non-goal is reversed. Same shipping iteration also fixed two retrieval-core bugs: `search_thoughts` now honors `limit > 32` (per-leg fetch + rerank `candidate_pool` scale to `limit`), and `TeiReranker` chunks oversized rerank batches to `[reranker].max_batch`.
+- 🚧 **M7 (operational maturity)** remaining — Prometheus `/metrics`, Tier 2 auth, eval suite. Day-to-day work right now is dogfooding the live corpus and refining the tagger.
 
 ## Next concrete step
 
-The shipped milestones (M0–M6.1, plus M7.0 backup/restore) are done; the remaining **M7 (operational maturity)** work — Prometheus metrics, Tier 2 auth, eval suite — is next; read `docs/milestones/m7-operational-maturity.md` for its scope and success criteria. New milestone work follows the doc-driven flow: read the milestone doc, produce a plan file, get approval, then code (same discipline as *How to handle ambiguity* below). Between milestones, the active work is dogfooding the live corpus and refining the tagger (`docs/tagger-improvements.md` is the iteration log).
+The shipped milestones (M0–M6.1, M7.0 backup/restore, M7.1 eval harness, M8 web UI — released as **v0.3.0**) are done; the remaining **M7 (operational maturity)** work — Prometheus metrics, Tier 2 auth, eval suite — is next; read `docs/milestones/m7-operational-maturity.md` for its scope and success criteria. New milestone work follows the doc-driven flow: read the milestone doc, produce a plan file, get approval, then code (same discipline as *How to handle ambiguity* below). Between milestones, the active work is dogfooding the live corpus and refining the tagger (`docs/tagger-improvements.md` is the iteration log).
 
 ## How to handle ambiguity
 

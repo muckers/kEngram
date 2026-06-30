@@ -30,6 +30,12 @@ pub struct TeiRerankerConfig {
     /// e.g. `"BAAI/bge-reranker-v2-m3"`.
     pub model_id: String,
     pub timeout: Duration,
+    /// Max candidates per `/rerank` request. TEI rejects batches larger than
+    /// its `--max-client-batch-size` (default 32) with HTTP 422; larger
+    /// candidate sets are split into batches of this size and merged (a
+    /// cross-encoder scores each (query, doc) pair independently, so chunking
+    /// is exactly equivalent to one batch). Keep this ≤ the TEI server's limit.
+    pub max_batch: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -40,6 +46,8 @@ pub struct TeiReranker {
     /// actual configured value. (Phase A taught us this lesson — see
     /// commit 1d627e4.)
     timeout_seconds: u64,
+    /// Batch ceiling per `/rerank` request (see `TeiRerankerConfig::max_batch`).
+    max_batch: usize,
     client: Client,
 }
 
@@ -63,6 +71,8 @@ impl TeiReranker {
             endpoint: config.endpoint,
             model_id: config.model_id,
             timeout_seconds: config.timeout.as_secs(),
+            // Clamp to ≥1 so a misconfigured 0 can't stall on empty chunks.
+            max_batch: config.max_batch.max(1),
             client,
         })
     }
@@ -96,6 +106,33 @@ impl Reranker for TeiReranker {
             return Ok(Vec::new());
         }
 
+        // Fast path: fits in one TEI request.
+        if candidates.len() <= self.max_batch {
+            return self.rerank_batch(query, candidates, 0).await;
+        }
+
+        // Otherwise split into ≤max_batch chunks and merge, offsetting each
+        // chunk's indices back into the full `candidates` slice. Cross-encoder
+        // scores are per-pair independent, so this equals one big batch.
+        let mut out = Vec::with_capacity(candidates.len());
+        for (chunk_no, chunk) in candidates.chunks(self.max_batch).enumerate() {
+            let offset = chunk_no * self.max_batch;
+            out.extend(self.rerank_batch(query, chunk, offset).await?);
+        }
+        Ok(out)
+    }
+}
+
+impl TeiReranker {
+    /// One `/rerank` request over a single batch (≤ `max_batch`). Returned
+    /// `RerankScore.index` is offset by `index_offset` so callers can map back
+    /// into the full candidate slice across chunks.
+    async fn rerank_batch(
+        &self,
+        query: &str,
+        candidates: &[&str],
+        index_offset: usize,
+    ) -> Result<Vec<RerankScore>, RerankerError> {
         let url = format!("{}/rerank", self.endpoint.trim_end_matches('/'));
         let body = RerankRequestBody {
             query,
@@ -148,7 +185,7 @@ impl Reranker for TeiReranker {
         Ok(parsed
             .into_iter()
             .map(|item| RerankScore {
-                index: item.index,
+                index: index_offset + item.index,
                 score: item.score,
             })
             .collect())
@@ -184,6 +221,7 @@ mod tests {
             endpoint,
             model_id: "BAAI/bge-reranker-v2-m3".to_string(),
             timeout: Duration::from_secs(2),
+            max_batch: 32,
         }
     }
 
@@ -234,6 +272,35 @@ mod tests {
         assert_eq!(out.len(), 3);
         assert_eq!(out[0].index, 2);
         assert!((out[0].score - 0.99).abs() < 1e-5);
+    }
+
+    #[tokio::test]
+    async fn batches_larger_than_max_batch_are_chunked_and_merged() {
+        // max_batch=2 over 4 candidates → two /rerank requests; the second
+        // chunk's indices must be offset by 2 back into the full slice.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/rerank"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {"index": 0, "score": 0.9},
+                {"index": 1, "score": 0.5},
+            ])))
+            .expect(2) // exactly two batched requests, not one oversized one
+            .mount(&server)
+            .await;
+
+        let cfg = TeiRerankerConfig {
+            endpoint: server.uri(),
+            model_id: "BAAI/bge-reranker-v2-m3".into(),
+            timeout: Duration::from_secs(2),
+            max_batch: 2,
+        };
+        let r = TeiReranker::new(cfg).unwrap();
+        let out = r.rerank("q", &["a", "b", "c", "d"]).await.unwrap();
+        assert_eq!(out.len(), 4);
+        let mut idx: Vec<usize> = out.iter().map(|s| s.index).collect();
+        idx.sort_unstable();
+        assert_eq!(idx, vec![0, 1, 2, 3]); // offsets applied across chunks
     }
 
     #[tokio::test]
@@ -325,6 +392,7 @@ mod tests {
             endpoint: server.uri(),
             model_id: "BAAI/bge-reranker-v2-m3".into(),
             timeout: Duration::from_millis(100),
+            max_batch: 32,
         };
         let r = TeiReranker::new(cfg).unwrap();
         let err = r.rerank("q", &["a"]).await.unwrap_err();
@@ -339,6 +407,7 @@ mod tests {
             endpoint: String::new(),
             model_id: "BAAI/bge-reranker-v2-m3".into(),
             timeout: Duration::from_secs(1),
+            max_batch: 32,
         };
         let err = TeiReranker::new(cfg).unwrap_err();
         assert!(matches!(err, RerankerError::Misconfigured(_)));

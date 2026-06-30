@@ -51,6 +51,11 @@ provider = ""
 endpoint = "http://localhost:8080"
 model_id = "BAAI/bge-reranker-v2-m3"
 timeout_seconds = 30
+# Max candidates per rerank HTTP call. Larger search limits are split into
+# batches of this size and merged, so it must not exceed TEI's
+# `--max-client-batch-size` (default 32). Raise both together if you serve
+# bigger result limits.
+max_batch = 32
 
 [tagger]
 # "" (default) = silent-disable: capture proceeds, no tag jobs enqueue, the
@@ -74,3 +79,13 @@ scope_vocab_size = 50
 # endpoint = "http://localhost:8082"
 # api_key = ""                    # optional bearer; sidecars on a private network usually omit
 # timeout_seconds = 60
+
+[web]
+# Read-only human web UI (search / thought detail / link graph / scope browser),
+# served by `kengram serve` on the same [server].bind address under `/` and
+# `/api/*`. Disabled by default. It NEVER writes — psql stays the write/admin
+# interface and /mcp the agent interface. There is no per-user auth: it inherits
+# the same trust boundary as /mcp (the [server].allowed_hosts allowlist + your
+# network perimeter, e.g. a Tailnet-only reverse proxy). Only enable it on a
+# deployment whose perimeter you trust to read the whole corpus.
+enabled = false

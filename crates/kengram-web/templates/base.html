@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{% block title %}kEngram{% endblock %}</title>
+    <link rel="stylesheet" href="/static/app.css" />
+    {% block head_extra %}{% endblock %}
+  </head>
+  <body data-page="{% block page %}{% endblock %}">
+    <header class="topbar">
+      <a class="brand" href="/">kEngram</a>
+      <nav>
+        <a href="/">Search</a>
+        <a href="/scopes">Scopes</a>
+        <a href="/graph">Graph</a>
+      </nav>
+      <span class="readonly-badge" title="This UI is read-only">read-only</span>
+    </header>
+    <main class="content">{% block content %}{% endblock %}</main>
+    <script src="{% block script_src %}/static/app.js{% endblock %}" defer></script>
+  </body>
+</html>
