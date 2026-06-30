@@ -28,6 +28,14 @@ pub struct Config {
     /// drainer task. Flip `provider = "openai-compatible"` to enable.
     pub tagger: TaggerConfig,
     pub reranker: RerankerConfig,
+    /// M8: the read-only human web surface. Disabled by default; flip
+    /// `enabled = true` to have `serve` mount the search/visualize UI and its
+    /// read-only `/api/*` routes onto the same axum server that serves `/mcp`.
+    /// The UI reuses the MCP read orchestrators and never mutates; `psql`
+    /// remains the write/admin interface. Exposure is governed by
+    /// `[server].bind` + `[server].allowed_hosts` (the web routes get the same
+    /// Host-header guard as `/mcp`).
+    pub web: WebConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -153,6 +161,16 @@ impl Default for RerankerConfig {
             timeout_seconds: 30,
         }
     }
+}
+
+/// M8 read-only web surface. Off by default (`Default` gives `enabled: false`),
+/// so existing deployments serve only `/mcp` until the operator opts in.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WebConfig {
+    /// When true, `serve` mounts the human search/visualize UI + read-only
+    /// `/api/*` routes alongside `/mcp`.
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -388,6 +406,26 @@ mod tests {
                 .allowed_hosts
                 .contains(&"repromax:8081".to_string())
         );
+    }
+
+    #[test]
+    fn web_surface_disabled_by_default() {
+        let c = Config::default();
+        assert!(!c.web.enabled);
+    }
+
+    #[test]
+    fn web_enabled_round_trips_from_toml() {
+        let toml = r#"
+            [web]
+            enabled = true
+        "#;
+        let c: Config = Figment::new()
+            .merge(Serialized::defaults(Config::default()))
+            .merge(Toml::string(toml))
+            .extract()
+            .unwrap();
+        assert!(c.web.enabled);
     }
 
     #[test]

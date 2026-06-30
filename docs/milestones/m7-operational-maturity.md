@@ -18,7 +18,7 @@ This milestone is omnibus by design. It bundles the operational concerns that ea
 ## Out of scope (deferred to which milestone)
 
 - Tier 3 (public + multi-user) — out of scope indefinitely. Would require OAuth2, per-user data partitioning, much more audit infrastructure. Implementable later if there's a reason, which is currently not foreseen.
-- Web UI — out of scope indefinitely.
+- Web UI — a **read-only** human search/visualize surface moved into scope at **M8** (`m8-human-read-surface.md`); a *write* web UI remains out of scope.
 - Cross-instance replication — Postgres logical replication is straightforward but only worth doing if actually used.
 - Memory forgetting / TTL policies — possibly post-M6 if the operator finds kengram retains things they want pruned.
 - Capture UX surfaces (Telegram bot, Raycast extension, browser extension) — possibly post-M6 as standalone projects that talk to kengram via MCP.

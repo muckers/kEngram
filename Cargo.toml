@@ -9,6 +9,7 @@ members = [
   "crates/kengram-cli",
   "crates/kengram-tagger-protocol",
   "crates/kengram-tagger-deterministic",
+  "crates/kengram-web",
 ]
 
 [workspace.package]
@@ -26,6 +27,7 @@ kengram-embed           = { path = "crates/kengram-embed" }
 kengram-extract         = { path = "crates/kengram-extract" }
 kengram-mcp             = { path = "crates/kengram-mcp" }
 kengram-tagger-protocol = { path = "crates/kengram-tagger-protocol" }
+kengram-web             = { path = "crates/kengram-web" }
 
 # Async runtime + traits
 tokio       = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "sync"] }

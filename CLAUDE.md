@@ -78,7 +78,7 @@ Eight crates. `kengram-cli` is the only binary; the rest are libraries with no `
 - Do not make kEngram operate vLLM or TEI. Those are external services with their own systemd units. kEngram only *consumes* their HTTP APIs.
 - Do not add a "hosted mode" or multi-tenant abstractions. Single user, single active session is a design assumption (§1 of the design doc).
 - Do not introduce an ORM (Diesel, SeaORM). `sqlx` is the choice and the reasons (compile-time checking, async-native, no macro magic) are intentional.
-- Do not implement a web UI in v0. Postgres + `psql` is the admin interface.
+- A **read-only** web UI is in scope as of **M8** (`docs/milestones/m8-human-read-surface.md`): a human search/visualize surface served by the `kengram` binary, reusing the MCP orchestrators behind read-only `/api/*` routes. It does NOT write — `psql` remains the write/admin interface and `/mcp` the agent interface. Do not add write/mutation routes to the web surface.
 - Do not implement any reflector or re-embedding flow that cannot be re-run. Idempotency is required.
 - Do not invent an MCP tool that's not in the current milestone's MCP surface (see the milestone doc) without raising it as a design question first. The full tool set lives in §8 of the design doc, but tools ship by milestone.
 - Do not edit `thoughts` rows once written. They are immutable. (§10 of the design doc explains why.)

@@ -1612,6 +1612,7 @@ dependencies = [
  "kengram-extract",
  "kengram-mcp",
  "kengram-storage",
+ "kengram-web",
  "rmcp",
  "serde",
  "serde_json",
@@ -1739,6 +1740,24 @@ dependencies = [
  "kengram-core",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "kengram-web"
+version = "0.2.0"
+dependencies = [
+ "axum",
+ "kengram-core",
+ "kengram-embed",
+ "kengram-mcp",
+ "kengram-storage",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "time",
+ "tokio",
+ "tower",
+ "tracing",
 ]
 
 [[package]]

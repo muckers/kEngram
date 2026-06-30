@@ -444,7 +444,19 @@ async fn run_serve(config: Config) -> anyhow::Result<()> {
     let mcp_service =
         StreamableHttpService::new(factory, LocalSessionManager::default().into(), http_cfg);
 
-    let app = axum::Router::new().nest_service("/mcp", mcp_service);
+    let mut app = axum::Router::new().nest_service("/mcp", mcp_service);
+    // M8: mount the read-only human web surface alongside `/mcp` when enabled.
+    // Shares the same pool/embedder/reranker; never mutates. Its routes get a
+    // Host-header guard mirroring the rmcp `allowed_hosts` check on `/mcp`.
+    if config.web.enabled {
+        app = app.merge(kengram_web::router(kengram_web::WebState {
+            pool: pool.clone(),
+            embedder: embedder.clone(),
+            reranker: reranker.clone(),
+            allowed_hosts: config.server.allowed_hosts.clone(),
+        }));
+        tracing::info!("web: read-only UI mounted at / and /api (M8)");
+    }
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .with_context(|| format!("binding HTTP server to {bind}"))?;

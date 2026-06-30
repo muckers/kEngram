@@ -33,14 +33,15 @@ pub use link::{
 };
 pub use relate::{
     GetRelatedThoughtsRequest, GetRelatedThoughtsResponse, RELATED_CONTENT_PREVIEW_LEN,
-    RelateError, RelatedTargetHit, get_related_thoughts,
+    RelateError, RelatedTargetHit, get_related_thoughts, related_thoughts_response_json,
 };
 pub use retract::{RetractError, RetractThoughtRequest, RetractThoughtResponse, retract_thought};
 pub use search::{
     DEFAULT_SEARCH_LIMIT, DEFAULT_TOP_K_PER_LEG, GetThoughtResponse, ListScopesRequest,
     ListScopesResponse, MAX_SEARCH_LIMIT, ReadError, RecentRequest, RecentResponse,
-    ScopeSummaryHit, SearchHit, SearchRequest, SearchResponse, get_thought, list_scopes,
-    recent_thoughts, search_thoughts,
+    ScopeSummaryHit, SearchHit, SearchRequest, SearchResponse, get_thought,
+    get_thought_response_json, list_scopes, list_scopes_response_json, recent_response_json,
+    recent_thoughts, search_response_json, search_thoughts,
 };
 pub use server::{
     CaptureArgs, GetRelatedThoughtsArgs, GetThoughtArgs, KengramServer, LinkThoughtsArgs,
