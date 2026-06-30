@@ -340,6 +340,33 @@ A/B-benchmark the reranker against RRF-only on an operator-curated fixture corpu
 cargo run --bin kengram -- bench rerank --corpus ~/.kengram/my-bench.json
 ```
 
+### Enable the web UI (read-only)
+
+The M8 web UI (search / thought detail / link graph / scope browser) is served by `kengram serve` itself — no separate process or port. It's off by default; turn it on with one config flag:
+
+```toml
+[web]
+enabled = true
+```
+
+It mounts on the **same `[server].bind` address** as `/mcp`, under `/` (pages) and `/api/*` (JSON). On startup the serve log confirms it:
+
+```
+web: read-only UI mounted at / and /api (M8)
+```
+
+Local dev smoke (default bind `127.0.0.1:8080`; the Tier 1 convention is `:8081`):
+
+```bash
+cargo run --bin kengram -- serve          # with [web].enabled = true
+# then open http://localhost:8080/ in a browser
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8080/ -H 'Host: localhost'   # -> 200
+```
+
+**It rides the existing deployment.** Because it's part of `kengram serve`, a production install that already runs `kengram serve` behind a reverse proxy just needs the flag + a restart — no new systemd unit, no new port, no proxy change (the proxy already forwards all paths to the serve address). 
+
+**Security.** The UI is read-only by construction (the `/api/*` handlers call only read orchestrators; there are no write routes) but has **no per-user auth** — anyone who can reach it can read the entire corpus, including private scopes. It inherits the same boundary as `/mcp`: the `[server].allowed_hosts` Host allowlist plus your network perimeter. The intended deployment is behind a perimeter you trust (e.g. a Tailnet-only reverse proxy); do not expose it to an untrusted network. To turn it back off: set `enabled = false` and restart — `/mcp` is unaffected.
+
 ## Configuration reference
 
 Defaults live in code. Override via `~/.config/kengram/kengram.toml`, a `--config <path>` argument, or `KENGRAM_*` env vars (nested via `__`, e.g. `KENGRAM_DATABASE__URL`). Layering order: defaults → user TOML → `--config` TOML → env. Later wins.
@@ -446,6 +473,7 @@ The reranker is the optional cross-encoder stage that re-scores the top `candida
 | `endpoint` | `"http://localhost:8081"` | Service root, no `/v1` suffix. The reranker client appends `/rerank`. |
 | `model_id` | `"BAAI/bge-reranker-v2-m3"` | kEngram-side stable identity. Dev override: `"cross-encoder/ms-marco-MiniLM-L-6-v2"` (matches the docker-compose pin). |
 | `timeout_seconds` | `30` | Per-request timeout. MiniLM is sub-100ms on Apple Silicon; BGE-v2-m3 on GPU is similar; ARM CPU runs of BGE-v2-m3 are minutes per call (don't). |
+| `max_batch` | `32` | Max candidate pairs per rerank HTTP call. Searches with a larger `candidate_pool` are split into batches of this size and merged, so it **must not exceed TEI's `--max-client-batch-size`** (default 32). Raise both together to rerank bigger result limits in one round-trip. |
 
 When the reranker times out or errors, the pipeline silently degrades to RRF + recency order and the response has `rerank_used: false`. Search still returns results.
 
@@ -483,6 +511,14 @@ Active only when `[tagger].provider = "http"`. kEngram POSTs `/tag` against the 
 |---|---|---|
 | `tick_interval_seconds` | `5` | How often the embed and tag drainers wake up and claim a batch off their respective queues. 5s is fine for single-user dogfood; tune lower for snappier vector-search readiness, higher to be gentler on the backends. |
 | `batch_size` | `16` | Max jobs claimed per tick (per queue). Bigger batches are kinder to the backend; smaller batches mean shorter critical sections and faster failover when a job hangs. |
+
+### `[web]`
+
+The read-only human web UI (M8). Disabled by default; when enabled it mounts under `/` and `/api/*` on the same `[server].bind` address as `/mcp`. See [Enable the web UI](#enable-the-web-ui-read-only) for the walkthrough.
+
+| knob | default | what it does |
+|---|---|---|
+| `enabled` | `false` | `true` mounts the read-only web UI (search / thought detail / link graph / scope browser) on the serve address. It never writes. It has **no per-user auth** — it inherits the same trust boundary as `/mcp` (`[server].allowed_hosts` + your network perimeter). Only enable it where the perimeter is trusted to read the whole corpus. |
 
 ## Tagger version history and safe re-tag procedure
 

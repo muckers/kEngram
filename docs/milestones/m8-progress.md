@@ -86,6 +86,15 @@ End state: M8 success criteria met; browser end-to-end pass clean.
 
 ## History
 
+- **2026-06-30** — **M8 shipped, released as v0.3.0.** Workspace bumped `0.2.0 → 0.3.0`;
+  `CHANGELOG.md` got a `[0.3.0]` entry (M8 web UI + the two retrieval-core fixes) and a backfilled
+  `[0.2.0]` (M7.1 eval harness, which had shipped untagged). Docs updated for the release:
+  `config/kengram.example.toml` (`[web]` section + `[reranker].max_batch`), `README.md` (a "Web UI"
+  section + M8 roadmap row + repo-layout entry), `DEVELOPMENT.md` ("Enable the web UI" walkthrough +
+  `[web]`/`max_batch` config-reference rows), and `CLAUDE.md` (M7.1/M8 shipped, nine-crate
+  workspace). Tags `v0.3.0` (release) and backfilled `v0.2.0` (on `adaf206`) cut. The one open item
+  — the in-browser JS smoke (graph render/expand, search-as-you-type) — moves to the production
+  cutover, where it's exercised against the live deployment from a browser. Milestone closed.
 - **2026-06-30** — UX pass + search-quality fixes (post-review iteration with Ron). Frontend:
   trailing-dot hierarchical scope search (`rjf.` → `scope_prefix`); graph rework to a readable
   radial breadthfirst layout (labels below nodes + dark halo + ellipsis, `spacingFactor` tuned to
