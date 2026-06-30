@@ -47,37 +47,55 @@ the flag; unit-tested.
 - [x] Live curl against the real corpus: search returns `vector_search_available:true` +
   `rerank_used:true` + reranked hits; scopes/thought/related all 200; bad Host → 403; bad param → 400
 
-## Phase 3 — SSR shells + assets ⏳
+## Phase 3 — SSR shells + assets ✅
 
 End state: search, thought-detail, and scope-browser surfaces render in a browser.
 
-- [ ] askama `base.html` + per-page templates
-- [ ] `rust-embed` static handler (`GET /static/{*path}`) + `app.css`
-- [ ] `/` search page + vanilla `app.js` search interaction
-- [ ] `/thought/:id` detail page (hydrates from `/api/thoughts/:id` + `/related`)
-- [ ] `/scopes` + `/scope/:name` (server-rendered, no-JS fallback)
+- [x] askama `base.html` + per-page templates (search/thought/scopes/scope)
+- [x] `rust-embed` static handler (`GET /static/{*path}`, content-type + Cache-Control) + `app.css`
+- [x] `/` search page + vanilla `app.js` search interaction (URL-seeded `q`, score badges, banner)
+- [x] `/thought/{id}` detail page (hydrates content + provenance + tags from `/api/thoughts/{id}`,
+  related edges from `/api/thoughts/{id}/related`)
+- [x] `/scopes` + `/scope/{name}` (server-rendered, no-JS fallback)
+- [x] Live smoke: pages render (title/form/data-attrs), `/scopes` lists real scope links, static
+  assets 200 with correct content-type, missing asset 404
 
-## Phase 4 — Graph visualization ⏳
+## Phase 4 — Graph visualization ✅
 
 End state: the `/graph` view loads a root thought and expands the link graph on click.
 
-- [ ] Vendor `cytoscape.min.js` into `static/`
-- [ ] `/graph` + `/graph?root=:id` page
-- [ ] Click-to-expand over `/api/thoughts/:id/related`; dedupe/merge; track expanded set
-- [ ] Style nodes/edges by relation + target kind (thought/entity/person/url)
+- [x] Vendor `cytoscape.min.js` into `static/` (368 KB, checked in; served as `text/javascript`)
+- [x] `/graph` + `/graph?root={id}` page (deferred cytoscape loads before `app.js`)
+- [x] Click-to-expand over `/api/thoughts/{id}/related`; dedupe by node/link id; track `expanded`
+- [x] Style nodes/edges by relation (edge labels) + target kind (thought/entity/person/url shapes)
 
-## Phase 5 — Polish + end-to-end ⏳
+## Phase 5 — Polish + end-to-end ✅
 
 End state: M8 success criteria met; browser end-to-end pass clean.
 
-- [ ] Search-as-you-type debounce; embedder-down banner; score badges
-- [ ] Loading / empty / error states; Cache-Control on static assets
-- [ ] Read-only audit (no mutating imports, no write routes); flag-off 404 check
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings` + `cargo fmt --all --check`
-- [ ] Browser end-to-end: search → detail → graph expand → scope browse
+- [x] Search-as-you-type debounce (250 ms); embedder-down banner; score badges
+- [x] Loading / empty / error states; Cache-Control on static assets
+- [x] Read-only audit (handler modules import only read orchestrators; no POST/PUT/DELETE/PATCH
+  routes); flag-off check (web disabled → `/` + `/api/*` 404, `/mcp` still 405-to-GET)
+- [x] `cargo clippy --workspace --all-targets -- -D warnings` + `cargo fmt --all --check` clean;
+  full `cargo test --workspace` green (528 tests, 0 failed)
+- [~] Browser end-to-end: all surfaces verified server-side via curl (HTML shells, SSR pages,
+  static assets, every `/api/*` against the live corpus). The in-browser JS interaction
+  (cytoscape render + click-expand, search-as-you-type) can't be exercised headless — left as a
+  manual smoke for the operator (`kengram serve` with `[web].enabled`, open `http://localhost:<port>/`).
 
 ## History
 
+- **2026-06-30** — Phases 3–5 landed (frontend). Phase 3: askama `base` + search/thought/scopes/scope
+  templates, a `rust-embed` static handler, `app.css`, and `app.js` (vanilla) — `/` and `/thought/{id}`
+  hydrate from `/api`, `/scopes` + `/scope/{name}` render server-side. Phase 4: vendored
+  `cytoscape.min.js`; `/graph?root={id}` with click-to-expand over `/api/thoughts/{id}/related`
+  (dedupe by id, styled by relation + target kind). Phase 5: debounced search-as-you-type,
+  embedder-down banner, score badges, error/empty states; read-only audit (handlers import only
+  read orchestrators, no write routes), flag-off 404 check. Gates: fmt + clippy `-D warnings` clean
+  workspace-wide; `cargo test --workspace` 528 green. Live curl smoke covers all server-rendered
+  output and every `/api/*`; the in-browser JS (graph render/expand) is a manual operator check.
+  M8 complete pending that manual browser pass.
 - **2026-06-30** — Phase 2 landed. New `kengram-web` crate: `WebState` + `router()`, five read-only
   `/api/*` handlers wired to the `kengram-mcp` orchestrators and serialized through the relocated
   canonical mappers (so `/api` JSON == `/mcp` JSON by construction), an HTTP error mapping

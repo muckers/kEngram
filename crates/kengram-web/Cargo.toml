@@ -23,6 +23,12 @@ time.workspace = true
 tracing.workspace = true
 sqlx.workspace = true
 
+# Frontend (M8 Phase 3+): compile-time HTML templates + embedded static assets.
+# All pure-Rust — no Node/npm/TS toolchain.
+askama = "0.12"
+rust-embed = "8"
+mime_guess = "2"
+
 [dev-dependencies]
 kengram-storage.workspace = true
 tower = "0.5"

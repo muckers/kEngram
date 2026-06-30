@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block title %}{{ scope }} · kEngram{% endblock %}
+{% block page %}scope{% endblock %}
+{% block content %}
+<h1>{{ scope }}</h1>
+<p><a href="/scopes">← all scopes</a></p>
+{% if thoughts.is_empty() %}
+<p class="muted">No thoughts in this scope.</p>
+{% else %}
+<ul class="results">
+  {% for t in thoughts %}
+  <li class="result">
+    <div class="result-head">
+      <a class="result-link" href="/thought/{{ t.id }}">{{ t.preview }}</a>
+      {% if !t.kind.is_empty() %}<span class="tag kind">{{ t.kind }}</span>{% endif %}
+    </div>
+    <div class="muted">{{ t.created_at }}</div>
+  </li>
+  {% endfor %}
+</ul>
+{% endif %}
+{% endblock %}

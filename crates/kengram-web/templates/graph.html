@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}Graph · kEngram{% endblock %}
+{% block page %}graph{% endblock %}
+{# cytoscape loads before the (deferred) app.js; both are deferred so they run in document order #}
+{% block head_extra %}<script defer src="/static/cytoscape.min.js"></script>{% endblock %}
+{% block content %}
+<div class="graph-toolbar">
+  <form id="graph-form" class="search-form" autocomplete="off">
+    <input id="graph-root" type="text" placeholder="root thought id…" value="{{ root }}" />
+    <button type="submit">Load</button>
+  </form>
+  <span id="graph-status" class="muted"></span>
+</div>
+<div id="graph" data-root="{{ root }}"></div>
+<p class="muted">Click a node to expand its one-hop neighborhood. Non-thought targets
+(entity / person / url) are leaves.</p>
+{% endblock %}

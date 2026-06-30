@@ -12,8 +12,10 @@
 //! `[web].enabled` is set. See `docs/milestones/m8-human-read-surface.md`.
 
 mod api;
+mod assets;
 mod error;
 mod host_guard;
+mod pages;
 
 pub use error::ApiError;
 
@@ -41,6 +43,15 @@ pub struct WebState {
 /// the rmcp `allowed_hosts` check that protects `/mcp`.
 pub fn router(state: WebState) -> Router {
     Router::new()
+        // SSR pages
+        .route("/", get(pages::search_page))
+        .route("/thought/{id}", get(pages::thought_page))
+        .route("/scopes", get(pages::scopes_page))
+        .route("/scope/{name}", get(pages::scope_page))
+        .route("/graph", get(pages::graph_page))
+        // embedded static assets
+        .route("/static/{*path}", get(assets::static_handler))
+        // read-only JSON API
         .route("/api/search", get(api::search))
         .route("/api/recent", get(api::recent))
         .route("/api/scopes", get(api::scopes))
