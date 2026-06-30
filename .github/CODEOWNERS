@@ -1,0 +1,7 @@
+# Code owners for kEngram.
+#
+# The owner listed here is automatically requested for review on every pull
+# request, which also generates a review-request notification regardless of
+# repository watch settings. Keep this broad on purpose — single maintainer.
+
+* @itripn
