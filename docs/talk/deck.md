@@ -15,6 +15,15 @@ opencode, ChatGPT — reads and writes the *same* memory.
 - Embedding + tagging are **external, swappable** sidecars.
 - *ken* (to know) + *-gram* (a recorded mark) — a recorded unit of knowing.
 
+Initial requirements:
+
+- Fully local inference with option to connect to foundation models
+- Fully local datastore (no cloud storage)
+- Thoughts are immutable and deduped via sha256, can only be retracted never deleted
+- Embeddings and tagging can be redone as models improve
+- Relationships captured (a graph)
+
+
 > The pipeline in one line:
 > **capture → embed → tag → hybrid search**
 
@@ -46,10 +55,10 @@ opencode, ChatGPT — reads and writes the *same* memory.
   vectors   tags
 ```
 
-- `capture` returns **instantly** — enrichment runs in the background.
+- `capture` returns **instantly** — decoration runs in the background.
 - One **worker** drains the queue, embedding + tagging each thought.
 - `embed` and `tag` are **external sidecars** (a vector model + an LLM) —
-  kEngram just calls their HTTP APIs.
+  kEngram just calls their HTTP APIs (current served from docker container).
 
 <!-- column: 1 -->
 
@@ -82,6 +91,8 @@ opencode, ChatGPT — reads and writes the *same* memory.
 - **Immutability spine.** Raw thoughts are permanent; tags + embeddings are
   *recomputable*. → A model swap is a **re-index, not a migration.**
 
+- **Scopes** are hierarchical and organize content for association and retrieval
+
 - **Content is identity.** SHA-256 fingerprint → idempotent capture; the same
   content twice collapses to one `thought_id`.
 
@@ -108,13 +119,13 @@ Our best tagger is a **reasoning model**. At first it looked unusable — broken
 JSON, repetition loops, timeouts. None of it was the model.
 
 <!-- pause -->
-<!-- new_lines: 2 -->
+<!-- new_lines: 1 -->
 <!-- list_item_newlines: 1 -->
 
 - The "model defect" was **context starvation** — it never had room to finish
   thinking, so it emitted truncated, broken JSON.
 - **Never run a reasoning tagger at temperature 0** — greedy decoding makes its
-  loops *deterministic* (~⅓ of calls fail).
+  loops *deterministic* (~1/3rd of calls fail).
 - The fix was **deployment, not model**: quantize to fit one GPU, pin an explicit
   context window, run at temp 0.2.
 
@@ -144,7 +155,7 @@ The spine of the design: **a thought is immutable.** Its embedding and tags are
 **recomputed**, never patched.
 
 <!-- pause -->
-<!-- new_lines: 2 -->
+<!-- new_lines: 1 -->
 <!-- list_item_newlines: 1 -->
 
 - Swap the embedding or tagging model? It's a **re-index, not a migration** —
@@ -176,7 +187,7 @@ Tag quality is **invisible at a glance** — a model can read fine and quietly
 mislabel half the corpus.
 
 <!-- pause -->
-<!-- new_lines: 2 -->
+<!-- new_lines: 1 -->
 <!-- list_item_newlines: 1 -->
 
 - We first chose models by **gut and a handful of fixtures** — and kept choosing
@@ -202,9 +213,57 @@ mislabel half the corpus.
 
 <!-- end_slide -->
 
+# The MCP surface — capture & retrieve
+
+<!-- new_line -->
+
+Every client speaks the **same small tool set**. Six for the read/write core:
+
+| Tool | What it does |
+| --- | --- |
+| `capture` | Store a thought. Returns instantly; embed + tag run async. Idempotent on content (SHA-256). |
+| `search_thoughts` | Hybrid search: vector ∪ trigram → RRF → recency → rerank. Filter by scope / tags. |
+| `recent_thoughts` | Chronological browse of a scope — newest first, no scoring. |
+| `get_thought` | Fetch one by ID with provenance: embedding status, tags, retraction. |
+| `list_scopes` | Enumerate scopes in use, with thought counts and activity dates. |
+| `retract_thought` | Mark a thought untrusted. A soft flag — never a delete. |
+
+<!-- speaker_note: |
+  These are the everyday calls. capture + search_thoughts carry 90% of traffic.
+  retract is the only "mutation" — and it's a flag, not an edit (thoughts are immutable).
+-->
+
+<!-- end_slide -->
+
+# The MCP surface — the relational graph
+
+<!-- new_line -->
+
+Three more tools turn the store into a **graph**. Edges are a closed vocabulary —
+`replaces`, `requires`, `references`, `supports`, `belongs_to`, `decided_by`, `refines`:
+
+| Tool | What it does |
+| --- | --- |
+| `link_thoughts` | Assert one edge from a thought to a thought / entity / person / URL. Idempotent. |
+| `unlink_thoughts` | Soft-delete an edge by its `(from, relation, target)` triple. |
+| `get_related_thoughts` | Walk outbound + inbound edges from a thought. The demo's third call. |
+
+<!-- new_line -->
+
+> Relations are **agent-supplied**, not extracted — no prompt to break under load.
+
+<!-- speaker_note: |
+  The closed vocabulary is the design bet from the decisions slide, made concrete:
+  7 relations, polymorphic targets (thought/entity/person/url), soft-delete.
+  search_thoughts → get_related_thoughts is the "discover then traverse" pattern
+  the demo walks.
+-->
+
+<!-- end_slide -->
+
 # Demo — it remembers its own construction
 
-Everything in the last two slides came *out of the system itself*.
+The content for this presentation came *out of the system itself*.
 
 In the pane to the right →
 
@@ -218,7 +277,7 @@ get_related_thoughts(<hit>)  → walk the relational graph
 
 <!-- pause -->
 
-**The mic-drop:** the talk you just heard is *retrievable from the thing the
+The talk you just heard is *retrievable from the thing the
 talk is about.*
 
 <!-- speaker_note: |

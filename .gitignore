@@ -43,3 +43,6 @@ Thumbs.db
 !/eval/corpora/example.json
 /eval/models.toml
 /eval/reports/
+
+# graphify — generated knowledge-graph output, regenerate with `graphify update .`
+/graphify-out/
