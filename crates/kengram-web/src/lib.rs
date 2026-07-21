@@ -49,6 +49,7 @@ pub fn router(state: WebState) -> Router {
         .route("/scopes", get(pages::scopes_page))
         .route("/scope/{name}", get(pages::scope_page))
         .route("/graph", get(pages::graph_page))
+        .route("/stats", get(pages::stats_page))
         // embedded static assets
         .route("/static/{*path}", get(assets::static_handler))
         // read-only JSON API
@@ -57,6 +58,7 @@ pub fn router(state: WebState) -> Router {
         .route("/api/scopes", get(api::scopes))
         .route("/api/thoughts/{id}", get(api::thought))
         .route("/api/thoughts/{id}/related", get(api::related))
+        .route("/api/stats", get(api::stats))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             host_guard::guard,
@@ -176,6 +178,32 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(body.get("results").and_then(Value::as_array).is_some());
         assert!(body.get("vector_search_available").is_some());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn api_stats_returns_200_with_expected_shape(pool: PgPool) {
+        cap(&pool, "a thought for the stats page", "web.test").await;
+        let (status, body) = get(state(pool, vec![]), "/api/stats", "localhost").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body.get("thoughts").and_then(|t| t.get("live")),
+            Some(&Value::from(1))
+        );
+        assert!(body.get("links").is_some());
+        assert!(body.get("queues").is_some());
+        assert!(
+            body.get("storage")
+                .and_then(|s| s.get("tables"))
+                .and_then(Value::as_array)
+                .is_some()
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn stats_page_renders_200(pool: PgPool) {
+        cap(&pool, "a thought for the stats page", "web.test").await;
+        let (status, _) = get(state(pool, vec![]), "/stats", "localhost").await;
+        assert_eq!(status, StatusCode::OK);
     }
 
     #[sqlx::test(migrations = "../../migrations")]

@@ -19,6 +19,7 @@ pub mod relate;
 pub mod retract;
 pub mod search;
 pub mod server;
+pub mod stats;
 mod validate;
 
 pub use backfill::{BackfillError, BackfillReport, embed_backfill};
@@ -46,4 +47,7 @@ pub use search::{
 pub use server::{
     CaptureArgs, GetRelatedThoughtsArgs, GetThoughtArgs, KengramServer, LinkThoughtsArgs,
     ListScopesArgs, RecentThoughtsArgs, RetractThoughtArgs, SearchThoughtsArgs, UnlinkThoughtsArgs,
+};
+pub use stats::{
+    CorpusStatsRequest, CorpusStatsResponse, corpus_stats, corpus_stats_response_json,
 };

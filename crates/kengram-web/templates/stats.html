@@ -1,0 +1,85 @@
+{% extends "base.html" %}
+{% block title %}Stats · kEngram{% endblock %}
+{% block page %}stats{% endblock %}
+
+{% macro barlist(rows) %}
+<ul class="bar-list">
+  {% for b in rows %}
+  <li class="bar-row">
+    <span class="bar-label" title="{{ b.label }}">{{ b.label }}</span>
+    <span class="bar"><span class="bar-fill" style="width: {{ b.pct }}%"></span></span>
+    <span class="bar-value">{{ b.value }}</span>
+    {% if !b.detail.is_empty() %}<span class="muted bar-detail">{{ b.detail }}</span>{% endif %}
+  </li>
+  {% endfor %}
+</ul>
+{% endmacro %}
+
+{% block content %}
+
+<h1>Corpus stats</h1>
+
+<section class="stat-cards">
+  {% for c in cards %}
+  <div class="stat-card">
+    <div class="stat-label">{{ c.label }}</div>
+    <div class="stat-value">{{ c.value }}</div>
+    {% if !c.sub.is_empty() %}<div class="muted stat-sub">{{ c.sub }}</div>{% endif %}
+  </div>
+  {% endfor %}
+</section>
+
+<section class="panel-grid">
+
+  <div class="panel">
+    <h2>Scopes <span class="muted">({{ scopes_total }})</span></h2>
+    {% if scopes.is_empty() %}
+    <p class="muted">No scopes yet.</p>
+    {% else %}
+    {% call barlist(scopes) %}
+    {% if scopes_hidden > 0 %}
+    <p class="panel-more muted">{{ scopes_hidden }} more — <a href="/scopes">see all scopes</a></p>
+    {% endif %}
+    {% endif %}
+  </div>
+
+  <div class="panel">
+    <h2>On-disk tables <span class="muted">{{ db_total }} total</span></h2>
+    {% if tables.is_empty() %}
+    <p class="muted">No tables.</p>
+    {% else %}
+    {% call barlist(tables) %}
+    {% endif %}
+  </div>
+
+  <div class="panel">
+    <h2>Links <span class="muted">{{ links_live }} live · {{ links_soft_deleted }} soft-deleted</span></h2>
+    {% if !by_relation.is_empty() %}
+    <h3>By relation</h3>
+    {% call barlist(by_relation) %}
+    {% endif %}
+    {% if !by_kind.is_empty() %}
+    <h3>By target kind</h3>
+    {% call barlist(by_kind) %}
+    {% endif %}
+    {% if !by_source.is_empty() %}
+    <h3>By source</h3>
+    {% call barlist(by_source) %}
+    {% endif %}
+    {% if by_relation.is_empty() && by_kind.is_empty() && by_source.is_empty() %}
+    <p class="muted">No links yet.</p>
+    {% endif %}
+  </div>
+
+  <div class="panel">
+    <h2>Embeddings by model</h2>
+    {% if embeddings.is_empty() %}
+    <p class="muted">No embeddings yet.</p>
+    {% else %}
+    {% call barlist(embeddings) %}
+    {% endif %}
+  </div>
+
+</section>
+
+{% endblock %}
