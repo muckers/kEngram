@@ -11,10 +11,10 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use kengram_core::{LinkDirection, RelationKind, Scope, ThoughtId};
 use kengram_mcp::{
-    GetRelatedThoughtsRequest, ListScopesRequest, RecentRequest, SearchRequest,
-    get_related_thoughts, get_thought, get_thought_response_json, list_scopes,
-    list_scopes_response_json, recent_response_json, recent_thoughts,
-    related_thoughts_response_json, search_response_json, search_thoughts,
+    CorpusStatsRequest, GetRelatedThoughtsRequest, ListScopesRequest, RecentRequest, SearchRequest,
+    corpus_stats, corpus_stats_response_json, get_related_thoughts, get_thought,
+    get_thought_response_json, list_scopes, list_scopes_response_json, recent_response_json,
+    recent_thoughts, related_thoughts_response_json, search_response_json, search_thoughts,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -129,6 +129,28 @@ pub(crate) async fn scopes(
 ) -> Result<Json<Value>, ApiError> {
     let resp = list_scopes(&st.pool, ListScopesRequest { prefix: p.prefix }).await?;
     Ok(Json(list_scopes_response_json(&resp)))
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct StatsParams {
+    /// Filters only the scopes section; corpus-global counts stay global.
+    scope_prefix: Option<String>,
+}
+
+/// `GET /api/stats` — corpus + storage telemetry (raw integer byte counts).
+/// Same data as the CLI `kengram stats`; humanization is a client concern.
+pub(crate) async fn stats(
+    State(st): State<WebState>,
+    Query(p): Query<StatsParams>,
+) -> Result<Json<Value>, ApiError> {
+    let resp = corpus_stats(
+        &st.pool,
+        CorpusStatsRequest {
+            scope_prefix: p.scope_prefix,
+        },
+    )
+    .await?;
+    Ok(Json(corpus_stats_response_json(&resp)))
 }
 
 /// `GET /api/thoughts/{id}` — a single thought with provenance.
