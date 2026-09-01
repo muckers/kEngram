@@ -1,0 +1,57 @@
+[Unit]
+Description=kEngram nightly GPU tagger window (00:00-06:00)
+Documentation=https://github.com/muckers/kengram/blob/main/docs/linux-autostart.md
+After=kengram-stack.service kengram-migrate.service
+Wants=kengram-stack.service
+
+[Service]
+Type=exec
+WorkingDirectory=@@KENGRAM_REPO@@
+Environment=RUST_LOG=@@RUST_LOG@@
+# Re-enables the tag drainer and points it at a GPU-resident model + a
+# GPU-scale timeout for the nightly window, overriding whatever [tagger] in
+# kengram.toml is set to. Pair with an embed-only kengram-worker.service (see
+# docs/linux-autostart.md, "Optional: nightly GPU tagger window") — never run
+# this alongside a kengram-worker.service that also has tagging enabled; the
+# tag queue has no row locking, so two concurrent tag drainers can
+# double-process the same thought.
+Environment=KENGRAM_TAGGER__PROVIDER=openai-compatible
+Environment=KENGRAM_TAGGER__ENDPOINT=http://localhost:11434/v1
+Environment=KENGRAM_TAGGER__MODEL_NAME=@@NIGHT_TAGGER_MODEL_NAME@@
+Environment=KENGRAM_TAGGER__MODEL_ID=@@NIGHT_TAGGER_MODEL_ID@@
+Environment=KENGRAM_TAGGER__TIMEOUT_SECONDS=@@NIGHT_TAGGER_TIMEOUT_SECONDS@@
+# Confirmed live (2026-08-31 rollout): Ollama appears to dedupe/route loaded
+# runners by underlying weight-blob digest, not by the full tag+parameters
+# identity — a request for THIS model can get silently served by an
+# already-resident runner for a DIFFERENT tag sharing the same blobs (e.g.
+# the day tagger's CPU-pinned variant), at THAT runner's placement, with no
+# error. `ollama stop` on one name doesn't instantly free things either — a
+# runner mid-"Stopping..." keeps accepting new work until it actually
+# drains. So: stop both the coding LLM and the day tagger's own CPU-tagged
+# model, then wait (bounded) for `ollama ps` to show nothing loaded before
+# starting the tag drainer — a genuinely clean slate, not just a stop
+# request. Best-effort (leading `-`): never blocks the window from starting
+# even if this fails (e.g. `ollama` unreachable, nothing was loaded).
+# `OLLAMA_KEEP_ALIVE` is normally set to a bounded TTL (not `Forever`) on
+# this deployment as a complementary safety net — see docs/linux-autostart.md
+# — but this explicit stop-and-wait is the deterministic guarantee for the
+# exact midnight boundary regardless of TTL timing.
+ExecStartPre=-/bin/sh -c '@@OLLAMA_BIN@@ stop "@@NIGHT_TAGGER_CODER_MODEL@@" 2>/dev/null; @@OLLAMA_BIN@@ stop "@@DAY_TAGGER_MODEL_NAME@@" 2>/dev/null; i=0; while [ "$i" -lt 30 ] && @@OLLAMA_BIN@@ ps | tail -n +2 | grep -q .; do sleep 1; i=$((i + 1)); done; exit 0'
+ExecStart=@@KENGRAM_BIN@@ worker
+# System variant: ExecStart=@@KENGRAM_BIN@@ --config @@KENGRAM_CONFIG@@ worker
+#   + User=/Group=docker/Environment=HOME= as above
+# Hard-stops 6h after actual start, regardless of the timer's own drift —
+# this, not the timer, is what enforces the end of the window.
+RuntimeMaxSec=21600
+# Maps systemd's stop (RuntimeMaxSec expiry or a manual `systemctl stop`)
+# onto the app's existing ctrl_c()-driven graceful shutdown (CancellationToken
+# + 30s join deadline in run_worker) instead of an unhandled SIGTERM.
+KillSignal=SIGINT
+# Small margin above the app's own 30s shutdown deadline before systemd
+# would escalate to SIGKILL.
+TimeoutStopSec=45s
+# This unit's only trigger should be kengram-tagger-night.timer.
+Restart=no
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,15 @@
+[Unit]
+Description=Start the nightly GPU tagger window at midnight
+Documentation=https://github.com/muckers/kengram/blob/main/docs/linux-autostart.md
+
+[Timer]
+OnCalendar=*-*-* 00:00:00
+# Deliberately NOT Persistent=true: if the box is off or rebooting at
+# midnight, a catch-up run could fire hours later — e.g. mid-morning, while
+# the coder is active — exactly the contention this pairing exists to avoid.
+# A missed night just means that night's tagging is skipped; tags are
+# advisory and can lag without affecting search.
+Persistent=false
+
+[Install]
+WantedBy=timers.target

@@ -10,6 +10,11 @@ WorkingDirectory=@@KENGRAM_REPO@@
 Environment=RUST_LOG=@@RUST_LOG@@
 # Honors [tagger]/[database] from the config. To force embed-only:
 #   Environment=KENGRAM_TAGGER__PROVIDER=
+# Pair embed-only here with kengram-tagger-night.service/.timer to keep
+# embeddings (and thus vector search) live 24/7 while tagging runs only in
+# a nightly GPU window — e.g. on a shared-GPU host where a coding LLM
+# competes with the tagger for VRAM. See docs/linux-autostart.md, "Optional:
+# nightly GPU tagger window".
 ExecStart=@@KENGRAM_BIN@@ worker
 # System variant: ExecStart=@@KENGRAM_BIN@@ --config @@KENGRAM_CONFIG@@ worker
 #   + User=/Group=docker/Environment=HOME= as above

@@ -253,6 +253,102 @@ daemon is up well before your lingered user manager, so this is a non-issue. If
 you need a hard guarantee, use the system-service variant, which can declare
 `After=docker.service` / `Requires=docker.service`.
 
+## Optional: nightly GPU tagger window (shared-GPU coding hosts)
+
+If your tagger LLM shares a GPU-backed Ollama (or other OpenAI-compatible)
+daemon with a coding-agent LLM — one host, one or two GPUs, no room for both
+models resident at once — running the tagger GPU-resident all day causes
+VRAM contention with the coder. Since kEngram's primary search path is
+vector search, not tags, tags can lag a day without hurting search: this
+pattern splits tagging into two processes so it only runs GPU-resident
+overnight, when the coder is idle.
+
+- An **always-on, embed-only** `kengram-worker.service`: tagging forced off
+  via `KENGRAM_TAGGER__PROVIDER=`, so only the embed drainer runs. Vector
+  search stays fresh 24/7; the tag drainer never contends with the coder.
+- A **nightly** `kengram-tagger-night.service`, started at 00:00 by
+  `kengram-tagger-night.timer` and hard-stopped after 6h via the service's
+  own `RuntimeMaxSec`, with tagging re-enabled and pointed at the
+  GPU-resident model via `KENGRAM_TAGGER__*` env overrides.
+
+**Important — Ollama can silently serve your GPU-tagged model through an
+already-resident runner for a *different* tag.** Confirmed live during
+rollout (2026-08-31): with a `Forever`-pinned coder resident, real tag calls
+against a nominally-GPU-configured model ran at CPU-only speed (~3 tok/s)
+with zero VRAM change — not because Ollama tried and failed to fit the model
+on GPU, but because it appears to dedupe/route loaded runners by underlying
+weight-blob digest rather than by the full tag+parameters identity, so the
+request got served by whatever runner (the day tagger's CPU-pinned variant,
+in this case) was already loaded for those same blobs, at *that* runner's
+placement, with no error. `ollama stop` doesn't fix this instantly either —
+a runner mid-`Stopping...` keeps accepting new work until it actually
+drains. `kengram-tagger-night.service`'s `ExecStartPre` stops both the coder
+*and* the day tagger's own model, then waits (bounded, up to 30s) for
+`ollama ps` to show nothing loaded before starting the tag drainer — a
+confirmed-clean slate, not just a stop request. Setting `OLLAMA_KEEP_ALIVE`
+to a bounded TTL (rather than `Forever`) on Ollama's own systemd unit is a
+good complementary safety net — an accidentally-reloaded model self-evicts
+instead of sitting resident indefinitely — but doesn't replace this explicit
+stop-and-wait for the exact midnight boundary. See the placeholders below.
+
+This does **not** add scheduling logic to kEngram itself — see `DESIGN.md`
+§11, "Why two drainers, no cron": the tag drainer still runs on a plain
+tick, unconditionally, exactly as designed. The time-of-day gating lives
+entirely here, in the ops layer, as two independently-schedulable OS
+processes — the same mechanism `serve` and `worker` already use.
+
+**Never run two tag drainers concurrently against the same database.**
+Unlike the embed queue (`FOR UPDATE SKIP LOCKED`, safe for concurrent
+consumers), the tag queue's fetch has no row locking — two simultaneous
+tag drainers can both claim and tag the same thought, wasting duplicate LLM
+calls. The embed-only override on the day unit is what guarantees only one
+tag drainer is ever live; don't skip it.
+
+### Setup
+
+1. On your installed `kengram-worker.service`, uncomment the embed-only
+   override so the always-on worker never runs the tag drainer:
+   ```
+   Environment=KENGRAM_TAGGER__PROVIDER=
+   ```
+2. Install `kengram-tagger-night.service` and `kengram-tagger-night.timer`
+   from `contrib/systemd/`, substituting the usual placeholders plus
+   `@@NIGHT_TAGGER_MODEL_NAME@@` / `@@NIGHT_TAGGER_MODEL_ID@@` /
+   `@@NIGHT_TAGGER_TIMEOUT_SECONDS@@` for your GPU-resident model (size the
+   timeout off your own GPU tagger latency, not the CPU config's timeout —
+   they differ by an order of magnitude), plus `@@OLLAMA_BIN@@` /
+   `@@NIGHT_TAGGER_CODER_MODEL@@` / `@@DAY_TAGGER_MODEL_NAME@@` naming
+   whatever coding LLM normally holds the GPU and the day tagger's own
+   model, so `ExecStartPre` can stop both and confirm a clean slate before
+   the tagger loads.
+3. Apply both changes:
+   ```bash
+   systemctl --user daemon-reload
+   systemctl --user restart kengram-worker.service
+   systemctl --user enable --now kengram-tagger-night.timer
+   ```
+
+### Verifying
+
+```bash
+# Day unit: startup line must read tagger=disabled, and only embed drain
+# ticks should ever appear in its journal.
+journalctl --user -u kengram-worker | grep "kengram worker started"
+
+# Manual smoke test of the night unit, any time of day:
+systemctl --user start kengram-tagger-night.service
+journalctl --user -u kengram-tagger-night -f
+# Look for: kengram worker started ... tagger=enabled (<your model_id>) ...
+# and a "tag drain tick" line landing within your configured timeout.
+systemctl --user stop kengram-tagger-night.service
+# Look for "worker tasks exited cleanly" (not "forcing exit") — confirms
+# KillSignal=SIGINT is reaching the app's graceful-shutdown path.
+
+# Next morning, confirm the real window ran end-to-end:
+journalctl --user -u kengram-tagger-night --since "00:00" --until "06:30"
+systemctl --user list-timers kengram-tagger-night.timer
+```
+
 ## Stopping and disabling
 
 ```bash
