@@ -1,0 +1,46 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT old_scope, new_scope, actor, reason, (changed_at IS NOT NULL) AS \"changed_at!\"\n               FROM scope_changes WHERE thought_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "old_scope",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "new_scope",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "actor",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "reason",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "changed_at!",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      null
+    ]
+  },
+  "hash": "fb9cd15ca132cdc1b3248f2db3a39c22f338ef01d4ba2390dec724aa2c3cb6a5"
+}

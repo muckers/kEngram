@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO scope_changes (thought_id, old_scope, new_scope, actor)\n               VALUES ($1, 'a', 'b', 'manual')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "dbd2274948f35ebc1173de951df2e62830e20800a2593e97018f8ab68cf5bd85"
+}

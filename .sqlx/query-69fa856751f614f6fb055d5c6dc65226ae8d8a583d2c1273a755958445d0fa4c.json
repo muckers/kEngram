@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO scope_changes (thought_id, old_scope, new_scope, actor, reason)\n               VALUES ($1, 'global', 'work.tcgplayer', 'manual', 'taxonomy drift')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "69fa856751f614f6fb055d5c6dc65226ae8d8a583d2c1273a755958445d0fa4c"
+}

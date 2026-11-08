@@ -3631,4 +3631,55 @@ mod tests {
         assert!(prov.retracted_at.is_some());
         assert_eq!(prov.retracted_reason.as_deref(), Some("operator decision"));
     }
+
+    // -- M7.2: scope_changes audit table ------------------------------------
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn scope_changes_roundtrip_and_migration_audit_seed(pool: PgPool) {
+        let id = insert_test_thought(&pool, "misfiled", "global").await;
+        sqlx::query!(
+            r#"INSERT INTO scope_changes (thought_id, old_scope, new_scope, actor, reason)
+               VALUES ($1, 'global', 'work.tcgplayer', 'manual', 'taxonomy drift')"#,
+            id.into_uuid()
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let row = sqlx::query!(
+            r#"SELECT old_scope, new_scope, actor, reason, (changed_at IS NOT NULL) AS "changed_at!"
+               FROM scope_changes WHERE thought_id = $1"#,
+            id.into_uuid()
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.old_scope, "global");
+        assert_eq!(row.new_scope, "work.tcgplayer");
+        assert_eq!(row.actor, "manual");
+        assert_eq!(row.reason.as_deref(), Some("taxonomy drift"));
+
+        // House rule (M5.2): 0012 seeds its migration_audit row.
+        let seeded = sqlx::query!(
+            r#"SELECT rows_touched FROM migration_audit WHERE migration = '0012_thought_rescoping'"#
+        )
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        assert_eq!(seeded.map(|r| r.rows_touched), Some(0));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn scope_changes_requires_existing_thought(pool: PgPool) {
+        // FK: an audit row for a thought that doesn't exist is rejected.
+        let bogus = uuid::Uuid::new_v4();
+        let result = sqlx::query!(
+            r#"INSERT INTO scope_changes (thought_id, old_scope, new_scope, actor)
+               VALUES ($1, 'a', 'b', 'manual')"#,
+            bogus
+        )
+        .execute(&pool)
+        .await;
+        assert!(result.is_err());
+    }
 }

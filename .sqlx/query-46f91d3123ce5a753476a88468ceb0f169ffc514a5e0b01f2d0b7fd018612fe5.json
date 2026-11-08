@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT rows_touched FROM migration_audit WHERE migration = '0012_thought_rescoping'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "rows_touched",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "46f91d3123ce5a753476a88468ceb0f169ffc514a5e0b01f2d0b7fd018612fe5"
+}
