@@ -1592,7 +1592,7 @@ pub async fn rescope_thought(
 }
 
 /// One row of a subtree rename: what moved, and where from/to.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RescopeRow {
     pub thought_id: ThoughtId,
     pub old_scope: String,
