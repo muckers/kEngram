@@ -734,7 +734,17 @@ fn map_rescope_error(err: RescopeError) -> String {
         RescopeError::SelfNesting { from, to } => format!(
             "rename target {to:?} equals the source scope or sits inside its subtree ({from:?}); bulk renames are CLI-only"
         ),
-        RescopeError::TrailingDot(s) => format!("scope {s:?} must not end with '.'"),
+        RescopeError::EmptyScopeSegment(s) => format!(
+            "scope {s:?} has an empty dotted segment — no part between/around '.' may be empty"
+        ),
+        // Today this tool only reaches the single-thought path and the
+        // orchestrator runs every guard first, so the storage-level
+        // defense-in-depth variants (SelfNestingRename, EmptyScopeSegment,
+        // SubtreeMappingMismatch) can't arrive here. **If subtree rename
+        // is ever exposed over MCP**, add explicit arms for them before
+        // wiring it — otherwise a rejected rename would wear this generic
+        // "internal database error" mask. (Operator review note,
+        // 2026-11-08.)
         RescopeError::Storage(e) => {
             tracing::error!(error = %e, "rescope_thought storage error");
             "internal database error".to_string()
@@ -1602,6 +1612,19 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("reason is required"));
+
+        // Empty dotted segment reaches the tool through the orchestrator
+        // guard — a clean message, not the generic Storage-arm mask.
+        let err = s
+            .rescope_thought(Parameters(RescopeThoughtArgs {
+                thought_id: ThoughtId::new().to_string(),
+                scope: "work..x".into(),
+                reason: "x".into(),
+                actor: None,
+            }))
+            .await
+            .unwrap_err();
+        assert!(err.contains("empty dotted segment"));
     }
 
     #[sqlx::test(migrations = "../../migrations")]

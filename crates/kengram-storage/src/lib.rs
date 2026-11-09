@@ -41,11 +41,13 @@ pub enum StorageError {
     InvalidRescopeTarget(ScopeError),
 
     /// Defense-in-depth guard (the orchestrator rejects these with a
-    /// friendlier message first): `Scope` itself allows trailing dots, but
-    /// the rescope path treats a trailing dot as a typo — it makes the
-    /// subtree prefix ambiguous.
-    #[error("scope {0:?} must not end with '.'")]
-    TrailingDotScope(String),
+    /// friendlier message first): `Scope` itself only checks non-empty +
+    /// length, so `work..x`, `.work`, and `work.` all pass it. The rescope
+    /// path rejects any **empty dotted segment** — the same typo class as a
+    /// trailing dot, and each makes the subtree prefix ambiguous
+    /// (`work.` names the same set as `work`; `work..x` has no real bucket).
+    #[error("scope {0:?} has an empty dotted segment — no part between/around '.' may be empty")]
+    EmptyScopeSegment(String),
 
     /// Defense-in-depth guard mirroring the orchestrator's: a subtree
     /// rename whose target is the source or inside its own subtree
@@ -1536,6 +1538,18 @@ fn escape_like_prefix(s: &str) -> String {
         .replace('_', "\\_")
 }
 
+/// True when any dotted segment of `s` is empty: `work..x` (middle),
+/// `.work` (leading), or `work.` (trailing). `Scope::new` doesn't catch
+/// these — it only checks non-empty + length — but a scope is a
+/// dotted-path key and an empty segment makes the subtree prefix
+/// ambiguous (`work.` would name the same set as `work`), so the rescope
+/// write engine rejects it regardless of caller. Shared with the
+/// orchestrator (`kengram_mcp::rescope`) so the rule can't drift between
+/// the two guard sites.
+pub fn has_empty_dotted_segment(s: &str) -> bool {
+    s.split('.').any(str::is_empty)
+}
+
 /// Result of `rescope_thought` (single-thought form). Discriminator on
 /// `previous_scope`: `None` = no row with that id at all; `Some(old)` with
 /// `changed == false` = already at target (no-op — nothing was written).
@@ -1584,8 +1598,8 @@ pub async fn rescope_thought(
     tagger_model_id: Option<&str>,
     dry_run: bool,
 ) -> Result<RescopeOutcome, StorageError> {
-    if new_scope.as_str().ends_with('.') {
-        return Err(StorageError::TrailingDotScope(
+    if has_empty_dotted_segment(new_scope.as_str()) {
+        return Err(StorageError::EmptyScopeSegment(
             new_scope.as_str().to_string(),
         ));
     }
@@ -1723,12 +1737,15 @@ pub async fn rename_scope_subtree(
     tagger_model_id: Option<&str>,
     dry_run: bool,
 ) -> Result<SubtreeRescopeOutcome, StorageError> {
-    if from.ends_with('.') || to.as_str().ends_with('.') {
-        return Err(StorageError::TrailingDotScope(if from.ends_with('.') {
-            from.to_string()
-        } else {
-            to.as_str().to_string()
-        }));
+    let bad = if has_empty_dotted_segment(from) {
+        Some(from)
+    } else if has_empty_dotted_segment(to.as_str()) {
+        Some(to.as_str())
+    } else {
+        None
+    };
+    if let Some(s) = bad {
+        return Err(StorageError::EmptyScopeSegment(s.to_string()));
     }
     if to.as_str() == from || to.as_str().starts_with(&format!("{from}.")) {
         return Err(StorageError::SelfNestingRename {
@@ -4156,25 +4173,33 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../../migrations")]
-    async fn rescope_single_rejects_trailing_dot_target(pool: PgPool) {
+    async fn rescope_single_rejects_empty_segment_target(pool: PgPool) {
         let id = insert_test_thought(&pool, "one", "global").await;
-        let err = rescope_thought(
-            &pool,
-            id,
-            &Scope::new("work.").unwrap(),
-            "manual",
-            "x",
-            Some("fake/v1"),
-            false,
-        )
-        .await
-        .unwrap_err();
-        assert!(matches!(err, StorageError::TrailingDotScope(s) if s == "work."));
+        // Trailing, middle, and leading empty segments — the same typo
+        // class; `Scope::new` lets all three through, the write engine
+        // doesn't.
+        for bad in ["work.", "work..x", ".work"] {
+            let err = rescope_thought(
+                &pool,
+                id,
+                &Scope::new(bad).unwrap(),
+                "manual",
+                "x",
+                Some("fake/v1"),
+                false,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(err, StorageError::EmptyScopeSegment(s) if s == bad),
+                "target {bad:?} must be rejected"
+            );
+        }
         assert_eq!(fetch_scope(&pool, id).await, "global");
     }
 
     #[sqlx::test(migrations = "../../migrations")]
-    async fn rename_subtree_guards_reject_nesting_and_trailing_dots(pool: PgPool) {
+    async fn rename_subtree_guards_reject_nesting_and_empty_segments(pool: PgPool) {
         // `rename_scope_subtree` is `pub` — the guard has to be enforced
         // at the write engine, not only in the MCP orchestrator, or a
         // future caller can bring the infinite-nesting bug back.
@@ -4196,7 +4221,15 @@ mod tests {
                 "`work -> {to}` must be rejected"
             );
         }
-        for (from, to) in [("work.", "play"), ("work", "play.")] {
+        // Empty segment on either side, in any position.
+        for (from, to) in [
+            ("work.", "play"),
+            ("work", "play."),
+            ("work..x", "play"),
+            ("work", "play..x"),
+            (".work", "play"),
+            ("work", ".play"),
+        ] {
             let err = rename_scope_subtree(
                 &pool,
                 from,
@@ -4209,7 +4242,7 @@ mod tests {
             .await
             .unwrap_err();
             assert!(
-                matches!(err, StorageError::TrailingDotScope(_)),
+                matches!(err, StorageError::EmptyScopeSegment(_)),
                 "`{from} -> {to}` must be rejected"
             );
         }

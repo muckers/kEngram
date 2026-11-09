@@ -97,12 +97,15 @@ pub enum RescopeError {
     )]
     SelfNesting { from: String, to: String },
 
-    /// A `from`/`to` ending in `.` is a typo, and worse, makes the
+    /// An empty dotted segment — `work.` (trailing), `work..x` (middle),
+    /// or `.work` (leading) — is a typo, and worse, makes the
     /// dotted-boundary subtree prefix ambiguous (`work.` would name the
-    /// same set as `work`). Rejected up front; `kengram_storage` refuses
-    /// them again as defense-in-depth.
-    #[error("scope {0:?} must not end with '.'")]
-    TrailingDot(String),
+    /// same set as `work`). `Scope::new` allows all three; the rescope
+    /// paths reject them up front. `kengram_storage` refuses them again as
+    /// defense-in-depth. The predicate is shared:
+    /// `kengram_storage::has_empty_dotted_segment`.
+    #[error("scope {0:?} has an empty dotted segment — no part between/around '.' may be empty")]
+    EmptyScopeSegment(String),
 
     #[error("storage error: {0}")]
     Storage(#[from] kengram_storage::StorageError),
@@ -136,8 +139,8 @@ pub async fn rescope_thought(
 ) -> Result<RescopeThoughtResponse, RescopeError> {
     let reason = guard_reason(&request.reason)?;
     let target = Scope::new(request.scope)?;
-    if target.as_str().ends_with('.') {
-        return Err(RescopeError::TrailingDot(target.as_str().to_string()));
+    if kengram_storage::has_empty_dotted_segment(target.as_str()) {
+        return Err(RescopeError::EmptyScopeSegment(target.as_str().to_string()));
     }
     let actor = resolve_actor(request.actor.as_deref());
 
@@ -170,10 +173,11 @@ pub async fn rescope_thought(
 /// surface delta). Guards run before any storage call: a `to` equal to
 /// or inside `from`'s subtree would re-match its own output on every
 /// re-run and nest forever (`work.archive.archive.x`), fresh audit rows
-/// per pass; a trailing-dot `from`/`to` makes the dotted prefix
-/// ambiguous. `kengram_storage::rename_scope_subtree` re-checks both —
-/// the orchestrator guard is for the message, the storage guard is for
-/// any future caller.
+/// per pass; an empty dotted segment (`from`/`to` with a trailing, middle,
+/// or leading empty part) makes the dotted prefix ambiguous.
+/// `kengram_storage::rename_scope_subtree` re-checks both — the
+/// orchestrator guard is for the message, the storage guard is for any
+/// future caller.
 pub async fn rename_scope_subtree(
     pool: &PgPool,
     tagger_model_id: Option<&str>,
@@ -182,16 +186,19 @@ pub async fn rename_scope_subtree(
     let reason = guard_reason(&request.reason)?;
     Scope::new(&request.from)?;
     let target = Scope::new(&request.to)?;
-    if request.from.ends_with('.') || target.as_str().ends_with('.') {
-        return Err(RescopeError::TrailingDot(if request.from.ends_with('.') {
-            request.from.clone()
-        } else {
-            request.to.clone()
-        }));
+    let bad = if kengram_storage::has_empty_dotted_segment(&request.from) {
+        Some(request.from.clone())
+    } else if kengram_storage::has_empty_dotted_segment(target.as_str()) {
+        Some(request.to.clone())
+    } else {
+        None
+    };
+    if let Some(scope) = bad {
+        return Err(RescopeError::EmptyScopeSegment(scope));
     }
     let actor = resolve_actor(request.actor.as_deref());
 
-    // No trailing-dot trimming here: trailing dots are rejected above, so
+    // No dot trimming here: empty dotted segments are rejected above, so
     // the raw `{from}.` prefix is the exact dotted-boundary prefix.
     let inside_subtree =
         request.to == request.from || request.to.starts_with(&format!("{}.", request.from));
@@ -461,7 +468,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(err, RescopeError::TrailingDot(_)));
+        assert!(matches!(err, RescopeError::EmptyScopeSegment(_)));
 
         // A guard-passing dry run plans accurately and writes nothing —
         // including the requeue count, which the old CLI printed as a
@@ -489,17 +496,28 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../../migrations")]
-    async fn trailing_dot_rejected_in_both_forms(pool: PgPool) {
-        // `Scope::new` accepts trailing dots; the rescope paths don't —
-        // `work.` would name the same set as `work`, making the subtree
-        // prefix ambiguous.
+    async fn empty_segment_rejected_in_both_forms(pool: PgPool) {
+        // `Scope::new` accepts empty dotted segments (`work.`, `work..x`,
+        // `.work`); the rescope paths don't — `work.` would name the same
+        // set as `work`, making the subtree prefix ambiguous, and the
+        // others have no real bucket. Same typo class, all positions.
         let id = cap(&pool, "one", "work.foo").await;
-        let err = rescope_thought(&pool, Some(TEST_TAGGER_ID), req(id, "work.", "x", None))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, RescopeError::TrailingDot(_)));
+        for bad in ["work.", "work..x", ".work"] {
+            let err = rescope_thought(&pool, Some(TEST_TAGGER_ID), req(id, bad, "x", None))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, RescopeError::EmptyScopeSegment(s) if s == bad),
+                "single target {bad:?} must be rejected"
+            );
+        }
 
-        for (from, to) in [("work.", "play"), ("work", "play.")] {
+        for (from, to) in [
+            ("work.", "play"),
+            ("work", "play."),
+            ("work..x", "play"),
+            ("work", "play..x"),
+        ] {
             let err = rename_scope_subtree(
                 &pool,
                 Some(TEST_TAGGER_ID),
@@ -514,7 +532,7 @@ mod tests {
             .await
             .unwrap_err();
             assert!(
-                matches!(err, RescopeError::TrailingDot(_)),
+                matches!(err, RescopeError::EmptyScopeSegment(_)),
                 "`{from} -> {to}` must be rejected"
             );
         }
