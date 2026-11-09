@@ -16,6 +16,7 @@ pub mod finalize;
 pub mod link;
 mod normalize;
 pub mod relate;
+pub mod rescope;
 pub mod retract;
 pub mod search;
 pub mod server;
@@ -36,6 +37,10 @@ pub use relate::{
     GetRelatedThoughtsRequest, GetRelatedThoughtsResponse, RELATED_CONTENT_PREVIEW_LEN,
     RelateError, RelatedTargetHit, get_related_thoughts, related_thoughts_response_json,
 };
+pub use rescope::{
+    DEFAULT_ACTOR, RenameScopeRequest, RenameScopeResponse, RescopeError, RescopeThoughtRequest,
+    RescopeThoughtResponse, rename_scope_subtree, rescope_thought,
+};
 pub use retract::{RetractError, RetractThoughtRequest, RetractThoughtResponse, retract_thought};
 pub use search::{
     DEFAULT_SEARCH_LIMIT, DEFAULT_TOP_K_PER_LEG, GetThoughtResponse, ListScopesRequest,
@@ -46,7 +51,8 @@ pub use search::{
 };
 pub use server::{
     CaptureArgs, GetRelatedThoughtsArgs, GetThoughtArgs, KengramServer, LinkThoughtsArgs,
-    ListScopesArgs, RecentThoughtsArgs, RetractThoughtArgs, SearchThoughtsArgs, UnlinkThoughtsArgs,
+    ListScopesArgs, RecentThoughtsArgs, RescopeThoughtArgs, RetractThoughtArgs, SearchThoughtsArgs,
+    UnlinkThoughtsArgs,
 };
 pub use stats::{
     CorpusStatsRequest, CorpusStatsResponse, corpus_stats, corpus_stats_response_json,

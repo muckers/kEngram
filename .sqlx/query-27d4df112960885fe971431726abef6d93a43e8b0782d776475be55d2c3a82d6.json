@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT old_scope, new_scope, actor, reason FROM scope_changes WHERE thought_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "old_scope",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "new_scope",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "actor",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "reason",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "27d4df112960885fe971431726abef6d93a43e8b0782d776475be55d2c3a82d6"
+}

@@ -93,6 +93,9 @@ impl ExtractedTarget {
 /// they can either implement this trait directly (in-process, Rust) or
 /// run as a sidecar speaking the `kengram-tagger-protocol` wire shape (any
 /// language, over HTTP).
+// See Embedder (embedder.rs): async-trait's bare `#[must_use]` + clippy 1.99's
+// `double_must_use`.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait Tagger: Send + Sync {
     /// Stable model identifier — written into `thoughts.tags_extractor_model`

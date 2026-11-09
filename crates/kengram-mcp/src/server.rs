@@ -31,6 +31,7 @@ use std::sync::Arc;
 use crate::capture::{self, CaptureError, CaptureRequest, MAX_CONTENT_LEN};
 use crate::link::{self, LinkError, LinkThoughtsRequest, MAX_LINK_NOTE_LEN};
 use crate::relate::{self, GetRelatedThoughtsRequest, RelateError, related_thoughts_response_json};
+use crate::rescope::{self, RescopeError, RescopeThoughtRequest};
 use crate::retract::{self, RetractError, RetractThoughtRequest};
 use crate::search::{
     self, ListScopesRequest, ReadError, RecentRequest, SearchRequest, get_thought_response_json,
@@ -147,6 +148,27 @@ pub struct RetractThoughtArgs {
         description = "Optional free-text reason for the retraction (e.g. 'wrong claim — see thought <new id> for correction'). Stored on thoughts.retracted_reason for audit; max 1000 chars."
     )]
     pub reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RescopeThoughtArgs {
+    #[schemars(description = "Thought ID (UUID string) to re-file.")]
+    pub thought_id: String,
+
+    #[schemars(
+        description = "New scope label (non-empty, max 256 chars; dotted convention like 'work.tcgplayer'). The thought's content is untouched — only its filing label moves."
+    )]
+    pub scope: String,
+
+    #[schemars(
+        description = "REQUIRED one-sentence reason for the re-filing (e.g. 'was filed under the pre-split work taxonomy; belongs under work.tcgplayer'). Appended verbatim to the append-only scope_changes audit row. Blank is rejected."
+    )]
+    pub reason: String,
+
+    #[schemars(
+        description = "Optional free-text actor identifier, following the capture `source` convention — name yourself as the calling agent (e.g. 'agent:claude-code'). Defaults to 'mcp'. The audit trail names WHICH agent moved the thought, so a bare transport label isn't enough."
+    )]
+    pub actor: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -458,6 +480,41 @@ impl KengramServer {
     }
 
     #[tool(
+        description = "Re-file an existing thought under a new scope (M7.2) — the only sanctioned way to change an existing thought's filing label. Content is never touched. Use for taxonomy drift (the thought is right; its scope bucket is wrong or stale — e.g. a `global` default an agent captured, or a label from a since-split taxonomy); correct filing at capture time stays preferred. `reason` is REQUIRED and lands, with your `actor`, in the append-only scope_changes audit trail the operator reads. Idempotent: already at target → `changed: false`, nothing written; unknown id → clean error. Retracted thoughts can be re-filed (filing hygiene; retrieval keeps skipping them). The moved thought's tag job is re-enqueued (live thoughts) so its tags re-derive under the new scope's vocabulary. Bulk subtree renames are CLI-only (`kengram rescope --scope <old> --to <new>`) — taxonomy maintenance is an operator workflow, not an agent one."
+    )]
+    async fn rescope_thought(
+        &self,
+        Parameters(args): Parameters<RescopeThoughtArgs>,
+    ) -> Result<String, String> {
+        let thought_id = ThoughtId::from_str(&args.thought_id)
+            .map_err(|e| format!("invalid thought_id: {e}"))?;
+
+        let resp = rescope::rescope_thought(
+            &self.pool,
+            self.tagger_model_id.as_deref(),
+            RescopeThoughtRequest {
+                thought_id,
+                scope: args.scope,
+                reason: args.reason,
+                actor: args.actor,
+                // No dry-run preview over MCP — `--dry-run` is a CLI
+                // operator affordance (m7.2 contract).
+                dry_run: false,
+            },
+        )
+        .await
+        .map_err(map_rescope_error)?;
+
+        let body = serde_json::json!({
+            "thought_id": resp.thought_id.to_string(),
+            "previous_scope": resp.previous_scope,
+            "new_scope": resp.new_scope,
+            "changed": resp.changed,
+        });
+        serde_json::to_string(&body).map_err(|e| format!("response serialization error: {e}"))
+    }
+
+    #[tool(
         description = "Create a relation from a thought to a polymorphic target in the kengram graph layer. Asserts an edge with one of seven closed-vocabulary relations: replaces, requires, references, supports, belongs_to, decided_by, refines. The target side can be: another thought (`to_thought_id`), a free-text entity name (`to_entity` — for experiments, projects, sessions, abstract concepts), a person name (`to_person` — for attribution like `decided_by`), or a URL (`to_url` — for external resources). Supply exactly one of the four target fields. Idempotent on the (from, relation, to_kind, to_value) quadruple — re-asserting the same live edge returns is_new=false and the existing link_id. If the edge was previously soft-deleted via `unlink_thoughts`, a fresh live row is inserted and is_new=true. Validates that thought endpoints exist (from + to_thought_id), that from != to_thought_id when targeting a thought, that to_url starts with http:// or https://, and that to_entity/to_person aren't empty; returns clear error strings otherwise."
     )]
     async fn link_thoughts(
@@ -664,6 +721,37 @@ fn map_retract_error(err: RetractError) -> String {
     }
 }
 
+fn map_rescope_error(err: RescopeError) -> String {
+    match err {
+        RescopeError::NotFound(id) => format!("thought not found: {id}"),
+        RescopeError::InvalidScope(e) => format!("invalid scope: {e}"),
+        RescopeError::MissingReason => {
+            "reason is required — supply one sentence on why the filing changed".to_string()
+        }
+        // Unreachable through this tool (single-thought form only — the
+        // nesting guard belongs to the CLI subtree rename), but the
+        // compiler keeps the mapping honest if that surface ever moves.
+        RescopeError::SelfNesting { from, to } => format!(
+            "rename target {to:?} equals the source scope or sits inside its subtree ({from:?}); bulk renames are CLI-only"
+        ),
+        RescopeError::EmptyScopeSegment(s) => format!(
+            "scope {s:?} has an empty dotted segment — no part between/around '.' may be empty"
+        ),
+        // Today this tool only reaches the single-thought path and the
+        // orchestrator runs every guard first, so the storage-level
+        // defense-in-depth variants (SelfNestingRename, EmptyScopeSegment,
+        // SubtreeMappingMismatch) can't arrive here. **If subtree rename
+        // is ever exposed over MCP**, add explicit arms for them before
+        // wiring it — otherwise a rejected rename would wear this generic
+        // "internal database error" mask. (Operator review note,
+        // 2026-11-08.)
+        RescopeError::Storage(e) => {
+            tracing::error!(error = %e, "rescope_thought storage error");
+            "internal database error".to_string()
+        }
+    }
+}
+
 fn map_link_error(err: LinkError) -> String {
     match err {
         LinkError::SelfLink => {
@@ -773,6 +861,8 @@ Top-level keys AND together; array values match by subset containment.
 
 `capture` is idempotent on content via SHA-256 fingerprint: same content captured twice returns the existing `thought_id` with `is_duplicate: true` and no new embedding/tag jobs enqueue.
 
+Filing correction (M7.2): `retract_thought` is for wrong claims; `rescope_thought` is for wrong filing — the content stands but its `scope` label drifted (a defaulted or stale taxonomy bucket). Correct filing at capture time is still preferred; rescope is for taxonomy drift, not routine filing. It requires a one-sentence `reason`, and every move is appended — with your `actor` — to an append-only audit trail the operator reads, so agent-initiated rescopes stay visible.
+
 Relations (M5+): thoughts can be linked with a closed-vocabulary `(from, relation, target)` edge. Seven relations (M5 shipped 6; M5.1 added `supports` after dogfood):
   replaces, requires, references, supports, belongs_to, decided_by, refines
 Distinguish `references` (prose-level citation / contextual mention) from `supports` (evidential / corroborative — the newer thought confirms a claim made in the older one). The `from` side is always a thought; the `to` side can be a thought, an entity name, a person name, or a URL (M5.2). Use:
@@ -783,7 +873,7 @@ Edges survive thought retraction (retracted thoughts surface with `retracted: tr
 
 Workflow shape: after capturing a thought, use `link_thoughts` to express structural relationships — these are queryable via `get_related_thoughts` and not encodable in `metadata`. After a search, follow up with `get_related_thoughts(thought_id)` on a hit to walk the graph from there. When the natural target of a relation isn't a thought, prefer the typed `to_entity`/`to_person`/`to_url` over capturing a placeholder thought. Before capturing, call `list_scopes(prefix?)` to discover what scopes are in use — don't invent new scope names silently. Pass the same prefix to `search_thoughts(scope_prefix=...)` or `recent_thoughts(scope_prefix=...)` to query across a namespace of related scopes (exact-match `scope` and prefix-match `scope_prefix` are mutually exclusive).
 
-Tools: `capture`, `search_thoughts`, `recent_thoughts`, `list_scopes`, `get_thought`, `retract_thought`, `link_thoughts`, `unlink_thoughts`, `get_related_thoughts`.";
+Tools: `capture`, `search_thoughts`, `recent_thoughts`, `list_scopes`, `get_thought`, `retract_thought`, `rescope_thought`, `link_thoughts`, `unlink_thoughts`, `get_related_thoughts`.";
 
 #[cfg(test)]
 mod tests {
@@ -920,10 +1010,34 @@ mod tests {
             "unlink_thoughts",
             "get_related_thoughts",
             "list_scopes",
+            "rescope_thought",
         ] {
             assert!(
                 s.contains(tool),
                 "instructions should advertise tool `{tool}`"
+            );
+        }
+        // M7.2: the rescope framing sentence is the guardrail for the first
+        // retroactive agent write since retraction — without it, agents
+        // rescope casually instead of filing right at capture.
+        for needle in ["taxonomy drift", "append-only", "actor"] {
+            assert!(
+                s.contains(needle),
+                "instructions should frame `rescope_thought` ({needle:?})"
+            );
+        }
+        // The required-`reason` ruling (2026-11-08) must survive schema
+        // regeneration: `reason` has no "null" alternative in its type.
+        let rescope_schema = schemars::schema_for!(RescopeThoughtArgs);
+        let v = serde_json::to_value(&rescope_schema).unwrap();
+        let required = v
+            .get("required")
+            .and_then(|r| r.as_array())
+            .expect("RescopeThoughtArgs must declare required fields");
+        for field in ["thought_id", "scope", "reason"] {
+            assert!(
+                required.iter().any(|f| f.as_str() == Some(field)),
+                "`{field}` must stay required",
             );
         }
         // M5.2: the polymorphic target-kind enum is the load-bearing new
@@ -1398,6 +1512,119 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("invalid thought_id"));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn rescope_tool_moves_then_no_ops(pool: PgPool) {
+        let s = KengramServer::new(
+            pool.clone(),
+            Arc::new(FakeEmbedder::new()),
+            None,
+            Some("fake/v1".into()),
+        );
+        let cap_raw = s
+            .capture(Parameters(CaptureArgs {
+                content: "misfiled note".into(),
+                source: "test".into(),
+                scope: Some("global".into()),
+                metadata: None,
+            }))
+            .await
+            .unwrap();
+        let thought_id = serde_json::from_str::<serde_json::Value>(&cap_raw).unwrap()["thought_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let raw = s
+            .rescope_thought(Parameters(RescopeThoughtArgs {
+                thought_id: thought_id.clone(),
+                scope: "work.bar".into(),
+                reason: "taxonomy drift".into(),
+                actor: Some("agent:claude-code".into()),
+            }))
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(json["changed"], true);
+        assert_eq!(json["previous_scope"], "global");
+        assert_eq!(json["new_scope"], "work.bar");
+        assert_eq!(json["thought_id"], thought_id.as_str());
+
+        // get_thought sees the new filing immediately (criterion 7: /api
+        // reads match the MCP view through the same orchestrators).
+        let raw = s
+            .get_thought(Parameters(GetThoughtArgs {
+                thought_id: thought_id.clone(),
+            }))
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(json["thought"]["scope"], "work.bar");
+
+        // Re-run: idempotent no-op, distinct from not-found.
+        let raw = s
+            .rescope_thought(Parameters(RescopeThoughtArgs {
+                thought_id: thought_id.clone(),
+                scope: "work.bar".into(),
+                reason: "rerun".into(),
+                actor: None,
+            }))
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(json["changed"], false);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn rescope_tool_errors_are_clean(pool: PgPool) {
+        let s = server(pool);
+
+        let err = s
+            .rescope_thought(Parameters(RescopeThoughtArgs {
+                thought_id: "not-a-uuid".into(),
+                scope: "work.x".into(),
+                reason: "x".into(),
+                actor: None,
+            }))
+            .await
+            .unwrap_err();
+        assert!(err.contains("invalid thought_id"));
+
+        let err = s
+            .rescope_thought(Parameters(RescopeThoughtArgs {
+                thought_id: ThoughtId::new().to_string(),
+                scope: "work.x".into(),
+                reason: "x".into(),
+                actor: None,
+            }))
+            .await
+            .unwrap_err();
+        assert!(err.contains("thought not found"));
+
+        let err = s
+            .rescope_thought(Parameters(RescopeThoughtArgs {
+                thought_id: ThoughtId::new().to_string(),
+                scope: "work.x".into(),
+                reason: "   ".into(),
+                actor: None,
+            }))
+            .await
+            .unwrap_err();
+        assert!(err.contains("reason is required"));
+
+        // Empty dotted segment reaches the tool through the orchestrator
+        // guard — a clean message, not the generic Storage-arm mask.
+        let err = s
+            .rescope_thought(Parameters(RescopeThoughtArgs {
+                thought_id: ThoughtId::new().to_string(),
+                scope: "work..x".into(),
+                reason: "x".into(),
+                actor: None,
+            }))
+            .await
+            .unwrap_err();
+        assert!(err.contains("empty dotted segment"));
     }
 
     #[sqlx::test(migrations = "../../migrations")]

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT t.id, t.scope, t.content, t.source, t.created_at, t.metadata,\n               t.content_fingerprint, t.tags,\n               t.tags_extractor_model, t.tags_extractor_version, t.tags_extracted_at,\n               t.retracted_at, t.retracted_reason,\n               e.created_at AS \"embedded_at?\"\n        FROM thoughts t\n        LEFT JOIN embeddings e\n            ON e.target_kind = 'thought'\n           AND e.target_id = t.id\n           AND e.model_id = $2\n        WHERE t.id = $1\n        ",
+  "query": "\n        SELECT t.id, t.scope, t.content, t.source, t.created_at, t.metadata,\n               t.content_fingerprint, t.tags,\n               t.tags_extractor_model, t.tags_extractor_version, t.tags_extracted_at,\n               t.retracted_at, t.retracted_reason,\n               e.created_at AS \"embedded_at?\",\n               sc.changed_at AS \"rescoped_at?\", sc.old_scope AS \"previous_scope?\"\n        FROM thoughts t\n        LEFT JOIN embeddings e\n            ON e.target_kind = 'thought'\n           AND e.target_id = t.id\n           AND e.model_id = $2\n        LEFT JOIN LATERAL (\n            SELECT old_scope, changed_at\n            FROM scope_changes\n            WHERE thought_id = t.id\n            ORDER BY changed_at DESC\n            LIMIT 1\n        ) sc ON true\n        WHERE t.id = $1\n        ",
   "describe": {
     "columns": [
       {
@@ -72,6 +72,16 @@
         "ordinal": 13,
         "name": "embedded_at?",
         "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 14,
+        "name": "rescoped_at?",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 15,
+        "name": "previous_scope?",
+        "type_info": "Text"
       }
     ],
     "parameters": {
@@ -94,8 +104,10 @@
       true,
       true,
       true,
+      false,
+      false,
       false
     ]
   },
-  "hash": "ca8712b3226509043b883f94a1775de8a809abdcb21a254914711cdf16ac83df"
+  "hash": "810579e7fb133788285afab46b02c3b47a45fce0c22e349c436c084912eadcc8"
 }

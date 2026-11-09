@@ -142,6 +142,7 @@ function renderThought(data) {
   row("embedding", p.embedding_status);
   row("tagger", p.tags_extractor_model ? `${p.tags_extractor_model} v${p.tags_extractor_version ?? "?"}` : null);
   if (p.retracted_at) row("retracted", `${p.retracted_at}${p.retracted_reason ? " — " + p.retracted_reason : ""}`);
+  if (p.rescoped_at) row("re-filed", `${p.rescoped_at}${p.previous_scope ? " — from " + p.previous_scope : ""}`);
 
   root.replaceChildren(
     el("h1", {}, `${t.scope}`),

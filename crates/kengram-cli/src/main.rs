@@ -10,7 +10,7 @@ mod bench;
 mod config;
 mod eval;
 
-use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{net::SocketAddr, path::PathBuf, str::FromStr, sync::Arc, time::Duration};
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
@@ -110,6 +110,43 @@ enum Command {
         /// to PATH. Recover by hand via psql if a retag produces worse tags.
         #[arg(long, value_name = "PATH", num_args = 0..=1, require_equals = true)]
         snapshot: Option<Option<PathBuf>>,
+    },
+    /// Re-file thoughts under a new scope (M7.2). Exactly one form:
+    /// `--thought <uuid>` re-files one thought; `--scope <old>` renames a
+    /// dotted subtree — `<old>` exactly plus `<old>.*` on dotted boundaries
+    /// (`work.foobar` is never touched by `--scope work.foo`). Content is
+    /// never modified; every move appends a row to the append-only
+    /// `scope_changes` audit trail and re-enqueues tagging (live thoughts,
+    /// when `[tagger]` is configured). `--reason` is required: one sentence
+    /// on why the filing changed is the cheapest insurance for future
+    /// archaeology. Rescopes are all-or-nothing; a subtree rename whose
+    /// mapping overflows the 256-char scope cap rolls back completely.
+    Rescope {
+        /// Single-thought form: the thought's UUID. Mutually exclusive
+        /// with `--scope`.
+        #[arg(long, conflicts_with = "scope")]
+        thought: Option<String>,
+        /// Subtree form: source scope, matched exactly and on dotted
+        /// boundaries below. Mutually exclusive with `--thought`.
+        #[arg(long, conflicts_with = "thought")]
+        scope: Option<String>,
+        /// The new scope. Non-empty, max 256 chars. For the subtree form
+        /// it may not be inside the renamed subtree (that rename would
+        /// re-match its own output on every re-run).
+        #[arg(long)]
+        to: String,
+        /// Required one-sentence reason, stored verbatim in every
+        /// `scope_changes` audit row this run writes.
+        #[arg(long)]
+        reason: String,
+        /// Free-text actor recorded in the audit trail (follows the
+        /// `source` convention; e.g. `manual`, `ops:renaming`).
+        #[arg(long, default_value = "manual")]
+        actor: String,
+        /// Print the plan (per-row old→new, match count, tag-requeue
+        /// count) without writing anything.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Benchmarking harness — A/B comparisons across search-pipeline
     /// configurations. Subcommand-action shape leaves room for additional
@@ -974,6 +1011,156 @@ async fn run_tag(
     Ok(())
 }
 
+// Re-file thoughts (M7.2). Thin surface: parse → pool → orchestrator.
+// All semantics (guards, validation, all-or-nothing, audit, requeue)
+// live in `kengram_mcp::rescope` so the CLI and MCP tool can't diverge.
+async fn run_rescope(
+    config: Config,
+    thought: Option<String>,
+    scope: Option<String>,
+    to: String,
+    reason: String,
+    actor: String,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    if thought.is_none() && scope.is_none() {
+        anyhow::bail!("one of --thought <uuid> or --scope <old> is required");
+    }
+
+    let pool = PgPoolOptions::new()
+        .max_connections(config.database.max_connections)
+        .connect(&config.database.url)
+        .await
+        .with_context(|| format!("connecting to {}", config.database.url))?;
+
+    // Same silent-disable rule as `build_tagger` — rescope needs the model
+    // id only, not a tagger client.
+    let tagger_model_id = if config.tagger.provider.is_empty() {
+        tracing::warn!(
+            "tagger: not configured — rescopes will move and audit but enqueue no re-tag jobs"
+        );
+        None
+    } else {
+        Some(config.tagger.model_id.clone())
+    };
+
+    match (thought, scope) {
+        (Some(id_raw), None) => {
+            let thought_id = kengram_core::ThoughtId::from_str(&id_raw)
+                .with_context(|| format!("parsing --thought={id_raw:?} as UUID"))?;
+            // Both --dry-run and a real run go through the orchestrator —
+            // same guards, same pre-read, same plan. An early read-only
+            // preview here could print "would re-file" for inputs the
+            // real run then rejects, and could only guess the requeue
+            // count. The orchestrator's dry run rolls back after the
+            // locking pre-read instead: accurate preview, zero writes.
+            let resp = kengram_mcp::rescope_thought(
+                &pool,
+                tagger_model_id.as_deref(),
+                kengram_mcp::RescopeThoughtRequest {
+                    thought_id,
+                    scope: to,
+                    reason,
+                    actor: Some(actor),
+                    dry_run,
+                },
+            )
+            .await
+            .with_context(|| format!("rescoping thought {thought_id}"))?;
+            match (resp.changed, resp.committed) {
+                (true, true) => {
+                    println!(
+                        "rescoped {thought_id}: {:?} -> {:?}",
+                        resp.previous_scope, resp.new_scope
+                    );
+                    if resp.requeued {
+                        println!("  tag job re-enqueued — the drainer re-tags under the new scope");
+                    } else {
+                        println!("  no tag requeue (retracted thought or [tagger] not configured)");
+                    }
+                }
+                (true, false) => {
+                    println!(
+                        "dry run: would re-file {thought_id}: {:?} -> {:?}",
+                        resp.previous_scope, resp.new_scope
+                    );
+                    println!(
+                        "  tag requeue: {}",
+                        if resp.requeued {
+                            "1 (live thought)"
+                        } else {
+                            "0 (retracted thought or [tagger] not configured)"
+                        }
+                    );
+                }
+                (false, _) => {
+                    println!(
+                        "no-op: {thought_id} already filed under {:?}{}",
+                        resp.previous_scope,
+                        if dry_run {
+                            " (dry run — nothing written)"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+            }
+        }
+        (None, Some(from)) => {
+            let resp = kengram_mcp::rename_scope_subtree(
+                &pool,
+                tagger_model_id.as_deref(),
+                kengram_mcp::RenameScopeRequest {
+                    from: from.clone(),
+                    to,
+                    reason,
+                    actor: Some(actor),
+                    dry_run,
+                },
+            )
+            .await
+            .with_context(|| format!("renaming scope subtree {from:?}"))?;
+            for row in &resp.moved {
+                println!(
+                    "  {} : {:?} -> {:?}",
+                    row.thought_id, row.old_scope, row.new_scope
+                );
+            }
+            if resp.moved.is_empty() {
+                println!("no-op: nothing filed under {from:?} or its subtree");
+            } else if dry_run {
+                println!(
+                    "dry run: {} matched, {} would requeue tagging — nothing written",
+                    resp.moved.len(),
+                    resp.requeued
+                );
+            } else {
+                println!(
+                    "{} thoughts re-filed; {} tag jobs queued",
+                    resp.moved.len(),
+                    resp.requeued
+                );
+            }
+            if resp.requeued >= 100 {
+                // Queue cost (m7.2 contract): requeues land ahead of every
+                // later capture — oldest-first claim. Concrete on the live
+                // corpus: rjf.tech ≈ 276 thoughts ≈ 27 h at CPU p50.
+                println!(
+                    "warning: {} re-tag jobs park a backlog ahead of later captures — \
+                     consider timing this before the nightly GPU tagger window (docs/linux-autostart.md)",
+                    resp.requeued
+                );
+            }
+        }
+        // Both arms below were validated before the pool connect; clap
+        // rejects the both-present case at parse time.
+        (Some(_), Some(_)) | (None, None) => {
+            unreachable!("validated above: exactly one of --thought/--scope")
+        }
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     init_tracing();
@@ -1010,6 +1197,14 @@ async fn main() -> anyhow::Result<()> {
             )
             .await
         }
+        Command::Rescope {
+            thought,
+            scope,
+            to,
+            reason,
+            actor,
+            dry_run,
+        } => run_rescope(config, thought, scope, to, reason, actor, dry_run).await,
         Command::Bench { action } => match action {
             BenchAction::Rerank { corpus } => run_bench_rerank(config, corpus).await,
         },
@@ -1339,5 +1534,101 @@ mod tag_tests {
         // Untagged row → null provenance.
         assert!(json[1]["tags_extractor_model"].is_null());
         assert!(json[1]["tags_extractor_version"].is_null());
+    }
+}
+
+#[cfg(test)]
+mod rescope_cli_tests {
+    use super::{Cli, Command};
+    use clap::Parser;
+
+    fn parse(args: &[&str]) -> clap::error::Result<Cli> {
+        Cli::try_parse_from(std::iter::once("kengram").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn single_form_parses_with_defaults() {
+        let cli = parse(&[
+            "rescope",
+            "--thought",
+            "6f1c8a3e-0000-4000-8000-000000000000",
+            "--to",
+            "work.bar",
+            "--reason",
+            "taxonomy drift",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Rescope {
+                thought,
+                scope,
+                to,
+                reason,
+                actor,
+                dry_run,
+            } => {
+                assert!(thought.is_some());
+                assert!(scope.is_none());
+                assert_eq!(to, "work.bar");
+                assert_eq!(reason, "taxonomy drift");
+                assert_eq!(actor, "manual");
+                assert!(!dry_run);
+            }
+            other => panic!("expected Rescope, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn subtree_form_with_dry_run_and_actor_parses() {
+        let cli = parse(&[
+            "rescope",
+            "--scope",
+            "work.foo",
+            "--to",
+            "work.bar",
+            "--reason",
+            "merge",
+            "--actor",
+            "ops:renaming",
+            "--dry-run",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Rescope {
+                thought,
+                scope,
+                dry_run,
+                actor,
+                ..
+            } => {
+                assert!(thought.is_none());
+                assert_eq!(scope.as_deref(), Some("work.foo"));
+                assert!(dry_run);
+                assert_eq!(actor, "ops:renaming");
+            }
+            other => panic!("expected Rescope, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reason_is_required() {
+        let err = parse(&["rescope", "--thought", "x", "--to", "y"]);
+        assert!(err.is_err(), "--reason missing must fail at parse time");
+    }
+
+    #[test]
+    fn thought_and_scope_are_mutually_exclusive() {
+        let err = parse(&[
+            "rescope",
+            "--thought",
+            "x",
+            "--scope",
+            "y",
+            "--to",
+            "z",
+            "--reason",
+            "r",
+        ]);
+        assert!(err.is_err());
     }
 }

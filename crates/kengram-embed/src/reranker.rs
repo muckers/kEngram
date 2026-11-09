@@ -20,6 +20,10 @@ pub struct RerankScore {
     pub score: f32,
 }
 
+// See kengram-core `Embedder`/`Tagger`: async-trait's bare `#[must_use]` on
+// async methods + clippy 1.99's `double_must_use` (not yet in async-trait's
+// suppression list).
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait Reranker: Send + Sync {
     /// Stable model identifier — conventionally `<vendor>/<model>`, e.g.

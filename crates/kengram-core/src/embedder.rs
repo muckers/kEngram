@@ -5,6 +5,10 @@ use async_trait::async_trait;
 
 use crate::EmbeddingModel;
 
+// async-trait pushes a bare `#[must_use]` onto each async method; clippy 1.99's
+// `double_must_use` flags that + `Result` return. async-trait 0.1.89's lint
+// suppression list predates the lint, so allow it here (upstream issue).
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait Embedder: Send + Sync {
     /// The model identity. The returned `EmbeddingModel.id` must match the
