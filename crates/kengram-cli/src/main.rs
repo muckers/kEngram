@@ -1048,33 +1048,12 @@ async fn run_rescope(
         (Some(id_raw), None) => {
             let thought_id = kengram_core::ThoughtId::from_str(&id_raw)
                 .with_context(|| format!("parsing --thought={id_raw:?} as UUID"))?;
-            if dry_run {
-                // Read-only preview (no row locks — a dry run reports, it
-                // doesn't reserve).
-                let Some(t) = kengram_storage::fetch_thought(&pool, thought_id)
-                    .await
-                    .context("looking up thought")?
-                else {
-                    anyhow::bail!("thought {thought_id} not found");
-                };
-                if t.scope.as_str() == to {
-                    println!("dry run: no-op — {thought_id} already filed under {to:?}");
-                } else {
-                    println!(
-                        "dry run: would re-file {thought_id}: {:?} -> {to:?}",
-                        t.scope.as_str()
-                    );
-                    println!(
-                        "  tag requeue: {}",
-                        if tagger_model_id.is_some() {
-                            "1 (unless the thought is retracted)"
-                        } else {
-                            "0 ([tagger] not configured)"
-                        }
-                    );
-                }
-                return Ok(());
-            }
+            // Both --dry-run and a real run go through the orchestrator —
+            // same guards, same pre-read, same plan. An early read-only
+            // preview here could print "would re-file" for inputs the
+            // real run then rejects, and could only guess the requeue
+            // count. The orchestrator's dry run rolls back after the
+            // locking pre-read instead: accurate preview, zero writes.
             let resp = kengram_mcp::rescope_thought(
                 &pool,
                 tagger_model_id.as_deref(),
@@ -1083,25 +1062,48 @@ async fn run_rescope(
                     scope: to,
                     reason,
                     actor: Some(actor),
+                    dry_run,
                 },
             )
             .await
             .with_context(|| format!("rescoping thought {thought_id}"))?;
-            if resp.changed {
-                println!(
-                    "rescoped {thought_id}: {:?} -> {:?}",
-                    resp.previous_scope, resp.new_scope
-                );
-                if resp.requeued {
-                    println!("  tag job re-enqueued — the drainer re-tags under the new scope");
-                } else {
-                    println!("  no tag requeue (retracted thought or [tagger] not configured)");
+            match (resp.changed, resp.committed) {
+                (true, true) => {
+                    println!(
+                        "rescoped {thought_id}: {:?} -> {:?}",
+                        resp.previous_scope, resp.new_scope
+                    );
+                    if resp.requeued {
+                        println!("  tag job re-enqueued — the drainer re-tags under the new scope");
+                    } else {
+                        println!("  no tag requeue (retracted thought or [tagger] not configured)");
+                    }
                 }
-            } else {
-                println!(
-                    "no-op: {thought_id} already filed under {:?}",
-                    resp.previous_scope
-                );
+                (true, false) => {
+                    println!(
+                        "dry run: would re-file {thought_id}: {:?} -> {:?}",
+                        resp.previous_scope, resp.new_scope
+                    );
+                    println!(
+                        "  tag requeue: {}",
+                        if resp.requeued {
+                            "1 (live thought)"
+                        } else {
+                            "0 (retracted thought or [tagger] not configured)"
+                        }
+                    );
+                }
+                (false, _) => {
+                    println!(
+                        "no-op: {thought_id} already filed under {:?}{}",
+                        resp.previous_scope,
+                        if dry_run {
+                            " (dry run — nothing written)"
+                        } else {
+                            ""
+                        }
+                    );
+                }
             }
         }
         (None, Some(from)) => {

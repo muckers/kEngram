@@ -497,6 +497,9 @@ impl KengramServer {
                 scope: args.scope,
                 reason: args.reason,
                 actor: args.actor,
+                // No dry-run preview over MCP — `--dry-run` is a CLI
+                // operator affordance (m7.2 contract).
+                dry_run: false,
             },
         )
         .await
@@ -731,6 +734,7 @@ fn map_rescope_error(err: RescopeError) -> String {
         RescopeError::SelfNesting { from, to } => format!(
             "rename target {to:?} equals the source scope or sits inside its subtree ({from:?}); bulk renames are CLI-only"
         ),
+        RescopeError::TrailingDot(s) => format!("scope {s:?} must not end with '.'"),
         RescopeError::Storage(e) => {
             tracing::error!(error = %e, "rescope_thought storage error");
             "internal database error".to_string()

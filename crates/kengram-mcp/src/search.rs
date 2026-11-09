@@ -788,7 +788,7 @@ mod tests {
         // view matches the MCP view byte-for-byte.
         let id = cap(&pool, "re-filed", "global").await;
         let to = kengram_core::Scope::new("work.x").unwrap();
-        kengram_storage::rescope_thought(&pool, id, &to, "agent:test", "hop", None)
+        kengram_storage::rescope_thought(&pool, id, &to, "agent:test", "hop", None, false)
             .await
             .unwrap();
 

@@ -8,9 +8,11 @@
 //!
 //! This orchestrator is the shared seam (same discipline as `finalize`):
 //! the CLI and the `rescope_thought` MCP tool behave identically because
-//! both run the guards here — self-nesting rejection, target validation,
-//! required non-blank `reason` (2026-11-08 operator ruling) — before any
-//! storage call.
+//! both run the guards here — self-nesting rejection, trailing-dot
+//! rejection, target validation, required non-blank `reason`
+//! (2026-11-08 operator ruling) — before any storage call, and dry runs
+//! go through the same path so a preview can't disagree with the real
+//! run.
 
 use kengram_core::{Scope, ScopeError, ThoughtId};
 use sqlx::PgPool;
@@ -30,6 +32,12 @@ pub struct RescopeThoughtRequest {
     /// both CLI forms and this tool).
     pub reason: String,
     pub actor: Option<String>,
+    /// Plan the move (guards + locking pre-read included), write nothing.
+    /// The MCP tool always passes `false`; `kengram rescope --dry-run`
+    /// passes `true` for both CLI forms so the preview runs the *same*
+    /// guards as the real run — a dry run can't report "would re-file"
+    /// for inputs the real run rejects.
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +53,9 @@ pub struct RescopeThoughtResponse {
     /// CLI-only reporting field; the MCP tool's JSON response omits it
     /// (contract shape is the four fields in §MCP surface delta).
     pub requeued: bool,
+    /// `false` on dry runs, no-ops, and not-found: `changed && committed`
+    /// is "re-filed for real". CLI-only; also absent from the MCP JSON.
+    pub committed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -86,6 +97,13 @@ pub enum RescopeError {
     )]
     SelfNesting { from: String, to: String },
 
+    /// A `from`/`to` ending in `.` is a typo, and worse, makes the
+    /// dotted-boundary subtree prefix ambiguous (`work.` would name the
+    /// same set as `work`). Rejected up front; `kengram_storage` refuses
+    /// them again as defense-in-depth.
+    #[error("scope {0:?} must not end with '.'")]
+    TrailingDot(String),
+
     #[error("storage error: {0}")]
     Storage(#[from] kengram_storage::StorageError),
 }
@@ -108,7 +126,9 @@ fn resolve_actor(actor: Option<&str>) -> String {
 
 /// Re-file one thought. `changed: false` (no-op, no audit row) when
 /// already at target; `Err(NotFound)` for unknown ids — the same
-/// no-op/did-work seam as `retract_thought`.
+/// no-op/did-work seam as `retract_thought`. `request.dry_run` runs the
+/// whole path (guards included) then rolls back — same preview-vs-real
+/// discipline as the subtree form.
 pub async fn rescope_thought(
     pool: &PgPool,
     tagger_model_id: Option<&str>,
@@ -116,6 +136,9 @@ pub async fn rescope_thought(
 ) -> Result<RescopeThoughtResponse, RescopeError> {
     let reason = guard_reason(&request.reason)?;
     let target = Scope::new(request.scope)?;
+    if target.as_str().ends_with('.') {
+        return Err(RescopeError::TrailingDot(target.as_str().to_string()));
+    }
     let actor = resolve_actor(request.actor.as_deref());
 
     let outcome = kengram_storage::rescope_thought(
@@ -125,6 +148,7 @@ pub async fn rescope_thought(
         &actor,
         reason,
         tagger_model_id,
+        request.dry_run,
     )
     .await?;
 
@@ -137,6 +161,7 @@ pub async fn rescope_thought(
         new_scope: outcome.new_scope,
         changed: outcome.changed,
         requeued: outcome.requeued,
+        committed: outcome.committed,
     })
 }
 
@@ -145,7 +170,10 @@ pub async fn rescope_thought(
 /// surface delta). Guards run before any storage call: a `to` equal to
 /// or inside `from`'s subtree would re-match its own output on every
 /// re-run and nest forever (`work.archive.archive.x`), fresh audit rows
-/// per pass.
+/// per pass; a trailing-dot `from`/`to` makes the dotted prefix
+/// ambiguous. `kengram_storage::rename_scope_subtree` re-checks both —
+/// the orchestrator guard is for the message, the storage guard is for
+/// any future caller.
 pub async fn rename_scope_subtree(
     pool: &PgPool,
     tagger_model_id: Option<&str>,
@@ -154,12 +182,19 @@ pub async fn rename_scope_subtree(
     let reason = guard_reason(&request.reason)?;
     Scope::new(&request.from)?;
     let target = Scope::new(&request.to)?;
+    if request.from.ends_with('.') || target.as_str().ends_with('.') {
+        return Err(RescopeError::TrailingDot(if request.from.ends_with('.') {
+            request.from.clone()
+        } else {
+            request.to.clone()
+        }));
+    }
     let actor = resolve_actor(request.actor.as_deref());
 
-    let inside_subtree = request.to == request.from
-        || request
-            .to
-            .starts_with(&format!("{}.", request.from.trim_end_matches('.')));
+    // No trailing-dot trimming here: trailing dots are rejected above, so
+    // the raw `{from}.` prefix is the exact dotted-boundary prefix.
+    let inside_subtree =
+        request.to == request.from || request.to.starts_with(&format!("{}.", request.from));
     if inside_subtree {
         return Err(RescopeError::SelfNesting {
             from: request.from.clone(),
@@ -233,6 +268,7 @@ mod tests {
             scope: scope.to_string(),
             reason: reason.to_string(),
             actor: actor.map(str::to_string),
+            dry_run: false,
         }
     }
 
@@ -381,6 +417,112 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(q.count, 0);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn single_dry_run_runs_the_shared_guards(pool: PgPool) {
+        // The single-form --dry-run used to read the thought directly in
+        // the CLI, so bad `--to`/`--reason` previewed "would re-file"
+        // while the real run failed. Dry runs now route through these
+        // guards and the storage dry-run rollback — preview == real.
+        let id = cap(&pool, "one", "work.foo").await;
+
+        let err = rescope_thought(
+            &pool,
+            Some(TEST_TAGGER_ID),
+            RescopeThoughtRequest {
+                dry_run: true,
+                ..req(id, "work.bar", "   ", None)
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, RescopeError::MissingReason));
+
+        let err = rescope_thought(
+            &pool,
+            Some(TEST_TAGGER_ID),
+            RescopeThoughtRequest {
+                dry_run: true,
+                ..req(id, "t".repeat(300).as_str(), "x", None)
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, RescopeError::InvalidScope(_)));
+
+        let err = rescope_thought(
+            &pool,
+            Some(TEST_TAGGER_ID),
+            RescopeThoughtRequest {
+                dry_run: true,
+                ..req(id, "work.bar.", "x", None)
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, RescopeError::TrailingDot(_)));
+
+        // A guard-passing dry run plans accurately and writes nothing —
+        // including the requeue count, which the old CLI printed as a
+        // guess ("1 (unless retracted)").
+        let resp = rescope_thought(
+            &pool,
+            Some(TEST_TAGGER_ID),
+            RescopeThoughtRequest {
+                dry_run: true,
+                ..req(id, "work.bar", "preview", None)
+            },
+        )
+        .await
+        .unwrap();
+        assert!(resp.changed);
+        assert!(!resp.committed);
+        assert!(resp.requeued);
+        assert_eq!(resp.previous_scope, "work.foo");
+        let thought = kengram_storage::fetch_thought(&pool, id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(thought.scope.as_str(), "work.foo");
+        assert!(audit_actor(&pool, id).await.is_none());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn trailing_dot_rejected_in_both_forms(pool: PgPool) {
+        // `Scope::new` accepts trailing dots; the rescope paths don't —
+        // `work.` would name the same set as `work`, making the subtree
+        // prefix ambiguous.
+        let id = cap(&pool, "one", "work.foo").await;
+        let err = rescope_thought(&pool, Some(TEST_TAGGER_ID), req(id, "work.", "x", None))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RescopeError::TrailingDot(_)));
+
+        for (from, to) in [("work.", "play"), ("work", "play.")] {
+            let err = rename_scope_subtree(
+                &pool,
+                Some(TEST_TAGGER_ID),
+                RenameScopeRequest {
+                    from: from.into(),
+                    to: to.into(),
+                    reason: "x".into(),
+                    actor: None,
+                    dry_run: false,
+                },
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(err, RescopeError::TrailingDot(_)),
+                "`{from} -> {to}` must be rejected"
+            );
+        }
+        let thought = kengram_storage::fetch_thought(&pool, id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(thought.scope.as_str(), "work.foo");
     }
 
     #[sqlx::test(migrations = "../../migrations")]
