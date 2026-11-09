@@ -33,6 +33,13 @@ pub enum StorageError {
     #[error("invalid scope decoded from database: {0}")]
     InvalidScope(#[from] ScopeError),
 
+    /// A rescope's computed new scope failed `Scope::new` validation
+    /// (empty / > 256 bytes) mid-rename. The whole rename rolled back —
+    /// subtree rescopes are all-or-nothing. (No `#[from]`: `InvalidScope`
+    /// already owns the `From<ScopeError>` impl.)
+    #[error("rescope target scope invalid: {0}")]
+    InvalidRescopeTarget(ScopeError),
+
     #[error("invalid source decoded from database: {0}")]
     InvalidSource(#[from] SourceError),
 
@@ -764,8 +771,12 @@ pub async fn snapshot_nonretracted_tags(
 
 /// Enqueue a thought for the tag drainer. Idempotent on `thought_id`
 /// conflict — re-enqueuing the same thought is a no-op.
+///
+/// Generic over the executor (M7.2): the rescope helpers enqueue *inside*
+/// their transaction, so this must run on a `Transaction` as well as a
+/// pool. `&PgPool` call sites compile unchanged.
 pub async fn enqueue_tag_job(
-    pool: &PgPool,
+    executor: impl sqlx::PgExecutor<'_>,
     thought_id: ThoughtId,
     tagger_model_id: &str,
 ) -> Result<bool, StorageError> {
@@ -778,7 +789,7 @@ pub async fn enqueue_tag_job(
         thought_id.into_uuid(),
         tagger_model_id,
     )
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(result.rows_affected() > 0)
 }
@@ -1468,6 +1479,249 @@ pub async fn retract_thought(
 
     Ok(RetractThoughtOutcome {
         retracted: updated.rows_affected() == 1,
+    })
+}
+
+// -- thought rescoping (M7.2) ----------------------------------------------
+
+/// Escape a free-form scope for use as a literal prefix in a `LIKE`
+/// pattern. The escape character is `\`, and `LIKE`'s metacharacters are
+/// `%` and `_` — but `\` itself must be doubled *first*, or the escapes
+/// added for `%`/`_` get consumed as escape sequences themselves.
+/// (Contract: m7.2 doc, "CLI surface delta".)
+fn escape_like_prefix(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+/// Result of `rescope_thought` (single-thought form). Discriminator on
+/// `previous_scope`: `None` = no row with that id at all; `Some(old)` with
+/// `changed == false` = already at target (no-op — nothing was written).
+/// Keeping not-found and no-op distinguishable is an MCP contract
+/// requirement; a pre-read predicate of `id AND scope <> target` would
+/// collapse both into "zero rows".
+#[derive(Debug, Clone)]
+pub struct RescopeOutcome {
+    pub thought_id: ThoughtId,
+    pub previous_scope: Option<String>,
+    pub new_scope: String,
+    pub changed: bool,
+}
+
+/// Re-file one thought under a new scope. Update, audit append, and
+/// (live thoughts only) tag-job requeue all run on one transaction —
+/// commit or nothing.
+///
+/// PG16-safe audit pattern: the *locking pre-read* (`FOR UPDATE`) carries
+/// the old values; `UPDATE ... RETURNING` returns the post-update row
+/// (`RETURNING OLD.*` is PG 18+). `FOR UPDATE` matters even single-user:
+/// two concurrent rescopes must not both see the pre-move state and
+/// double-write audit rows.
+pub async fn rescope_thought(
+    pool: &PgPool,
+    thought_id: ThoughtId,
+    new_scope: &Scope,
+    actor: &str,
+    reason: &str,
+    tagger_model_id: &str,
+) -> Result<RescopeOutcome, StorageError> {
+    let mut tx = pool.begin().await?;
+
+    let pre = sqlx::query!(
+        r#"SELECT scope, retracted_at FROM thoughts WHERE id = $1 FOR UPDATE"#,
+        thought_id.into_uuid()
+    )
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let outcome = match pre {
+        None => RescopeOutcome {
+            thought_id,
+            previous_scope: None,
+            new_scope: new_scope.as_str().to_string(),
+            changed: false,
+        },
+        Some(row) if row.scope == new_scope.as_str() => RescopeOutcome {
+            thought_id,
+            previous_scope: Some(row.scope),
+            new_scope: new_scope.as_str().to_string(),
+            changed: false,
+        },
+        Some(row) => {
+            sqlx::query!(
+                "UPDATE thoughts SET scope = $2 WHERE id = $1",
+                thought_id.into_uuid(),
+                new_scope.as_str()
+            )
+            .execute(&mut *tx)
+            .await?;
+
+            sqlx::query!(
+                r#"INSERT INTO scope_changes (thought_id, old_scope, new_scope, actor, reason)
+                   VALUES ($1, $2, $3, $4, $5)"#,
+                thought_id.into_uuid(),
+                row.scope,
+                new_scope.as_str(),
+                actor,
+                reason
+            )
+            .execute(&mut *tx)
+            .await?;
+
+            // Live thoughts only: tags are conditioned on per-scope vocab
+            // and the scope-identifier strip filter, so old-scope tags are
+            // silently stale under the new scope. Retracted thoughts get
+            // the audit row but no requeue — the drainer doesn't filter
+            // retracted_at and retracted tags feed nothing.
+            if row.retracted_at.is_none() {
+                enqueue_tag_job(&mut *tx, thought_id, tagger_model_id).await?;
+            }
+
+            RescopeOutcome {
+                thought_id,
+                previous_scope: Some(row.scope),
+                new_scope: new_scope.as_str().to_string(),
+                changed: true,
+            }
+        }
+    };
+
+    tx.commit().await?;
+    Ok(outcome)
+}
+
+/// One row of a subtree rename: what moved, and where from/to.
+#[derive(Debug, Clone)]
+pub struct RescopeRow {
+    pub thought_id: ThoughtId,
+    pub old_scope: String,
+    pub new_scope: String,
+}
+
+/// Result of `rename_scope_subtree`. On a dry run (or a zero-match no-op),
+/// `committed == false` and `moved`/`requeued` describe what a real run
+/// would do. `requeued` counts matched *live* rows — matching what a real
+/// run enqueues (or finds already-queued), so dry-run and real run print
+/// the same backlog number.
+#[derive(Debug, Clone)]
+pub struct SubtreeRescopeOutcome {
+    pub moved: Vec<RescopeRow>,
+    pub requeued: usize,
+    pub committed: bool,
+}
+
+/// Dotted-boundary subtree rename: `from` exactly, plus every `from.*` on
+/// a dotted boundary — `from.foobar` shapes under a longer-scope sibling
+/// are never touched. Mapping: `from` -> `to`, `from.rest` -> `to.rest`.
+///
+/// Two bound parameters, deliberately (`$1` raw, `$2` escaped): the raw
+/// prefix serves the exact match and the `strip_prefix` mapping offset,
+/// while the escaped prefix serves the `LIKE` pattern. One param cannot
+/// serve both — a scope containing `_`/`%` would get the wrong match set
+/// or the wrong substring offsets. (Contract: m7.2 review pass 2, #4.)
+///
+/// Every row's new scope is computed and `Scope::new`-validated **in
+/// Rust, before any write**; any invalid row aborts the whole rename
+/// (all-or-nothing, criterion 5). This validation gate is why the flow is
+/// not a single SQL statement. The per-row checked `UPDATE`s run in one
+/// transaction rather than a single `UPDATE ... FROM (VALUES ...)` — same
+/// commit-or-nothing semantics, and keeps every statement under the
+/// compile-time-checked `query!` macro instead of hand-built dynamic SQL.
+pub async fn rename_scope_subtree(
+    pool: &PgPool,
+    from: &str,
+    to: &Scope,
+    actor: &str,
+    reason: &str,
+    tagger_model_id: &str,
+    dry_run: bool,
+) -> Result<SubtreeRescopeOutcome, StorageError> {
+    let escaped = escape_like_prefix(from);
+    let mut tx = pool.begin().await?;
+
+    let rows = sqlx::query!(
+        r#"SELECT id, scope, retracted_at FROM thoughts
+           WHERE scope = $1 OR scope LIKE $2 || '.%' ESCAPE '\'
+           FOR UPDATE"#,
+        from,
+        escaped
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+
+    // Compute + validate the whole plan before touching anything; an Err
+    // here drops the tx (implicit rollback) with zero writes.
+    let mut plan = Vec::with_capacity(rows.len());
+    let prefix = format!("{from}.");
+    for r in &rows {
+        let new_scope = if r.scope == from {
+            to.as_str().to_string()
+        } else {
+            // The LIKE predicate uses the *escaped* literal prefix, so a
+            // match guarantees `scope` starts with `from.` byte-for-byte;
+            // the raw `prefix` slice is therefore safe. Anything else is
+            // a logic bug, not data — surface it rather than mis-slice.
+            let rest = r
+                .scope
+                .strip_prefix(&prefix)
+                .ok_or(sqlx::Error::RowNotFound)
+                .map_err(StorageError::Database)?;
+            let joined = format!("{}.{rest}", to.as_str());
+            Scope::new(joined)
+                .map_err(StorageError::InvalidRescopeTarget)?
+                .into_string()
+        };
+        plan.push(RescopeRow {
+            thought_id: ThoughtId::from(r.id),
+            old_scope: r.scope.clone(),
+            new_scope,
+        });
+    }
+
+    let requeued = rows.iter().filter(|r| r.retracted_at.is_none()).count();
+
+    if dry_run || plan.is_empty() {
+        // Nothing to commit; the rollback (drop) releases the row locks.
+        tx.rollback().await?;
+        return Ok(SubtreeRescopeOutcome {
+            moved: plan,
+            requeued,
+            committed: false,
+        });
+    }
+
+    for (r, row) in rows.iter().zip(plan.iter()) {
+        sqlx::query!(
+            "UPDATE thoughts SET scope = $2 WHERE id = $1",
+            r.id,
+            &row.new_scope
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query!(
+            r#"INSERT INTO scope_changes (thought_id, old_scope, new_scope, actor, reason)
+               VALUES ($1, $2, $3, $4, $5)"#,
+            r.id,
+            row.old_scope,
+            row.new_scope,
+            actor,
+            reason
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        if r.retracted_at.is_none() {
+            enqueue_tag_job(&mut *tx, row.thought_id, tagger_model_id).await?;
+        }
+    }
+
+    tx.commit().await?;
+    Ok(SubtreeRescopeOutcome {
+        moved: plan,
+        requeued,
+        committed: true,
     })
 }
 
@@ -3681,5 +3935,280 @@ mod tests {
         .execute(&pool)
         .await;
         assert!(result.is_err());
+    }
+
+    // -- M7.2: rescope helpers ----------------------------------------------
+
+    async fn fetch_scope(pool: &PgPool, id: ThoughtId) -> String {
+        fetch_thought(pool, id)
+            .await
+            .unwrap()
+            .unwrap()
+            .scope
+            .as_str()
+            .to_string()
+    }
+
+    async fn pending_tags_count(pool: &PgPool, id: ThoughtId) -> i64 {
+        sqlx::query!(
+            r#"SELECT COUNT(*) AS "count!" FROM pending_tags WHERE thought_id = $1"#,
+            id.into_uuid()
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap()
+        .count
+    }
+
+    async fn audit_rows(
+        pool: &PgPool,
+        id: ThoughtId,
+    ) -> Vec<(String, String, String, Option<String>)> {
+        sqlx::query!(
+            r#"SELECT old_scope, new_scope, actor, reason FROM scope_changes WHERE thought_id = $1"#,
+            id.into_uuid()
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| (r.old_scope, r.new_scope, r.actor, r.reason))
+        .collect()
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn rescope_single_moves_audits_and_requeues(pool: PgPool) {
+        let id = insert_test_thought(&pool, "misfiled", "global").await;
+        let to = Scope::new("work.bar").unwrap();
+        let out = rescope_thought(&pool, id, &to, "manual", "taxonomy drift", "fake/v1")
+            .await
+            .unwrap();
+        assert!(out.changed);
+        assert_eq!(out.previous_scope.as_deref(), Some("global"));
+
+        assert_eq!(fetch_scope(&pool, id).await, "work.bar");
+        let audit = audit_rows(&pool, id).await;
+        assert_eq!(audit.len(), 1);
+        // Pre-update value, not the post-update one (the PG16 trap).
+        assert_eq!(audit[0].0, "global");
+        assert_eq!(audit[0].1, "work.bar");
+        assert_eq!(audit[0].2, "manual");
+        assert_eq!(audit[0].3.as_deref(), Some("taxonomy drift"));
+        assert_eq!(pending_tags_count(&pool, id).await, 1);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn rescope_single_no_op_writes_nothing(pool: PgPool) {
+        let id = insert_test_thought(&pool, "already placed", "work.bar").await;
+        let to = Scope::new("work.bar").unwrap();
+        let out = rescope_thought(&pool, id, &to, "manual", "rerun", "fake/v1")
+            .await
+            .unwrap();
+        assert!(!out.changed);
+        assert_eq!(out.previous_scope.as_deref(), Some("work.bar"));
+        assert!(audit_rows(&pool, id).await.is_empty());
+        assert_eq!(pending_tags_count(&pool, id).await, 0);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn rescope_single_not_found_is_distinct_from_no_op(pool: PgPool) {
+        let missing = ThoughtId::from(uuid::Uuid::new_v4());
+        let to = Scope::new("work.bar").unwrap();
+        let out = rescope_thought(&pool, missing, &to, "manual", "x", "fake/v1")
+            .await
+            .unwrap();
+        // No row at all → previous_scope None; a no-op carries Some(scope).
+        assert!(!out.changed);
+        assert_eq!(out.previous_scope, None);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn subtree_rename_exact_and_descendants_never_siblings(pool: PgPool) {
+        let exact = insert_test_thought(&pool, "exact", "work.foo").await;
+        let child = insert_test_thought(&pool, "child", "work.foo.baz").await;
+        let sibling = insert_test_thought(&pool, "sibling", "work.foobar").await;
+
+        let to = Scope::new("work.bar").unwrap();
+        let out = rename_scope_subtree(
+            &pool, "work.foo", &to, "manual", "taxonomy", "fake/v1", false,
+        )
+        .await
+        .unwrap();
+        assert!(out.committed);
+        assert_eq!(out.moved.len(), 2);
+        assert_eq!(out.requeued, 2);
+
+        assert_eq!(fetch_scope(&pool, exact).await, "work.bar");
+        assert_eq!(fetch_scope(&pool, child).await, "work.bar.baz");
+        assert_eq!(fetch_scope(&pool, sibling).await, "work.foobar");
+
+        // Criterion 2: each audit row carries *that row's own* pre-rename
+        // scope — the direct guard against UPDATE...RETURNING returning new
+        // values.
+        let exact_audit = audit_rows(&pool, exact).await;
+        let child_audit = audit_rows(&pool, child).await;
+        assert_eq!(exact_audit.len(), 1);
+        assert_eq!(child_audit.len(), 1);
+        assert_eq!(
+            (exact_audit[0].0.as_str(), exact_audit[0].1.as_str()),
+            ("work.foo", "work.bar")
+        );
+        assert_eq!(
+            (child_audit[0].0.as_str(), child_audit[0].1.as_str()),
+            ("work.foo.baz", "work.bar.baz")
+        );
+        assert!(audit_rows(&pool, sibling).await.is_empty());
+        assert_eq!(pending_tags_count(&pool, exact).await, 1);
+        assert_eq!(pending_tags_count(&pool, child).await, 1);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn subtree_rename_rerun_is_a_no_op(pool: PgPool) {
+        insert_test_thought(&pool, "exact", "work.foo").await;
+        let to = Scope::new("work.bar").unwrap();
+        rename_scope_subtree(&pool, "work.foo", &to, "manual", "first", "fake/v1", false)
+            .await
+            .unwrap();
+        let again =
+            rename_scope_subtree(&pool, "work.foo", &to, "manual", "rerun", "fake/v1", false)
+                .await
+                .unwrap();
+        assert!(!again.committed);
+        assert!(again.moved.is_empty());
+        assert_eq!(again.requeued, 0);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn subtree_rename_underscores_are_literal_not_wildcards(pool: PgPool) {
+        // Criterion 3: the `_`-bearing scope must match exactly AND the
+        // resulting scope strings must be right — catching an escaped
+        // prefix used where the raw one (mapping offset) was needed.
+        let exact = insert_test_thought(&pool, "exact", "personal_medical").await;
+        let dotted = insert_test_thought(&pool, "dotted", "personal_medical.anxiety").await;
+        // Unescaped, `personal_medical` would wildcard-match this:
+        let lookalike = insert_test_thought(&pool, "lookalike", "personalXmedical").await;
+        // A naive `.%.`-style mapping trap: underscore directly after.
+        let suffixed = insert_test_thought(&pool, "suffixed", "personal_medical_x").await;
+
+        let to = Scope::new("personal_health").unwrap();
+        rename_scope_subtree(
+            &pool,
+            "personal_medical",
+            &to,
+            "manual",
+            "rename",
+            "fake/v1",
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(fetch_scope(&pool, exact).await, "personal_health");
+        assert_eq!(fetch_scope(&pool, dotted).await, "personal_health.anxiety");
+        assert_eq!(fetch_scope(&pool, lookalike).await, "personalXmedical");
+        assert_eq!(fetch_scope(&pool, suffixed).await, "personal_medical_x");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn subtree_rename_percent_signs_are_literal(pool: PgPool) {
+        // `%` in the from-prefix: unescaped, `a%b` matches nearly anything.
+        let exact = insert_test_thought(&pool, "pct exact", "a%b").await;
+        let dotted = insert_test_thought(&pool, "pct dotted", "a%b.deep").await;
+        let unrelated = insert_test_thought(&pool, "wildcard victim", "aXbYz").await;
+
+        let to = Scope::new("c").unwrap();
+        rename_scope_subtree(&pool, "a%b", &to, "manual", "rename", "fake/v1", false)
+            .await
+            .unwrap();
+
+        assert_eq!(fetch_scope(&pool, exact).await, "c");
+        assert_eq!(fetch_scope(&pool, dotted).await, "c.deep");
+        assert_eq!(fetch_scope(&pool, unrelated).await, "aXbYz");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn subtree_dry_run_writes_nothing_but_reports(pool: PgPool) {
+        let exact = insert_test_thought(&pool, "exact", "work.foo").await;
+        insert_test_thought(&pool, "child", "work.foo.baz").await;
+
+        let to = Scope::new("work.bar").unwrap();
+        let out =
+            rename_scope_subtree(&pool, "work.foo", &to, "manual", "preview", "fake/v1", true)
+                .await
+                .unwrap();
+        assert!(!out.committed);
+        assert_eq!(out.moved.len(), 2);
+        assert_eq!(out.requeued, 2);
+        // The plan content is visible without committing:
+        let row = out
+            .moved
+            .iter()
+            .find(|r| r.old_scope == "work.foo.baz")
+            .unwrap();
+        assert_eq!(row.new_scope, "work.bar.baz");
+
+        assert_eq!(fetch_scope(&pool, exact).await, "work.foo");
+        assert!(audit_rows(&pool, exact).await.is_empty());
+        assert_eq!(pending_tags_count(&pool, exact).await, 0);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn subtree_overflow_rolls_back_the_whole_rename(pool: PgPool) {
+        // Criterion 5: `to` alone is valid (250 chars), but `to + "." + rest`
+        // overflows 256 for the deep row → nothing moves, no audit, no jobs.
+        let short = insert_test_thought(&pool, "maps exactly", "w").await;
+        let deep = insert_test_thought(&pool, "overflows", "w.zzzzzzzzzz").await;
+
+        let to = Scope::new(format!("t{}", "x".repeat(249))).unwrap();
+        assert!(to.as_str().len() <= kengram_core::Scope::MAX_LEN);
+        let result =
+            rename_scope_subtree(&pool, "w", &to, "manual", "too long", "fake/v1", false).await;
+        match result {
+            Err(StorageError::InvalidRescopeTarget(_)) => {}
+            other => panic!("expected InvalidRescopeTarget, got {other:?}"),
+        }
+
+        assert_eq!(fetch_scope(&pool, short).await, "w");
+        assert_eq!(fetch_scope(&pool, deep).await, "w.zzzzzzzzzz");
+        assert!(audit_rows(&pool, short).await.is_empty());
+        assert!(audit_rows(&pool, deep).await.is_empty());
+        assert_eq!(pending_tags_count(&pool, short).await, 0);
+        assert_eq!(pending_tags_count(&pool, deep).await, 0);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn subtree_retracted_rows_audit_but_never_requeue(pool: PgPool) {
+        let live = insert_test_thought(&pool, "live", "work.foo").await;
+        let dead = insert_test_thought(&pool, "retracted", "work.foo.dead").await;
+        retract_thought(&pool, dead, Some("test")).await.unwrap();
+
+        let to = Scope::new("work.bar").unwrap();
+        let out =
+            rename_scope_subtree(&pool, "work.foo", &to, "manual", "rename", "fake/v1", false)
+                .await
+                .unwrap();
+        assert_eq!(out.moved.len(), 2);
+        assert_eq!(out.requeued, 1); // live only
+
+        // Both rows get audit rows (filing hygiene applies to retracted)…
+        assert_eq!(audit_rows(&pool, live).await.len(), 1);
+        assert_eq!(audit_rows(&pool, dead).await.len(), 1);
+        // …but only the live one burns a tagger call.
+        assert_eq!(pending_tags_count(&pool, live).await, 1);
+        assert_eq!(pending_tags_count(&pool, dead).await, 0);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn subtree_already_pending_row_is_not_duplicated(pool: PgPool) {
+        let id = insert_test_thought(&pool, "already queued", "work.foo").await;
+        enqueue_tag_job(&pool, id, "fake/v1").await.unwrap();
+
+        let to = Scope::new("work.bar").unwrap();
+        rename_scope_subtree(&pool, "work.foo", &to, "manual", "rename", "fake/v1", false)
+            .await
+            .unwrap();
+        // ON CONFLICT DO NOTHING: the thought is already queued and will be
+        // tagged under the new scope on its next claim.
+        assert_eq!(pending_tags_count(&pool, id).await, 1);
     }
 }
