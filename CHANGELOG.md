@@ -6,6 +6,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- **Nightly tagger window no longer reports a false failure.**
+  `contrib/systemd/kengram-tagger-night.service` ran `kengram worker` (which
+  never self-exits) under `RuntimeMaxSec=21600`, and systemd always records
+  a RuntimeMaxSec-triggered stop as `failed (Result: timeout)` — so every
+  window, including successful ones, showed `failed` each morning (observed
+  3+ weeks live). `ExecStart` now ends the window itself via an inner
+  `timeout --signal=INT` (the same graceful shutdown `KillSignal` maps to),
+  normalizing the expected time-reached sentinel to exit 0; `RuntimeMaxSec`
+  stays as the outer safety net and genuine failures still redden the unit.
+  Docs walkthrough updated.
+
 ## [0.4.0] — 2026-11-08
 
 Thought rescoping (M7.2): supervised re-filing of existing thoughts under a new

@@ -18,7 +18,7 @@ verifying, and troubleshooting — lives in
 | `kengram-server.service` | exec | Runs `kengram serve` (the MCP/HTTP server). |
 | `kengram-worker.service` | exec | Runs `kengram worker` (embed + tag drainers). |
 | `kengram-tagger-night.service` | exec | **Optional.** A second `kengram worker` process for a nightly GPU-tagger window; pair with an embed-only `kengram-worker.service`. See `docs/linux-autostart.md`, "Optional: nightly GPU tagger window." |
-| `kengram-tagger-night.timer` | timer | **Optional.** Starts `kengram-tagger-night.service` at midnight; the service's own `RuntimeMaxSec` ends the window. |
+| `kengram-tagger-night.timer` | timer | **Optional.** Starts `kengram-tagger-night.service` at midnight; the service ends its own window via an inner `timeout` (5 min before its `RuntimeMaxSec` safety net fires). |
 
 The units ship in **user-service** form (run as your login user, read
 `~/.config/kengram/kengram.toml` via XDG). The doc shows the small deltas for the

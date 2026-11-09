@@ -267,9 +267,16 @@ overnight, when the coder is idle.
   via `KENGRAM_TAGGER__PROVIDER=`, so only the embed drainer runs. Vector
   search stays fresh 24/7; the tag drainer never contends with the coder.
 - A **nightly** `kengram-tagger-night.service`, started at 00:00 by
-  `kengram-tagger-night.timer` and hard-stopped after 6h via the service's
-  own `RuntimeMaxSec`, with tagging re-enabled and pointed at the
-  GPU-resident model via `KENGRAM_TAGGER__*` env overrides.
+  `kengram-tagger-night.timer`, with tagging re-enabled and pointed at the
+  GPU-resident model via `KENGRAM_TAGGER__*` env overrides. The window ends
+  itself: an inner `timeout --signal=INT` sends the app its graceful
+  ctrl_c shutdown 5 minutes before the service's `RuntimeMaxSec` safety net
+  would. (`kengram worker` never self-exits, and systemd *always* records a
+  RuntimeMaxSec-triggered stop as `failed (Result: timeout)` — observed live
+  2026-11-08, where 3+ weeks of perfectly healthy windows all reported
+  `failed` each morning. The wrapper normalizes the expected time-reached
+  sentinel to exit 0, so a green unit means the window ran and a red one
+  means something actually went wrong.)
 
 **Important — Ollama can silently serve your GPU-tagged model through an
 already-resident runner for a *different* tag.** Confirmed live during

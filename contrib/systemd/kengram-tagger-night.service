@@ -37,15 +37,25 @@ Environment=KENGRAM_TAGGER__TIMEOUT_SECONDS=@@NIGHT_TAGGER_TIMEOUT_SECONDS@@
 # — but this explicit stop-and-wait is the deterministic guarantee for the
 # exact midnight boundary regardless of TTL timing.
 ExecStartPre=-/bin/sh -c '@@OLLAMA_BIN@@ stop "@@NIGHT_TAGGER_CODER_MODEL@@" 2>/dev/null; @@OLLAMA_BIN@@ stop "@@DAY_TAGGER_MODEL_NAME@@" 2>/dev/null; i=0; while [ "$i" -lt 30 ] && @@OLLAMA_BIN@@ ps | tail -n +2 | grep -q .; do sleep 1; i=$((i + 1)); done; exit 0'
-ExecStart=@@KENGRAM_BIN@@ worker
-# System variant: ExecStart=@@KENGRAM_BIN@@ --config @@KENGRAM_CONFIG@@ worker
+# The window ends ITSELF: `timeout` delivers the same ctrl_c-style SIGINT
+# that KillSignal below maps manual stops onto, 5 minutes before
+# RuntimeMaxSec would. `kengram worker` never self-exits, and a
+# RuntimeMaxSec-triggered stop ALWAYS records `failed (Result: timeout)` —
+# so without this wrapper every window reads as a failure even when the
+# graceful shutdown worked perfectly, masking real ones. Exit 124 (the
+# timeout sentinel) normalizes to 0; any genuine app failure still
+# propagates non-zero and reddens the unit. (Confirmed live 2026-11-08:
+# every night for 3+ weeks ended `timeout` while tagging succeeded.)
+ExecStart=/bin/sh -c 'timeout --signal=INT 21300 @@KENGRAM_BIN@@ worker; rc=$?; [ "$rc" -eq 124 ] && rc=0; exit $rc'
+# System variant: ExecStart=/bin/sh -c 'timeout --signal=INT 21300 @@KENGRAM_BIN@@ --config @@KENGRAM_CONFIG@@ worker; rc=$?; [ "$rc" -eq 124 ] && rc=0; exit $rc'
 #   + User=/Group=docker/Environment=HOME= as above
-# Hard-stops 6h after actual start, regardless of the timer's own drift —
-# this, not the timer, is what enforces the end of the window.
+# Outer safety net: hard-stops 6h after actual start if the wrapper itself
+# wedges. With the inner timeout at 21300 this should never fire.
 RuntimeMaxSec=21600
-# Maps systemd's stop (RuntimeMaxSec expiry or a manual `systemctl stop`)
-# onto the app's existing ctrl_c()-driven graceful shutdown (CancellationToken
-# + 30s join deadline in run_worker) instead of an unhandled SIGTERM.
+# Maps systemd's stop (the RuntimeMaxSec safety net or a manual
+# `systemctl stop`) onto the app's existing ctrl_c()-driven graceful
+# shutdown (CancellationToken + 30s join deadline in run_worker)
+# instead of an unhandled SIGTERM.
 KillSignal=SIGINT
 # Small margin above the app's own 30s shutdown deadline before systemd
 # would escalate to SIGKILL.
