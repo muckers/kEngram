@@ -41,6 +41,10 @@ pub struct RescopeThoughtResponse {
     /// from `Err(NotFound)`, which the storage pre-read's `None` carries
     /// (a `scope <> target` predicate would collapse the two).
     pub changed: bool,
+    /// Tag job queued as a result (live thought + tagger configured).
+    /// CLI-only reporting field; the MCP tool's JSON response omits it
+    /// (contract shape is the four fields in §MCP surface delta).
+    pub requeued: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -132,6 +136,7 @@ pub async fn rescope_thought(
         previous_scope,
         new_scope: outcome.new_scope,
         changed: outcome.changed,
+        requeued: outcome.requeued,
     })
 }
 

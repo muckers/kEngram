@@ -1507,6 +1507,10 @@ pub struct RescopeOutcome {
     pub previous_scope: Option<String>,
     pub new_scope: String,
     pub changed: bool,
+    /// Whether the thought's tag job is queued as a result — true only
+    /// when the thought is live and `[tagger]` is configured. `false` on
+    /// not-found, no-op, retracted rows, and unconfigured-tagger runs.
+    pub requeued: bool,
 }
 
 /// Re-file one thought under a new scope. Update, audit append, and
@@ -1544,12 +1548,14 @@ pub async fn rescope_thought(
             previous_scope: None,
             new_scope: new_scope.as_str().to_string(),
             changed: false,
+            requeued: false,
         },
         Some(row) if row.scope == new_scope.as_str() => RescopeOutcome {
             thought_id,
             previous_scope: Some(row.scope),
             new_scope: new_scope.as_str().to_string(),
             changed: false,
+            requeued: false,
         },
         Some(row) => {
             sqlx::query!(
@@ -1578,6 +1584,7 @@ pub async fn rescope_thought(
             // the audit row but no requeue — the drainer doesn't filter
             // retracted_at and retracted tags feed nothing. Likewise a
             // missing tagger config (None) enqueues nothing.
+            let requeued = row.retracted_at.is_none() && tagger_model_id.is_some();
             if let (None, Some(model_id)) = (row.retracted_at, tagger_model_id) {
                 enqueue_tag_job(&mut *tx, thought_id, model_id).await?;
             }
@@ -1587,6 +1594,7 @@ pub async fn rescope_thought(
                 previous_scope: Some(row.scope),
                 new_scope: new_scope.as_str().to_string(),
                 changed: true,
+                requeued,
             }
         }
     };
