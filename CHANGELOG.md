@@ -6,6 +6,44 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-11-08
+
+Thought rescoping (M7.2): supervised re-filing of existing thoughts under a new
+scope, with an append-only audit trail. Amends the immutability contract
+(DESIGN.md §10): `scope` is operational metadata, mutable **only** through the
+rescope paths — `content`, `source`, and `created_at` stay immutable.
+
+### Added
+- **Thought rescoping (M7.2).** `rescope_thought` MCP tool + `kengram rescope`
+  CLI re-file a thought under a new scope; update, audit, and tag-job requeue
+  commit in one transaction (locking pre-read; PG16-safe audit). The tool
+  requires a one-sentence `reason` and takes an optional free-text `actor`;
+  it is idempotent (already at target → `changed: false`), with unknown ids a
+  clean error distinct from the no-op. The CLI adds **subtree renames**
+  (`--scope <old> --to <new>` — dotted-boundary: `work.foobar` is never
+  touched by `work → …`; CLI-only, taxonomy maintenance is an operator
+  workflow) and `--dry-run` on both forms, which runs the identical guards and
+  plan, prints accurate match + requeue counts, and commits nothing.
+- **`scope_changes` audit table (migration `0012`).** Append-only: every move
+  records `old_scope` (the pre-update value per row), `new_scope`, `actor`,
+  `reason`, `changed_at`. Full history stays SQL-only. Guards shared by CLI
+  and MCP — required non-blank reason, target validation, empty-dotted-segment
+  rejection (`work.`, `work..x`, `.work`), self-nesting rejection
+  (`work → work.archive`) — enforced again inside the storage write engine as
+  defense-in-depth.
+- **Re-tagging on move.** Rescoped live thoughts re-enqueue their tag job
+  (retracted rows and an unconfigured `[tagger]` do not), so tags re-derive
+  under the new scope's controlled vocabulary.
+- **Last-rescope hint.** `get_thought` / `/api/thoughts/{id}` / web
+  thought-detail surface `rescoped_at` + `previous_scope` (the latest
+  `scope_changes` hop), mirroring how retraction state renders.
+
+### Changed
+- **Contract:** `thoughts.scope` reclassified from claim content to operational
+  metadata (DESIGN.md §10 amendment, 2026-11-06). Ad-hoc `UPDATE … SET scope`
+  remains forbidden; the sanctioned write paths are the rescope CLI/tool, and
+  they keep the audit trail.
+
 ## [0.3.0] — 2026-06-30
 
 Read-only web UI (M8) over the existing corpus, plus two retrieval-core fixes.
@@ -83,7 +121,8 @@ thoughts in Postgres + pgvector and exposes them to any MCP-capable client.
 - No Prometheus metrics or eval suite yet (remaining M7 scope).
 - Tagger output quality varies by base model; tags are advisory only.
 
-[Unreleased]: https://github.com/muckers/kEngram/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/muckers/kEngram/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/muckers/kEngram/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/muckers/kEngram/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/muckers/kEngram/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/muckers/kEngram/releases/tag/v0.1.0

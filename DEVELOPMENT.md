@@ -230,7 +230,7 @@ sqlx migrate run
 
 Once the workspace is built (step 5), `cargo run --bin kengram -- migrate` is the equivalent idempotent form.
 
-The migration set (currently 11 numbered files in `migrations/`) ships the schema described in `DESIGN.md` §5, plus subsequent additions: thought retraction, the thought_links graph layer, polymorphic link targets, soft-delete + migration_audit, and the JSONB cleanup that removed the redundant `tags.relations` copy.
+The migration set (currently 12 numbered files in `migrations/`) ships the schema described in `DESIGN.md` §5, plus subsequent additions: thought retraction, the thought_links graph layer, polymorphic link targets, soft-delete + migration_audit, the JSONB cleanup that removed the redundant `tags.relations` copy, and the `scope_changes` append-only audit table behind thought rescoping (0012, M7.2).
 
 **Migration audit.** The `migration_audit` table (introduced in 0010) records what each migration did — `migration`, `ran_at`, `rows_touched`, optional `notes`. Convention going forward: any row-touching migration ends with an `INSERT INTO migration_audit (...)` statement so the operator can verify per-migration impact via `kengram audit migrations` rather than psql. Schema-only migrations should still insert an audit row with `rows_touched = 0` and a one-line `notes` summary. See [Operator workflows](#operator-workflows) for the `kengram audit migrations` walkthrough.
 
@@ -260,7 +260,7 @@ The `--all-targets --all-features` flags matter: they capture `query!` macros be
 
 CI (when it lands at M7) will enforce that `.sqlx/` is up to date.
 
-Point an MCP-capable client (Claude Code, Claude Desktop, `mcp-inspector`) at `http://127.0.0.1:8081/mcp` (streamable-HTTP transport, per the current MCP spec). Nine tools are exposed:
+Point an MCP-capable client (Claude Code, Claude Desktop, `mcp-inspector`) at `http://127.0.0.1:8081/mcp` (streamable-HTTP transport, per the current MCP spec). Ten tools are exposed:
 
 - `capture` — write a thought; returns `thought_id`, `embedding_status: "pending"`, and `is_duplicate`. Same content captured twice (SHA-256 fingerprint match) returns the existing `thought_id`.
 - `search_thoughts` — RRF-fused vector + trigram retrieval over thoughts; recency-boosted; optional cross-encoder rerank; optional `tag_filter` JSONB-containment filter (e.g. `{"kind": "task"}`); `scope` (exact) or `scope_prefix` (namespace) for scope filtering. Each hit carries its `tags` object.
@@ -268,6 +268,7 @@ Point an MCP-capable client (Claude Code, Claude Desktop, `mcp-inspector`) at `h
 - `list_scopes` — discover what scopes are in use (optionally `prefix`-filtered). Pair with `scope_prefix` on the search/recent tools for a discover-then-query workflow.
 - `get_thought` — full thought + provenance + tags + tagger provenance.
 - `retract_thought` — mark a thought as untrusted (excluded from retrieval; still visible via `get_thought` for audit).
+- `rescope_thought` — re-file a thought under a new scope (M7.2; required `reason`, audited in append-only `scope_changes`, re-enqueues tagging). Bulk subtree renames are CLI-only: `kengram rescope --scope <old> --to <new> [--dry-run]`.
 - `link_thoughts`, `unlink_thoughts`, `get_related_thoughts` — the graph layer. See [Relational data and link graph](#relational-data-and-link-graph).
 
 `kengram serve` and `kengram worker` are paired: `serve` writes thoughts and enqueues embedding + tag jobs; `worker` drains both queues (`pending_embeddings` and `pending_tags`). Running `serve` without `worker` is fine — thoughts are still durable and trigram-searchable — but vector kNN won't surface them and tags stay empty until the worker runs. When `[tagger].provider` is empty, the tag-job enqueue at capture is a no-op and the tag drainer doesn't spawn.

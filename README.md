@@ -94,7 +94,7 @@ Equivalent JSON for `.mcp.json`:
 }
 ```
 
-All nine tools (see below) are available with full schemas.
+All ten tools (see below) are available with full schemas.
 
 ### Claude Desktop
 
@@ -173,7 +173,7 @@ Config lives at `opencode.json` (project root) or `~/.config/opencode/opencode.j
 }
 ```
 
-In opencode, pick the model via `/models` (it appears as `ollama/qwen3:14b`); kEngram's nine tools become available alongside opencode's built-ins. **The model must be tool-capable** — `qwen3` family, `llama3.1+`, `gpt-oss` work; many smaller Llama variants silently no-op on tool calls. kEngram's default deployment is single-user localhost (Tier 0); LAN/Tailnet exposure is Tier 1. Tier 2 bearer auth is M7 ahead — see [Roadmap](#roadmap).
+In opencode, pick the model via `/models` (it appears as `ollama/qwen3:14b`); kEngram's ten tools become available alongside opencode's built-ins. **The model must be tool-capable** — `qwen3` family, `llama3.1+`, `gpt-oss` work; many smaller Llama variants silently no-op on tool calls. kEngram's default deployment is single-user localhost (Tier 0); LAN/Tailnet exposure is Tier 1. Tier 2 bearer auth is M7 ahead — see [Roadmap](#roadmap).
 
 ### Other MCP clients
 
@@ -181,7 +181,7 @@ Any client speaking streamable-HTTP can point at `http://127.0.0.1:8081/mcp` dir
 
 ## What you get (MCP surface)
 
-**Status:** everything through M6 is shipped — capture & search, hybrid retrieval with cross-encoder rerank, the tagging sidecar, and the relational link graph — plus `kengram backup` / `restore` (M7.0), the tagger-quality eval harness (M7.1), and the read-only [web UI](#web-ui-read-only-m8) (M8). The rest of M7 (operational maturity — Prometheus metrics, Tier 2 auth, eval suite) is open work and a good first place to contribute. See the [Roadmap](#roadmap) for the per-milestone breakdown.
+**Status:** everything through M6 is shipped — capture & search, hybrid retrieval with cross-encoder rerank, the tagging sidecar, and the relational link graph — plus `kengram backup` / `restore` (M7.0), the tagger-quality eval harness (M7.1), the read-only [web UI](#web-ui-read-only-m8) (M8), and thought rescoping (M7.2). The rest of M7 (operational maturity — Prometheus metrics, Tier 2 auth, eval suite) is open work and a good first place to contribute. See the [Roadmap](#roadmap) for the per-milestone breakdown.
 
 | Tool | What it does |
 |---|---|
@@ -190,12 +190,13 @@ Any client speaking streamable-HTTP can point at `http://127.0.0.1:8081/mcp` dir
 | `recent_thoughts` | Browse by recency in a (optional) scope. Accepts `scope` (exact match) or `scope_prefix` (namespace match) — mutually exclusive. Excludes retracted thoughts. |
 | `get_thought` | Full thought + provenance (embedding status, embedded-at, tags, tagger provenance — `tags_extractor_model` / `tags_extractor_version` / `tags_extracted_at` — retraction state). Direct lookup returns the row even if retracted — the audit path. |
 | `retract_thought` | Mark a thought as untrusted. Sets `thoughts.retracted_at` so the row is excluded from retrieval. The row stays in the DB; `get_thought` still returns it with retraction state surfaced. |
+| `rescope_thought` | Re-file an existing thought under a new scope (M7.2) — the only sanctioned way to change an existing thought's filing label; content is never touched. Requires a one-sentence `reason`; optional free-text `actor`. Every move appends to the append-only `scope_changes` audit trail and re-enqueues the tag job (live thoughts) so tags re-derive under the new scope's vocabulary. Idempotent: already at target → `changed: false`, nothing written. Bulk subtree renames are CLI-only (`kengram rescope --scope <old> --to <new>`). |
 | `link_thoughts` | Create a link from a thought to a polymorphic target (another thought, an entity name, a person name, or a URL) with one of seven closed-vocabulary relations. Idempotent on `(from, relation, to_kind, to_value)`. |
 | `unlink_thoughts` | Soft-delete a link by its `(from, relation, target)` triple. Returns a three-way `status`: `deleted_now`, `already_deleted`, or `never_existed`. Re-creating a soft-deleted edge via `link_thoughts` succeeds (fresh row). |
 | `get_related_thoughts` | Walk the link graph from a thought. Returns `outbound` + `inbound` groups; each hit carries a `to_kind`/`to_value` discriminator and a `link_source` (`agent` vs `tagger`). For thought-target hits, also surfaces the target's content-preview, scope, retraction state, and timestamps. Optional filters by relation, target kind, and direction. |
 | `list_scopes` | Enumerate scopes currently in use (each with `thought_count`, `first_activity_at`, `last_activity_at`), sorted most-recently-used first. Optional `prefix` filter. Pair with `scope_prefix` on `search_thoughts` / `recent_thoughts` to query across a namespace. |
 
-CLI subcommands: `kengram serve`, `kengram worker`, `kengram migrate`, `kengram embed-backfill`, `kengram tag`, `kengram stats`, `kengram bench`, `kengram audit migrations`, `kengram backup`, `kengram restore`. Operational details in [Operator workflows](DEVELOPMENT.md#operator-workflows) in DEVELOPMENT.md.
+CLI subcommands: `kengram serve`, `kengram worker`, `kengram migrate`, `kengram embed-backfill`, `kengram tag`, `kengram rescope`, `kengram stats`, `kengram bench`, `kengram audit migrations`, `kengram backup`, `kengram restore`. Operational details in [Operator workflows](DEVELOPMENT.md#operator-workflows) in DEVELOPMENT.md.
 
 ## Web UI (read-only, M8)
 
@@ -291,9 +292,9 @@ crates/
 ├── kengram-extract/              # Tagger impls: OpenAICompatibleTagger (vLLM/OpenRouter/Ollama), HttpTagger (sidecar client), FakeTagger
 ├── kengram-tagger-protocol/      # wire types for the HTTP tagger-sidecar contract
 ├── kengram-tagger-deterministic/ # reference non-LLM tagger sidecar (opt-in)
-├── kengram-mcp/                  # capture/search/get/recent/retract/link/unlink/related/scopes orchestrators + rmcp wiring
+├── kengram-mcp/                  # capture/search/get/recent/retract/rescope/link/unlink/related/scopes orchestrators + rmcp wiring
 ├── kengram-web/                  # read-only web UI (M8): SSR pages + /api/* reusing the kengram-mcp orchestrators
-└── kengram-cli/                  # binary; serve/migrate/worker/embed-backfill/tag/stats/bench/audit/backup/restore subcommands
+└── kengram-cli/                  # binary; serve/migrate/worker/embed-backfill/tag/rescope/stats/bench/audit/backup/restore subcommands
 migrations/                       # sqlx migrations (numbered)
 docs/                             # design doc + per-milestone scope/progress
 scripts/                          # operator-driven runbooks (bench-rerank.md, smoke.md)
@@ -314,7 +315,7 @@ Built across seven capability milestones (M1 → M7), preceded by an environment
 | [M4.1 — v2 tagging](docs/milestones/m4.1-tagging-v2.md) | ✅ | Split `topics` into `entities` + `topics`; scope-aware controlled-vocabulary injection. |
 | [M5 — selective relations](docs/milestones/m5-selective-relations.md) | ✅ | Thought-to-thought graph layer with seven closed-vocabulary relations. M5.1 added `supports`. M5.2 added polymorphic targets, soft-delete with three-way unlink status, and operator audit (`migration_audit` + `kengram audit migrations`). |
 | [M6 — stats CLI + tagger-extracted relations](docs/milestones/m6-stats-and-tagger-relations.md) | ✅ | `kengram stats` CLI for corpus + storage telemetry. v5+ tagger auto-emits non-thought relations (URLs / entities / persons) from prose with `source='tagger'`. The original M6 (artifacts) was dropped after a live-corpus measurement showed kengram occupies a high-signal-density sweet spot. |
-| [M7 — operational maturity](docs/milestones/m7-operational-maturity.md) | 🚧 | **Shipped (M7.0):** `kengram backup` / `kengram restore` with manifest sidecar + compatibility checks. **Shipped (M7.1):** tagger-quality eval harness + cross-model sweep. **Open:** Prometheus `/metrics`, Tier 2 bearer-token auth, eval suite, backup retention cron, tunnel deployment guide. |
+| [M7 — operational maturity](docs/milestones/m7-operational-maturity.md) | 🚧 | **Shipped (M7.0):** `kengram backup` / `kengram restore` with manifest sidecar + compatibility checks. **Shipped (M7.1):** tagger-quality eval harness + cross-model sweep. **Shipped (M7.2):** thought rescoping — `kengram rescope` CLI + `rescope_thought` MCP tool with append-only `scope_changes` audit. **Open:** Prometheus `/metrics`, Tier 2 bearer-token auth, eval suite, backup retention cron, tunnel deployment guide. |
 | [M8 — human read surface](docs/milestones/m8-human-read-surface.md) | ✅ | Read-only web UI (search / thought detail / link graph / scope browser) served by `kengram serve` behind `[web].enabled`; five read-only `/api/*` endpoints reusing the MCP orchestrators. Rust SSR + vanilla JS, no Node. |
 
 Per-milestone progress is tracked in `docs/milestones/m{N}-progress.md`.
