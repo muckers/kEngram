@@ -1518,13 +1518,16 @@ pub struct RescopeOutcome {
 /// (`RETURNING OLD.*` is PG 18+). `FOR UPDATE` matters even single-user:
 /// two concurrent rescopes must not both see the pre-move state and
 /// double-write audit rows.
+/// `tagger_model_id`: `None` when `[tagger]` is unconfigured — the rescope
+/// still moves and audits, but enqueues nothing (mirrors capture's
+/// silent-disable semantics).
 pub async fn rescope_thought(
     pool: &PgPool,
     thought_id: ThoughtId,
     new_scope: &Scope,
     actor: &str,
     reason: &str,
-    tagger_model_id: &str,
+    tagger_model_id: Option<&str>,
 ) -> Result<RescopeOutcome, StorageError> {
     let mut tx = pool.begin().await?;
 
@@ -1573,9 +1576,10 @@ pub async fn rescope_thought(
             // and the scope-identifier strip filter, so old-scope tags are
             // silently stale under the new scope. Retracted thoughts get
             // the audit row but no requeue — the drainer doesn't filter
-            // retracted_at and retracted tags feed nothing.
-            if row.retracted_at.is_none() {
-                enqueue_tag_job(&mut *tx, thought_id, tagger_model_id).await?;
+            // retracted_at and retracted tags feed nothing. Likewise a
+            // missing tagger config (None) enqueues nothing.
+            if let (None, Some(model_id)) = (row.retracted_at, tagger_model_id) {
+                enqueue_tag_job(&mut *tx, thought_id, model_id).await?;
             }
 
             RescopeOutcome {
@@ -1634,7 +1638,7 @@ pub async fn rename_scope_subtree(
     to: &Scope,
     actor: &str,
     reason: &str,
-    tagger_model_id: &str,
+    tagger_model_id: Option<&str>,
     dry_run: bool,
 ) -> Result<SubtreeRescopeOutcome, StorageError> {
     let escaped = escape_like_prefix(from);
@@ -1679,7 +1683,11 @@ pub async fn rename_scope_subtree(
         });
     }
 
-    let requeued = rows.iter().filter(|r| r.retracted_at.is_none()).count();
+    let requeued = if tagger_model_id.is_some() {
+        rows.iter().filter(|r| r.retracted_at.is_none()).count()
+    } else {
+        0
+    };
 
     if dry_run || plan.is_empty() {
         // Nothing to commit; the rollback (drop) releases the row locks.
@@ -1712,8 +1720,8 @@ pub async fn rename_scope_subtree(
         .execute(&mut *tx)
         .await?;
 
-        if r.retracted_at.is_none() {
-            enqueue_tag_job(&mut *tx, row.thought_id, tagger_model_id).await?;
+        if let (None, Some(model_id)) = (r.retracted_at, tagger_model_id) {
+            enqueue_tag_job(&mut *tx, row.thought_id, model_id).await?;
         }
     }
 
@@ -3980,7 +3988,7 @@ mod tests {
     async fn rescope_single_moves_audits_and_requeues(pool: PgPool) {
         let id = insert_test_thought(&pool, "misfiled", "global").await;
         let to = Scope::new("work.bar").unwrap();
-        let out = rescope_thought(&pool, id, &to, "manual", "taxonomy drift", "fake/v1")
+        let out = rescope_thought(&pool, id, &to, "manual", "taxonomy drift", Some("fake/v1"))
             .await
             .unwrap();
         assert!(out.changed);
@@ -4001,7 +4009,7 @@ mod tests {
     async fn rescope_single_no_op_writes_nothing(pool: PgPool) {
         let id = insert_test_thought(&pool, "already placed", "work.bar").await;
         let to = Scope::new("work.bar").unwrap();
-        let out = rescope_thought(&pool, id, &to, "manual", "rerun", "fake/v1")
+        let out = rescope_thought(&pool, id, &to, "manual", "rerun", Some("fake/v1"))
             .await
             .unwrap();
         assert!(!out.changed);
@@ -4014,7 +4022,7 @@ mod tests {
     async fn rescope_single_not_found_is_distinct_from_no_op(pool: PgPool) {
         let missing = ThoughtId::from(uuid::Uuid::new_v4());
         let to = Scope::new("work.bar").unwrap();
-        let out = rescope_thought(&pool, missing, &to, "manual", "x", "fake/v1")
+        let out = rescope_thought(&pool, missing, &to, "manual", "x", Some("fake/v1"))
             .await
             .unwrap();
         // No row at all → previous_scope None; a no-op carries Some(scope).
@@ -4030,7 +4038,13 @@ mod tests {
 
         let to = Scope::new("work.bar").unwrap();
         let out = rename_scope_subtree(
-            &pool, "work.foo", &to, "manual", "taxonomy", "fake/v1", false,
+            &pool,
+            "work.foo",
+            &to,
+            "manual",
+            "taxonomy",
+            Some("fake/v1"),
+            false,
         )
         .await
         .unwrap();
@@ -4066,13 +4080,28 @@ mod tests {
     async fn subtree_rename_rerun_is_a_no_op(pool: PgPool) {
         insert_test_thought(&pool, "exact", "work.foo").await;
         let to = Scope::new("work.bar").unwrap();
-        rename_scope_subtree(&pool, "work.foo", &to, "manual", "first", "fake/v1", false)
-            .await
-            .unwrap();
-        let again =
-            rename_scope_subtree(&pool, "work.foo", &to, "manual", "rerun", "fake/v1", false)
-                .await
-                .unwrap();
+        rename_scope_subtree(
+            &pool,
+            "work.foo",
+            &to,
+            "manual",
+            "first",
+            Some("fake/v1"),
+            false,
+        )
+        .await
+        .unwrap();
+        let again = rename_scope_subtree(
+            &pool,
+            "work.foo",
+            &to,
+            "manual",
+            "rerun",
+            Some("fake/v1"),
+            false,
+        )
+        .await
+        .unwrap();
         assert!(!again.committed);
         assert!(again.moved.is_empty());
         assert_eq!(again.requeued, 0);
@@ -4097,7 +4126,7 @@ mod tests {
             &to,
             "manual",
             "rename",
-            "fake/v1",
+            Some("fake/v1"),
             false,
         )
         .await
@@ -4117,9 +4146,17 @@ mod tests {
         let unrelated = insert_test_thought(&pool, "wildcard victim", "aXbYz").await;
 
         let to = Scope::new("c").unwrap();
-        rename_scope_subtree(&pool, "a%b", &to, "manual", "rename", "fake/v1", false)
-            .await
-            .unwrap();
+        rename_scope_subtree(
+            &pool,
+            "a%b",
+            &to,
+            "manual",
+            "rename",
+            Some("fake/v1"),
+            false,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(fetch_scope(&pool, exact).await, "c");
         assert_eq!(fetch_scope(&pool, dotted).await, "c.deep");
@@ -4132,10 +4169,17 @@ mod tests {
         insert_test_thought(&pool, "child", "work.foo.baz").await;
 
         let to = Scope::new("work.bar").unwrap();
-        let out =
-            rename_scope_subtree(&pool, "work.foo", &to, "manual", "preview", "fake/v1", true)
-                .await
-                .unwrap();
+        let out = rename_scope_subtree(
+            &pool,
+            "work.foo",
+            &to,
+            "manual",
+            "preview",
+            Some("fake/v1"),
+            true,
+        )
+        .await
+        .unwrap();
         assert!(!out.committed);
         assert_eq!(out.moved.len(), 2);
         assert_eq!(out.requeued, 2);
@@ -4161,8 +4205,16 @@ mod tests {
 
         let to = Scope::new(format!("t{}", "x".repeat(249))).unwrap();
         assert!(to.as_str().len() <= kengram_core::Scope::MAX_LEN);
-        let result =
-            rename_scope_subtree(&pool, "w", &to, "manual", "too long", "fake/v1", false).await;
+        let result = rename_scope_subtree(
+            &pool,
+            "w",
+            &to,
+            "manual",
+            "too long",
+            Some("fake/v1"),
+            false,
+        )
+        .await;
         match result {
             Err(StorageError::InvalidRescopeTarget(_)) => {}
             other => panic!("expected InvalidRescopeTarget, got {other:?}"),
@@ -4183,10 +4235,17 @@ mod tests {
         retract_thought(&pool, dead, Some("test")).await.unwrap();
 
         let to = Scope::new("work.bar").unwrap();
-        let out =
-            rename_scope_subtree(&pool, "work.foo", &to, "manual", "rename", "fake/v1", false)
-                .await
-                .unwrap();
+        let out = rename_scope_subtree(
+            &pool,
+            "work.foo",
+            &to,
+            "manual",
+            "rename",
+            Some("fake/v1"),
+            false,
+        )
+        .await
+        .unwrap();
         assert_eq!(out.moved.len(), 2);
         assert_eq!(out.requeued, 1); // live only
 
@@ -4204,9 +4263,17 @@ mod tests {
         enqueue_tag_job(&pool, id, "fake/v1").await.unwrap();
 
         let to = Scope::new("work.bar").unwrap();
-        rename_scope_subtree(&pool, "work.foo", &to, "manual", "rename", "fake/v1", false)
-            .await
-            .unwrap();
+        rename_scope_subtree(
+            &pool,
+            "work.foo",
+            &to,
+            "manual",
+            "rename",
+            Some("fake/v1"),
+            false,
+        )
+        .await
+        .unwrap();
         // ON CONFLICT DO NOTHING: the thought is already queued and will be
         // tagged under the new scope on its next claim.
         assert_eq!(pending_tags_count(&pool, id).await, 1);

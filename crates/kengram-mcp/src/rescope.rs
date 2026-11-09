@@ -107,7 +107,7 @@ fn resolve_actor(actor: Option<&str>) -> String {
 /// no-op/did-work seam as `retract_thought`.
 pub async fn rescope_thought(
     pool: &PgPool,
-    tagger_model_id: &str,
+    tagger_model_id: Option<&str>,
     request: RescopeThoughtRequest,
 ) -> Result<RescopeThoughtResponse, RescopeError> {
     let reason = guard_reason(&request.reason)?;
@@ -143,7 +143,7 @@ pub async fn rescope_thought(
 /// per pass.
 pub async fn rename_scope_subtree(
     pool: &PgPool,
-    tagger_model_id: &str,
+    tagger_model_id: Option<&str>,
     request: RenameScopeRequest,
 ) -> Result<RenameScopeResponse, RescopeError> {
     let reason = guard_reason(&request.reason)?;
@@ -236,15 +236,23 @@ mod tests {
         // Criterion 1: a bad id yields a clean not-found *error*, while
         // already-at-target is an Ok(changed:false) no-op.
         let missing = ThoughtId::new();
-        let err = rescope_thought(&pool, TEST_TAGGER_ID, req(missing, "work.bar", "x", None))
-            .await
-            .unwrap_err();
+        let err = rescope_thought(
+            &pool,
+            Some(TEST_TAGGER_ID),
+            req(missing, "work.bar", "x", None),
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, RescopeError::NotFound(id) if id == missing));
 
         let id = cap(&pool, "placed", "work.bar").await;
-        let resp = rescope_thought(&pool, TEST_TAGGER_ID, req(id, "work.bar", "rerun", None))
-            .await
-            .unwrap();
+        let resp = rescope_thought(
+            &pool,
+            Some(TEST_TAGGER_ID),
+            req(id, "work.bar", "rerun", None),
+        )
+        .await
+        .unwrap();
         assert!(!resp.changed);
         assert_eq!(resp.previous_scope.as_str(), "work.bar");
         // No-op wrote no audit row.
@@ -258,14 +266,18 @@ mod tests {
         let b = cap(&pool, "two", "global").await;
         rescope_thought(
             &pool,
-            TEST_TAGGER_ID,
+            Some(TEST_TAGGER_ID),
             req(a, "work.x", "naming", Some("agent:claude-code")),
         )
         .await
         .unwrap();
-        rescope_thought(&pool, TEST_TAGGER_ID, req(b, "work.y", "naming", None))
-            .await
-            .unwrap();
+        rescope_thought(
+            &pool,
+            Some(TEST_TAGGER_ID),
+            req(b, "work.y", "naming", None),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             audit_actor(&pool, a).await.as_deref(),
             Some("agent:claude-code")
@@ -276,14 +288,14 @@ mod tests {
     #[sqlx::test(migrations = "../../migrations")]
     async fn blank_reason_is_rejected_everywhere(pool: PgPool) {
         let id = cap(&pool, "one", "global").await;
-        let err = rescope_thought(&pool, TEST_TAGGER_ID, req(id, "work.x", "   ", None))
+        let err = rescope_thought(&pool, Some(TEST_TAGGER_ID), req(id, "work.x", "   ", None))
             .await
             .unwrap_err();
         assert!(matches!(err, RescopeError::MissingReason));
 
         let err = rename_scope_subtree(
             &pool,
-            TEST_TAGGER_ID,
+            Some(TEST_TAGGER_ID),
             RenameScopeRequest {
                 from: "work".into(),
                 to: "play".into(),
@@ -305,7 +317,7 @@ mod tests {
         for to in ["work", "work.archive", "work.archive.deep"] {
             let err = rename_scope_subtree(
                 &pool,
-                TEST_TAGGER_ID,
+                Some(TEST_TAGGER_ID),
                 RenameScopeRequest {
                     from: "work".into(),
                     to: to.into(),
@@ -332,13 +344,13 @@ mod tests {
     #[sqlx::test(migrations = "../../migrations")]
     async fn invalid_target_rejected(pool: PgPool) {
         let id = cap(&pool, "one", "global").await;
-        let err = rescope_thought(&pool, TEST_TAGGER_ID, req(id, "", "x", None))
+        let err = rescope_thought(&pool, Some(TEST_TAGGER_ID), req(id, "", "x", None))
             .await
             .unwrap_err();
         assert!(matches!(err, RescopeError::InvalidScope(_)));
         let err = rescope_thought(
             &pool,
-            TEST_TAGGER_ID,
+            Some(TEST_TAGGER_ID),
             req(id, "t".repeat(257).as_str(), "x", None),
         )
         .await
@@ -347,11 +359,31 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../../migrations")]
+    async fn unconfigured_tagger_moves_and_audits_without_enqueue(pool: PgPool) {
+        // `[tagger]` absent: the move + audit still happen, the queue
+        // stays empty — capture's silent-disable semantics carried over.
+        let id = cap(&pool, "one", "global").await;
+        let resp = rescope_thought(&pool, None, req(id, "work.x", "no tagger", None))
+            .await
+            .unwrap();
+        assert!(resp.changed);
+        assert!(audit_actor(&pool, id).await.is_some());
+        let q = sqlx::query!(
+            "SELECT COUNT(*) AS \"count!\" FROM pending_tags WHERE thought_id = $1",
+            Tid::into_uuid(id)
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(q.count, 0);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
     async fn dry_run_plans_without_committing(pool: PgPool) {
         let id = cap(&pool, "one", "work.foo").await;
         let resp = rename_scope_subtree(
             &pool,
-            TEST_TAGGER_ID,
+            Some(TEST_TAGGER_ID),
             RenameScopeRequest {
                 from: "work.foo".into(),
                 to: "work.bar".into(),

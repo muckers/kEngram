@@ -51,7 +51,8 @@ pub use search::{
 };
 pub use server::{
     CaptureArgs, GetRelatedThoughtsArgs, GetThoughtArgs, KengramServer, LinkThoughtsArgs,
-    ListScopesArgs, RecentThoughtsArgs, RetractThoughtArgs, SearchThoughtsArgs, UnlinkThoughtsArgs,
+    ListScopesArgs, RecentThoughtsArgs, RescopeThoughtArgs, RetractThoughtArgs, SearchThoughtsArgs,
+    UnlinkThoughtsArgs,
 };
 pub use stats::{
     CorpusStatsRequest, CorpusStatsResponse, corpus_stats, corpus_stats_response_json,
