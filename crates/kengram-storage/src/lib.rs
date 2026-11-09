@@ -277,6 +277,12 @@ pub struct ThoughtWithProvenance {
     /// path and continues to return the row regardless of retraction state.
     pub retracted_at: Option<OffsetDateTime>,
     pub retracted_reason: Option<String>,
+    /// `Some(_)` when the thought has been re-filed (M7.2): the **latest**
+    /// `scope_changes` hop — `previous_scope` is that row's `old_scope`.
+    /// Deliberately last-hop-only (2026-11-08 ruling): full rescope
+    /// history stays SQL-only, like `migration_audit`.
+    pub rescoped_at: Option<OffsetDateTime>,
+    pub previous_scope: Option<String>,
 }
 
 /// Fetch a thought along with its embedding provenance for the given model.
@@ -291,12 +297,20 @@ pub async fn fetch_thought_with_provenance(
                t.content_fingerprint, t.tags,
                t.tags_extractor_model, t.tags_extractor_version, t.tags_extracted_at,
                t.retracted_at, t.retracted_reason,
-               e.created_at AS "embedded_at?"
+               e.created_at AS "embedded_at?",
+               sc.changed_at AS "rescoped_at?", sc.old_scope AS "previous_scope?"
         FROM thoughts t
         LEFT JOIN embeddings e
             ON e.target_kind = 'thought'
            AND e.target_id = t.id
            AND e.model_id = $2
+        LEFT JOIN LATERAL (
+            SELECT old_scope, changed_at
+            FROM scope_changes
+            WHERE thought_id = t.id
+            ORDER BY changed_at DESC
+            LIMIT 1
+        ) sc ON true
         WHERE t.id = $1
         "#,
         id.into_uuid(),
@@ -335,6 +349,8 @@ pub async fn fetch_thought_with_provenance(
         embedded_at: r.embedded_at,
         retracted_at: r.retracted_at,
         retracted_reason: r.retracted_reason,
+        rescoped_at: r.rescoped_at,
+        previous_scope: r.previous_scope,
     }))
 }
 
@@ -4263,6 +4279,50 @@ mod tests {
         // …but only the live one burns a tagger call.
         assert_eq!(pending_tags_count(&pool, live).await, 1);
         assert_eq!(pending_tags_count(&pool, dead).await, 0);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn provenance_surfaces_only_the_last_rescope_hop(pool: PgPool) {
+        let id = insert_test_thought(&pool, "moved twice", "global").await;
+        let model = EmbeddingModel::bge_m3();
+        let prov = fetch_thought_with_provenance(&pool, id, &model)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(prov.rescoped_at.is_none());
+        assert!(prov.previous_scope.is_none());
+
+        rescope_thought(
+            &pool,
+            id,
+            &Scope::new("work.a").unwrap(),
+            "manual",
+            "first hop",
+            Some("fake/v1"),
+        )
+        .await
+        .unwrap();
+        // Separate the NOW()s so ORDER BY changed_at DESC is deterministic.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        rescope_thought(
+            &pool,
+            id,
+            &Scope::new("work.b").unwrap(),
+            "manual",
+            "second hop",
+            Some("fake/v1"),
+        )
+        .await
+        .unwrap();
+
+        let prov = fetch_thought_with_provenance(&pool, id, &model)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(prov.rescoped_at.is_some());
+        // Latest hop only — `global` (the first hop's old_scope) does NOT
+        // surface; that history is SQL-only by ruling.
+        assert_eq!(prov.previous_scope.as_deref(), Some("work.a"));
     }
 
     #[sqlx::test(migrations = "../../migrations")]

@@ -143,6 +143,10 @@ pub struct GetThoughtResponse {
     /// state.
     pub retracted_at: Option<OffsetDateTime>,
     pub retracted_reason: Option<String>,
+    /// Last-rescope hint (M7.2, 2026-11-08 ruling): the latest
+    /// `scope_changes` hop only — full history stays SQL-only.
+    pub rescoped_at: Option<OffsetDateTime>,
+    pub previous_scope: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -446,6 +450,8 @@ pub async fn get_thought(
         embedded_at: prov.embedded_at,
         retracted_at: prov.retracted_at,
         retracted_reason: prov.retracted_reason,
+        rescoped_at: prov.rescoped_at,
+        previous_scope: prov.previous_scope,
     })
 }
 
@@ -550,6 +556,8 @@ pub fn get_thought_response_json(resp: &GetThoughtResponse) -> serde_json::Value
             "tags_extracted_at": resp.thought.tags_extracted_at.and_then(|t| t.format(&time::format_description::well_known::Rfc3339).ok()),
             "retracted_at": resp.retracted_at.and_then(|t| t.format(&time::format_description::well_known::Rfc3339).ok()),
             "retracted_reason": resp.retracted_reason,
+            "rescoped_at": resp.rescoped_at.and_then(|t| t.format(&time::format_description::well_known::Rfc3339).ok()),
+            "previous_scope": resp.previous_scope,
         },
     })
 }
@@ -771,6 +779,36 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ReadError::NotFound));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn get_thought_json_carries_last_rescope_hint(pool: PgPool) {
+        // M7.2 ruling: get_thought surfaces the latest scope_changes hop;
+        // both MCP and /api serialize through this one mapper, so the web
+        // view matches the MCP view byte-for-byte.
+        let id = cap(&pool, "re-filed", "global").await;
+        let to = kengram_core::Scope::new("work.x").unwrap();
+        kengram_storage::rescope_thought(&pool, id, &to, "agent:test", "hop", None)
+            .await
+            .unwrap();
+
+        let embedder = FakeEmbedder::new();
+        let resp = get_thought(&pool, embedder.model(), id).await.unwrap();
+        assert_eq!(resp.previous_scope.as_deref(), Some("global"));
+        assert!(resp.rescoped_at.is_some());
+
+        let json = get_thought_response_json(&resp);
+        assert!(json["provenance"]["rescoped_at"].is_string());
+        assert_eq!(json["provenance"]["previous_scope"], "global");
+        // The current filing is the thought's live scope, not the hint.
+        assert_eq!(json["thought"]["scope"], "work.x");
+
+        // Never-rescoped thoughts carry nulls, not absent keys.
+        let plain = cap(&pool, "untouched", "global").await;
+        let resp = get_thought(&pool, embedder.model(), plain).await.unwrap();
+        let json = get_thought_response_json(&resp);
+        assert!(json["provenance"]["rescoped_at"].is_null());
+        assert!(json["provenance"]["previous_scope"].is_null());
     }
 
     // -- M4: tag-filter coverage ---------------------------------------------
