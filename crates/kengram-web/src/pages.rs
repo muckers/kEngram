@@ -150,11 +150,14 @@ pub(crate) async fn thought_page(Path(id): Path<String>) -> Html<String> {
 // counts, live thoughts only). The page rebuilds the dotted hierarchy as a
 // collapsible tree — the web mirror of the CLI's Scopes tree
 // (`kengram-cli/src/main.rs`: `ScopeTreeNode` + `render_scopes_tree`), with
-// the same synthesis / alphabetical / rollup semantics rendered as nested
-// `<details>` instead of box-drawing text. Unlike the CLI the browser page
-// shows *every* scope: no top-N truncation (it is the "see all scopes"
-// target), and branch-only ancestors (`rjf`, `project`) newly appear as
-// heads. Presentation-only: `/api/scopes` stays a flat array.
+// the same synthesis / alphabetical / rollup semantics: the same
+// box-drawing connectors (`├─`/`└─` + `│  ` slots) and the same absolute
+// count columns (rollup right-aligned, own count in a parens column),
+// collapsed by nested `<details>` instead of being flat text. Unlike the
+// CLI the browser page shows *every* scope: no top-N truncation (it is the
+// "see all scopes" target), and branch-only ancestors (`rjf`, `project`)
+// newly appear as heads. Presentation-only: `/api/scopes` stays a flat
+// array.
 
 /// Trie node over dotted scope segments. `own_count` is `Some` only for
 /// populated scopes; synthesized ancestors are branch nodes. Mirrors the
@@ -207,13 +210,13 @@ fn scope_child_path(path: &str, seg: &str) -> String {
     }
 }
 
-/// "296 (280)" — the subtree rollup, with the exact scope's own count in
-/// parens only when strictly smaller (CLI parity; leaves and branch-only
-/// heads show the rollup alone).
-fn scope_count_text(rollup: i64, own: Option<i64>) -> String {
+/// The own count as a separate aligned column: `(280)` only when strictly
+/// smaller than the rollup (CLI parity; leaves and branch-only heads show
+/// the rollup alone).
+fn scope_note_text(rollup: i64, own: Option<i64>) -> Option<String> {
     match own {
-        Some(o) if o < rollup => format!("{rollup} ({o})"),
-        _ => rollup.to_string(),
+        Some(o) if o < rollup => Some(format!("({o})")),
+        _ => None,
     }
 }
 
@@ -236,46 +239,97 @@ struct ScopeNodeView {
     /// No thought sits at this exact scope (synthesized ancestor): the
     /// name is inert text, not a link — its exact-scope page would be empty.
     branch_only: bool,
-    /// Preformatted count (see [`scope_count_text`]).
+    /// Box-drawing prefix (ancestor slots + own connector, e.g. `"│  └─ "`).
+    /// Roots carry none — exactly the CLI's connector rule.
+    conn: String,
+    /// Whole-subtree rollup, right-aligned into the number column.
     count: String,
+    /// Own count in parens, own column (see [`scope_note_text`]); empty
+    /// when it would duplicate the rollup.
+    note: String,
     /// Subtree-latest activity, `YYYY-MM-DD`.
     last: String,
     children: Vec<ScopeNodeView>,
 }
 
 /// Convert one trie node (and its whole subtree) to its view, precomputing
-/// every display string per house style.
-fn to_scope_node_view(path: &str, node: &ScopeNode) -> ScopeNodeView {
+/// every display string per house style. `conn` is this node's rendered
+/// prefix; `base` is the slot string this node's level contributes to its
+/// descendants (`│  ` while it has later siblings, else spaces) — the
+/// CLI's `cont` rule verbatim.
+fn to_scope_node_view(path: &str, node: &ScopeNode, conn: String, base: String) -> ScopeNodeView {
+    let n = node.children.len();
+    let children = node
+        .children
+        .iter()
+        .enumerate()
+        .map(|(i, (seg, c))| {
+            let last = i + 1 == n;
+            to_scope_node_view(
+                &scope_child_path(path, seg),
+                c,
+                format!("{base}{}", if last { "└─ " } else { "├─ " }),
+                format!("{base}{}", if last { "   " } else { "│  " }),
+            )
+        })
+        .collect();
+    let rollup = node.rollup();
     ScopeNodeView {
         seg: path.rsplit('.').next().unwrap_or(path).to_string(),
         branch_only: node.own_count.is_none(),
-        count: scope_count_text(node.rollup(), node.own_count),
+        conn,
+        count: rollup.to_string(),
+        note: scope_note_text(rollup, node.own_count).unwrap_or_default(),
         last: node
             .last()
             .map(|d| d.date().to_string())
             .unwrap_or_default(),
         path: path.to_string(),
-        children: node
-            .children
-            .iter()
-            .map(|(seg, c)| to_scope_node_view(&scope_child_path(path, seg), c))
-            .collect(),
+        children,
     }
+}
+
+/// Absolute column widths for the tree, computed over the whole forest the
+/// way the CLI's render pass does it: one label column (connector slots +
+/// the 1-char collapse toggle + name) so every rollup lands in one
+/// right-aligned number column, then the number and parens columns. The
+/// row is monospaced, so `ch` widths align exactly.
+fn scope_tree_style(views: &[ScopeNodeView]) -> String {
+    fn walk(vs: &[ScopeNodeView], acc: &mut (usize, usize, usize)) {
+        for v in vs {
+            acc.0 = acc
+                .0
+                .max(v.conn.chars().count() + 1 + v.seg.chars().count());
+            acc.1 = acc.1.max(v.count.chars().count());
+            acc.2 = acc.2.max(v.note.chars().count());
+            walk(&v.children, acc);
+        }
+    }
+    let (label, num, note) = {
+        let mut acc = (0, 0, 0);
+        walk(views, &mut acc);
+        acc
+    };
+    format!("--scope-label-col: {label}ch; --scope-num-col: {num}ch; --scope-note-col: {note}ch;")
 }
 
 #[derive(Template)]
 #[template(path = "scopes.html")]
 struct ScopesPage {
     roots: Vec<ScopeNodeView>,
+    /// Inline custom properties sizing the tree's label/number/parens
+    /// columns (see [`scope_tree_style`]); interpolated onto `.scope-tree`.
+    style: String,
 }
 
 pub(crate) async fn scopes_page(State(st): State<WebState>) -> Result<Html<String>, ApiError> {
     let resp = list_scopes(&st.pool, ListScopesRequest { prefix: None }).await?;
-    let roots = build_scope_trie(&resp.scopes)
+    let roots: Vec<ScopeNodeView> = build_scope_trie(&resp.scopes)
         .into_iter()
-        .map(|(seg, node)| to_scope_node_view(&seg, &node))
+        .map(|(seg, node)| to_scope_node_view(&seg, &node, String::new(), String::new()))
         .collect();
-    Ok(render(ScopesPage { roots }))
+    let style = scope_tree_style(&roots);
+    Ok(render(ScopesPage { roots, style }))
 }
 
 // ---- /scope/{name} -------------------------------------------------------
@@ -504,7 +558,7 @@ mod scope_tree_tests {
     fn roots(hits: &[ScopeSummaryHit]) -> Vec<ScopeNodeView> {
         build_scope_trie(hits)
             .iter()
-            .map(|(seg, node)| to_scope_node_view(seg, node))
+            .map(|(seg, node)| to_scope_node_view(seg, node, String::new(), String::new()))
             .collect()
     }
 
@@ -550,34 +604,53 @@ mod scope_tree_tests {
             hit("rjf.tech.squrl", 11, 0),
             hit("rjf.tech.zed", 5, 0),
         ]);
-        assert_eq!(r[0].count, "296"); // branch root: rollup only, no parens
+        assert_eq!((r[0].count.as_str(), r[0].note.as_str()), ("296", "")); // branch root: rollup only
         let tech = &r[0].children[0];
         assert_eq!(
-            (tech.seg.as_str(), tech.count.as_str()),
-            ("tech", "296 (280)")
+            (tech.seg.as_str(), tech.count.as_str(), tech.note.as_str()),
+            ("tech", "296", "(280)")
         );
         // Children are alphabetical: squrl before zed.
         assert_eq!(
             (
                 tech.children[0].seg.as_str(),
-                tech.children[0].count.as_str()
+                tech.children[0].count.as_str(),
+                tech.children[0].note.as_str()
             ),
-            ("squrl", "11")
+            ("squrl", "11", "")
         );
         assert_eq!(
             (
                 tech.children[1].seg.as_str(),
-                tech.children[1].count.as_str()
+                tech.children[1].count.as_str(),
+                tech.children[1].note.as_str()
             ),
-            ("zed", "5")
+            ("zed", "5", "")
         );
     }
 
     #[test]
-    fn count_text_parens_only_when_strictly_smaller() {
-        assert_eq!(scope_count_text(10, Some(10)), "10");
-        assert_eq!(scope_count_text(10, None), "10");
-        assert_eq!(scope_count_text(10, Some(4)), "10 (4)");
+    fn note_column_only_when_strictly_smaller() {
+        assert_eq!(scope_note_text(10, Some(10)), None);
+        assert_eq!(scope_note_text(10, None), None);
+        assert_eq!(scope_note_text(10, Some(4)), Some("(4)".into()));
+    }
+
+    #[test]
+    fn connectors_and_slots_match_the_cli() {
+        let r = roots(&[
+            hit("rjf.ham-radio", 1, 0),
+            hit("rjf.tech.zed", 1, 0),
+            hit("zeroclaw", 1, 0),
+        ]);
+        // Roots carry no connector (the CLI's depth-0 rule)…
+        assert_eq!((r[0].seg.as_str(), r[0].conn.as_str()), ("rjf", ""));
+        assert_eq!((r[1].seg.as_str(), r[1].conn.as_str()), ("zeroclaw", ""));
+        // …siblings get ├─/└─ off the parent's slot base…
+        assert_eq!(r[0].children[0].conn, "├─ "); // ham-radio
+        assert_eq!(r[0].children[1].conn, "└─ "); // tech (last sibling)
+        // …and a last sibling contributes spaces (not │) to its descendants.
+        assert_eq!(r[0].children[1].children[0].conn, "   └─ "); // zed
     }
 
     #[test]
@@ -612,28 +685,50 @@ mod scope_tree_tests {
         ])
     }
 
+    /// Build the page exactly as the handler does (columns sized to the forest).
+    fn page(roots: Vec<ScopeNodeView>) -> ScopesPage {
+        let style = scope_tree_style(&roots);
+        ScopesPage { roots, style }
+    }
+
+    #[test]
+    fn column_style_sizes_to_the_forest() {
+        // Widest label: squrl at "   └─ " + toggle + name = 6 + 1 + 5 = 12.
+        // Largest rollup 291 (3 digits); widest note "(280)" (5).
+        assert_eq!(
+            scope_tree_style(&fixture_views()),
+            "--scope-label-col: 12ch; --scope-num-col: 3ch; --scope-note-col: 5ch;"
+        );
+        assert_eq!(
+            scope_tree_style(&[]),
+            "--scope-label-col: 0ch; --scope-num-col: 0ch; --scope-note-col: 0ch;"
+        );
+    }
+
     #[test]
     fn render_uses_collapsible_details_nesting() -> Result<(), askama::Error> {
-        let html = ScopesPage {
-            roots: fixture_views(),
-        }
-        .render()?;
+        let html = page(fixture_views()).render()?;
         assert!(html.contains("<details open class=\"scope-branch\">"));
         assert!(html.contains("<summary class=\"scope-row\">"));
         assert!(html.contains("<div class=\"scope-children\">"));
         assert!(html.contains("scope-leaf"));
-        // tech = own 280 + squrl 11; the rjf head is branch-only (no parens).
-        assert!(html.contains(">291 (280)<"));
-        assert!(html.contains("<span class=\"scope-count\">291</span>"));
+        // CLI connectors render verbatim…
+        assert!(html.contains("<span class=\"tree-conn\">└─ </span>"));
+        assert!(html.contains("<span class=\"tree-conn\">   └─ </span>"));
+        // …and rollup + own land in their own adjacent columns
+        // (tech = own 280 + squrl 11; the rjf head is branch-only, no note).
+        assert!(html.contains(
+            "<span class=\"scope-rollup\">291</span><span class=\"scope-note\">(280)</span>"
+        ));
+        assert!(html.contains(
+            "style=\"--scope-label-col: 12ch; --scope-num-col: 3ch; --scope-note-col: 5ch;\""
+        ));
         Ok(())
     }
 
     #[test]
     fn render_links_exact_scopes_only() -> Result<(), askama::Error> {
-        let html = ScopesPage {
-            roots: fixture_views(),
-        }
-        .render()?;
+        let html = page(fixture_views()).render()?;
         assert!(html.contains("<a class=\"scope-name\" href=\"/scope/rjf.tech\">tech</a>"));
         assert!(html.contains("<span class=\"scope-name\">rjf</span>"));
         assert!(!html.contains("href=\"/scope/rjf\"")); // branch heads stay inert
@@ -643,7 +738,7 @@ mod scope_tree_tests {
     #[test]
     fn render_escapes_scope_names() -> Result<(), askama::Error> {
         let r = roots(&[hit("evil.<script>alert(1)</script>", 1, 0)]);
-        let html = ScopesPage { roots: r }.render()?;
+        let html = page(r).render()?;
         assert!(html.contains("&lt;script&gt;"));
         assert!(!html.contains("<script>alert")); // no live injection
         Ok(())

@@ -100,16 +100,23 @@ a:hover { text-decoration: underline; }
 .score { font-size: 0.7rem; color: var(--muted); border: 1px solid var(--border); border-radius: 6px; padding: 0.12rem 0.45rem; }
 
 /* Scopes page: collapsible dotted-hierarchy tree (server-rendered
-   <details>, zero JS). Nesting supplies the indentation; the disclosure
-   marker is a custom ::before glyph because `display: flex` on <summary>
-   suppresses the native triangle. */
-.scope-row { display: flex; align-items: baseline; gap: 0.75rem; padding: 0.5rem 0; border-bottom: 1px solid var(--border); }
+   <details>, zero JS) with the CLI's box-drawing connectors and absolute
+   count columns. The rows are monospaced so `ch` columns align exactly;
+   --scope-label-col / --scope-num-col / --scope-note-col are computed per
+   tree in pages.rs (scope_tree_style) and set inline on .scope-tree. The
+   collapse toggle lives inside the label column (▸/▾ via ::before, since
+   display:flex on <summary> suppresses the native disclosure marker). */
+.scope-tree { font-family: ui-monospace, "Cascadia Mono", Menlo, Consolas, monospace; font-size: 0.85rem; }
+.scope-row { display: flex; align-items: baseline; gap: 0.6rem; padding: 0.35rem 0; border-bottom: 1px solid var(--border); }
 .scope-branch > summary { cursor: pointer; list-style: none; }
 .scope-branch > summary::-webkit-details-marker { display: none; }
-.scope-branch > summary::before { content: "▸"; color: var(--muted); font-size: 0.8rem; }
-details[open] > .scope-row::before { content: "▾"; }
-.scope-children { padding-left: 1.4rem; }
-.scope-count { background: var(--tag); border-radius: 999px; padding: 0.05rem 0.5rem; font-size: 0.78rem; color: #b9c4d6; }
+.scope-label { width: var(--scope-label-col); white-space: pre; }
+.tree-conn { color: var(--muted); }
+.tree-toggle { color: var(--muted); }
+.scope-branch > .scope-label > .tree-toggle::before { content: "▸"; }
+details[open] > .scope-row > .scope-label > .tree-toggle::before { content: "▾"; }
+.scope-rollup { text-align: right; min-width: var(--scope-num-col); }
+.scope-note { color: var(--muted); min-width: var(--scope-note-col); }
 
 .thought { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 1rem 1.15rem; }
 .thought .body { white-space: pre-wrap; }

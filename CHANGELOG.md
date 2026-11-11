@@ -6,6 +6,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+- **The web `/scopes` tree gained the CLI's connector glyphs and count
+  columns.** Rows are monospaced and carry the same `├─` / `└─` / `│`
+  tree lines as `kengram stats`, and counts render the CLI way: the
+  whole-subtree rollup right-aligned in one number column with the
+  own-count parens in its own column (`296` `(280)`). Column widths are
+  computed per tree server-side (the CLI's two-pass alignment, as inline
+  CSS custom properties). The ▸/▾ collapse toggle moved inside the label
+  column so alignment survives collapsing. Presentation-only.
+
 ## [0.4.1] — 2026-11-11
 
 Post-0.4.0 polish for the human-facing surfaces and the nightly window: the
