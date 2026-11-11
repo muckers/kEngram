@@ -100,19 +100,28 @@ a:hover { text-decoration: underline; }
 .score { font-size: 0.7rem; color: var(--muted); border: 1px solid var(--border); border-radius: 6px; padding: 0.12rem 0.45rem; }
 
 /* Scopes page: collapsible dotted-hierarchy tree (server-rendered
-   <details>, zero JS) with the CLI's box-drawing connectors and absolute
-   count columns. The rows are monospaced so `ch` columns align exactly;
-   --scope-label-col / --scope-num-col / --scope-note-col are computed per
-   tree in pages.rs (scope_tree_style) and set inline on .scope-tree. The
-   collapse toggle lives inside the label column (▸/▾ via ::before, since
-   display:flex on <summary> suppresses the native disclosure marker). */
+   <details>, zero JS) with continuous CONNECTOR LINES drawn in CSS, not
+   typed: each nesting level's .scope-children block carries a 1px vertical
+   rail (its left border) and each non-root row enters with a 2ch
+   horizontal elbow (top border) starting exactly at the rail. Indent is
+   exactly 3ch per level in the monospaced tree font, and pages.rs
+   (scope_align) precomputes per-node label widths + the number/parens
+   column sizes (set inline on .scope-tree) so every rollup shares one
+   absolute x — the CLI's count-column alignment. The row's own -1ch
+   margin pulls the ▸/▾ toggle column left of the rail, so the connector
+   runs uninterrupted from rail to name at any depth. No row separator
+   lines: they would cut the tree apart. */
 .scope-tree { font-family: ui-monospace, "Cascadia Mono", Menlo, Consolas, monospace; font-size: 0.85rem; }
-.scope-row { display: flex; align-items: baseline; gap: 0.6rem; padding: 0.35rem 0; border-bottom: 1px solid var(--border); }
+.scope-row { display: flex; align-items: baseline; gap: 0.6rem; padding: 0.3rem 0; }
 .scope-branch > summary { cursor: pointer; list-style: none; }
 .scope-branch > summary::-webkit-details-marker { display: none; }
-.scope-label { width: var(--scope-label-col); white-space: pre; }
-.tree-conn { color: var(--muted); }
-.tree-toggle { color: var(--muted); }
+.scope-children { margin-left: 3ch; border-left: 1px solid var(--border); }
+/* Pullback applies to both child shapes: leaf rows are direct children,
+   branch rows live inside their <details>. */
+.scope-children > .scope-row,
+.scope-children > .scope-branch > .scope-row { margin-left: -1ch; }
+.tree-toggle { display: inline-block; width: 1ch; color: var(--muted); }
+.tree-elbow { display: inline-block; width: 2ch; border-top: 1px solid var(--border); vertical-align: middle; }
 .scope-branch > .scope-label > .tree-toggle::before { content: "▸"; }
 details[open] > .scope-row > .scope-label > .tree-toggle::before { content: "▾"; }
 .scope-rollup { text-align: right; min-width: var(--scope-num-col); }
