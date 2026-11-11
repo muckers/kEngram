@@ -15,7 +15,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   right-aligned in one number column with the own-count parens beside it
   (`296` `(280)`) — label widths are computed per node server-side so the
   numbers align absolutely at every depth, and per-level indent is exact
-  `ch` steps in the monospaced tree. Presentation-only.
+  `ch` steps in the monospaced tree. The rails/elbows draw in their own
+  `--tree-line` color — at 1px hairlines the card `--border` tone is nearly
+  invisible against the page background (~1.4:1 contrast). Presentation-only.
 
 ## [0.4.1] — 2026-11-11
 

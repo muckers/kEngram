@@ -6,6 +6,10 @@
   --muted: #8b93a1;
   --accent: #6ea8fe;
   --border: #2a2f3a;
+  /* Tree rails/elbows are 1px lines on the page background; --border
+     (#2a2f3a) reads ~1.4:1 there — fine for card edges, invisible for
+     hairlines. Tree lines get their own brighter color (~3:1). */
+  --tree-line: #556070;
   --tag: #2a3344;
   --warn-bg: #3a2f12;
   --warn-fg: #f0d28a;
@@ -115,13 +119,13 @@ a:hover { text-decoration: underline; }
 .scope-row { display: flex; align-items: baseline; gap: 0.6rem; padding: 0.3rem 0; }
 .scope-branch > summary { cursor: pointer; list-style: none; }
 .scope-branch > summary::-webkit-details-marker { display: none; }
-.scope-children { margin-left: 3ch; border-left: 1px solid var(--border); }
+.scope-children { margin-left: 3ch; border-left: 1px solid var(--tree-line); }
 /* Pullback applies to both child shapes: leaf rows are direct children,
    branch rows live inside their <details>. */
 .scope-children > .scope-row,
 .scope-children > .scope-branch > .scope-row { margin-left: -1ch; }
 .tree-toggle { display: inline-block; width: 1ch; color: var(--muted); }
-.tree-elbow { display: inline-block; width: 2ch; border-top: 1px solid var(--border); vertical-align: middle; }
+.tree-elbow { display: inline-block; width: 2ch; border-top: 1px solid var(--tree-line); vertical-align: middle; }
 .scope-branch > .scope-label > .tree-toggle::before { content: "▸"; }
 details[open] > .scope-row > .scope-label > .tree-toggle::before { content: "▾"; }
 .scope-rollup { text-align: right; min-width: var(--scope-num-col); }
