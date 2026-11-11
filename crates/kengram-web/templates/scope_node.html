@@ -1,0 +1,28 @@
+{#- One scope-tree node; recursed by scopes.html (and itself) via `.render()`.
+    Auto-escaping is ON for every interpolated value; only a child's
+    already-rendered markup gets `|safe`. All display strings are
+    precomputed in pages.rs; the template stays dumb. -#}
+{% if !children.is_empty() %}
+<details open class="scope-branch">
+  <summary class="scope-row">
+    {%- if branch_only %}
+    <span class="scope-name">{{ seg }}</span>
+    {%- else %}
+    <a class="scope-name" href="/scope/{{ path }}">{{ seg }}</a>
+    {%- endif %}
+    <span class="scope-count">{{ count }}</span>
+    <span class="muted">last active {{ last }}</span>
+  </summary>
+  <div class="scope-children">
+    {%- for c in children %}
+    {{ c.render()?|safe }}
+    {%- endfor %}
+  </div>
+</details>
+{%- else %}
+<div class="scope-row scope-leaf">
+  <a class="scope-name" href="/scope/{{ path }}">{{ seg }}</a>
+  <span class="scope-count">{{ count }}</span>
+  <span class="muted">last active {{ last }}</span>
+</div>
+{%- endif %}

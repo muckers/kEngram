@@ -99,9 +99,17 @@ a:hover { text-decoration: underline; }
 .scores { display: flex; gap: 0.5rem; flex-wrap: wrap; }
 .score { font-size: 0.7rem; color: var(--muted); border: 1px solid var(--border); border-radius: 6px; padding: 0.12rem 0.45rem; }
 
-.scope-list { list-style: none; padding: 0; margin: 0; }
-.scope-list li { display: flex; align-items: baseline; gap: 0.75rem; padding: 0.5rem 0; border-bottom: 1px solid var(--border); }
-.scope-list .count { background: var(--tag); border-radius: 999px; padding: 0.05rem 0.5rem; font-size: 0.78rem; color: #b9c4d6; }
+/* Scopes page: collapsible dotted-hierarchy tree (server-rendered
+   <details>, zero JS). Nesting supplies the indentation; the disclosure
+   marker is a custom ::before glyph because `display: flex` on <summary>
+   suppresses the native triangle. */
+.scope-row { display: flex; align-items: baseline; gap: 0.75rem; padding: 0.5rem 0; border-bottom: 1px solid var(--border); }
+.scope-branch > summary { cursor: pointer; list-style: none; }
+.scope-branch > summary::-webkit-details-marker { display: none; }
+.scope-branch > summary::before { content: "▸"; color: var(--muted); font-size: 0.8rem; }
+details[open] > .scope-row::before { content: "▾"; }
+.scope-children { padding-left: 1.4rem; }
+.scope-count { background: var(--tag); border-radius: 999px; padding: 0.05rem 0.5rem; font-size: 0.78rem; color: #b9c4d6; }
 
 .thought { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 1rem 1.15rem; }
 .thought .body { white-space: pre-wrap; }

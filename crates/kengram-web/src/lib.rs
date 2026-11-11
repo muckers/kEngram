@@ -112,6 +112,25 @@ mod tests {
         (status, json)
     }
 
+    /// Fire a GET at the router with a given Host header; return (status, raw body text).
+    async fn get_text(state: WebState, uri: &str, host: &str) -> (StatusCode, String) {
+        let resp = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header(header::HOST, host)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
     async fn cap(pool: &PgPool, content: &str, scope: &str) -> String {
         capture(
             pool,
@@ -217,5 +236,16 @@ mod tests {
                 .iter()
                 .any(|s| s.get("scope").and_then(Value::as_str) == Some("web.test"))
         );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn scopes_page_renders_collapsible_tree(pool: PgPool) {
+        cap(&pool, "a thought in a nested scope", "web.test.deep").await;
+        let (status, body) = get_text(state(pool, vec![]), "/scopes", "localhost").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("<details open class=\"scope-branch\">"));
+        assert!(body.contains("href=\"/scope/web.test.deep\""));
+        // Synthesized branch head: inert text, not a link.
+        assert!(body.contains("<span class=\"scope-name\">web</span>"));
     }
 }
