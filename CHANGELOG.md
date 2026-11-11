@@ -6,6 +6,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+- **`kengram stats` Scopes section is now an indented scope tree.** The flat
+  most-recently-used scope list is rebuilt in the CLI into a box-drawing tree
+  over the dotted hierarchy (alphabetical at every level; ancestors no
+  thought sits at directly render as branch-only nodes). The headline count
+  is the **whole-subtree rollup**, with the exact scope's own count in parens
+  when smaller (`tech 296 (280)`), so rescoped taxonomies read at a glance.
+  `--top-scopes N` now keeps the N largest subtrees (was: N most-recently-
+  used); pruned siblings collapse to `… (+M scopes, K thoughts)` lines.
+  Presentation-only: `list_scopes`, the `corpus_stats` wire shape, and the
+  web `/stats` page are unchanged.
+
 ### Fixed
 - **Nightly tagger window no longer reports a false failure.**
   `contrib/systemd/kengram-tagger-night.service` ran `kengram worker` (which

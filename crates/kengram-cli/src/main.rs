@@ -178,8 +178,9 @@ enum Command {
         /// scopes summary section; corpus-global counts stay global.
         #[arg(long)]
         scope_prefix: Option<String>,
-        /// Limit the scopes summary section to the N most-recently-used
-        /// scopes. Defaults to 20.
+        /// Limit the scopes summary tree to the N scopes with the most
+        /// thoughts in their whole subtree (ancestors stay as structure).
+        /// Defaults to 20.
         #[arg(long, default_value_t = 20)]
         top_scopes: usize,
     },
@@ -1391,47 +1392,8 @@ async fn run_stats(
 
     // -- Scopes section --
     println!();
-    if stats.scopes.is_empty() {
-        let suffix = scope_prefix
-            .as_deref()
-            .map(|p| format!(" matching prefix {p:?}"))
-            .unwrap_or_default();
-        println!("Scopes (0){suffix}: (no scopes)");
-    } else {
-        let shown = stats.scopes.iter().take(top_scopes).collect::<Vec<_>>();
-        let truncated = stats.scopes.len().saturating_sub(shown.len());
-        let suffix = scope_prefix
-            .as_deref()
-            .map(|p| format!(" matching prefix {p:?}"))
-            .unwrap_or_default();
-        println!(
-            "Scopes ({}){}:{}",
-            stats.scopes.len(),
-            suffix,
-            if truncated > 0 {
-                format!("  (showing top {top_scopes}, {truncated} more hidden)")
-            } else {
-                String::new()
-            }
-        );
-        let max_scope_w = shown
-            .iter()
-            .map(|s| s.scope.as_str().len())
-            .max()
-            .unwrap_or(0);
-        for s in shown {
-            let last_date = s
-                .last_activity_at
-                .format(&time::format_description::well_known::Iso8601::DATE)
-                .unwrap_or_else(|_| "?".into());
-            println!(
-                "  {scope:<width$}  {n} thoughts  last {last}",
-                scope = s.scope.as_str(),
-                width = max_scope_w,
-                n = s.thought_count,
-                last = last_date,
-            );
-        }
+    for line in render_scopes_tree(&stats.scopes, top_scopes, scope_prefix.as_deref()) {
+        println!("{line}");
     }
 
     // -- On-disk tables section --
@@ -1480,9 +1442,336 @@ fn humanize_bytes(n: i64) -> String {
     }
 }
 
+// -- Scopes tree rendering (presentation only; used by run_stats) ---------
+//
+// `kengram_storage::list_scopes` returns a flat list of *populated* scopes
+// (exact-scope counts, live thoughts only). The Scopes section rebuilds the
+// dotted hierarchy from it: alphabetical siblings at every level, ancestors
+// that no thought sits at directly (`rjf`, `rjf.professional`) synthesized as
+// branch nodes, and each line's headline number rolled up across the whole
+// subtree, with the node's own direct count in parens when smaller.
+
+/// Trie node over dotted scope segments. `own_count` is `Some` only for
+/// populated scopes; synthesized ancestors are branch nodes.
+#[derive(Default)]
+struct ScopeTreeNode {
+    own_count: Option<i64>,
+    own_last: Option<time::OffsetDateTime>,
+    children: std::collections::BTreeMap<String, ScopeTreeNode>,
+}
+
+impl ScopeTreeNode {
+    /// Thoughts in this node's whole subtree (own + descendants).
+    fn rollup(&self) -> i64 {
+        self.own_count.unwrap_or(0) + self.children.values().map(Self::rollup).sum::<i64>()
+    }
+
+    /// Populated scopes in this node's whole subtree.
+    fn populated(&self) -> i64 {
+        (if self.own_count.is_some() { 1 } else { 0 })
+            + self.children.values().map(Self::populated).sum::<i64>()
+    }
+
+    /// Latest activity in the subtree (own + descendants).
+    fn last(&self) -> Option<time::OffsetDateTime> {
+        self.own_last
+            .max(self.children.values().filter_map(Self::last).max())
+    }
+}
+
+/// Full scope path for a child segment; roots join onto the empty path
+/// without a leading dot.
+fn scope_child_path(path: &str, seg: &str) -> String {
+    if path.is_empty() {
+        seg.to_string()
+    } else {
+        format!("{path}.{seg}")
+    }
+}
+
+/// Walk the trie collecting `(full scope path, subtree rollup)` for every
+/// populated node.
+fn collect_scope_paths(node: &ScopeTreeNode, path: &str, out: &mut Vec<(String, i64)>) {
+    if node.own_count.is_some() {
+        out.push((path.to_string(), node.rollup()));
+    }
+    for (seg, child) in &node.children {
+        collect_scope_paths(child, &scope_child_path(path, seg), out);
+    }
+}
+
+/// A node renders if it was selected itself or any descendant was — the
+/// ancestor closure keeps pruned leaves attached to visible parents.
+fn scope_node_shown(
+    node: &ScopeTreeNode,
+    path: &str,
+    kept: &std::collections::HashSet<String>,
+) -> bool {
+    kept.contains(path)
+        || node
+            .children
+            .iter()
+            .any(|(seg, c)| scope_node_shown(c, &scope_child_path(path, seg), kept))
+}
+
+/// One rendered line's raw pieces; column widths are applied in a second
+/// pass once every line is known.
+enum ScopeLineKind {
+    Node {
+        /// Subtree rollup; own count when strictly smaller than it.
+        rollup: i64,
+        own: Option<i64>,
+        last: String,
+        /// No thought sits at this exact scope (synthesized ancestor).
+        branch_only: bool,
+    },
+    /// Collapsed pruned siblings: `… (+M scopes, K thoughts)`.
+    Hidden { scopes: i64, thoughts: i64 },
+}
+
+struct ScopeLine {
+    prefix: String,
+    name: String,
+    kind: ScopeLineKind,
+}
+
+/// Render the whole Scopes section (header + tree lines) from the flat
+/// scope list. `top` selects the N populated scopes with the **largest
+/// subtree rollups** (ties: scope string asc); pruned scopes stay counted
+/// in ancestor rollups and are surfaced per level via a
+/// `… (+M scopes, K thoughts)` line plus the header's
+/// `(showing top N, M more hidden)` note. Nodes forced in only to keep a
+/// pruned leaf attached to a visible parent are structure, not hidden
+/// scopes.
+fn render_scopes_tree(
+    scopes: &[kengram_storage::ScopeSummary],
+    top: usize,
+    scope_prefix: Option<&str>,
+) -> Vec<String> {
+    let suffix = scope_prefix
+        .filter(|p| !p.is_empty())
+        .map(|p| format!(" matching prefix {p:?}"))
+        .unwrap_or_default();
+    if scopes.is_empty() {
+        return vec![format!("Scopes (0){suffix}: (no scopes)")];
+    }
+    // An exact-scope filter (`--scope rjf.quotes`) yields one populated
+    // scope: there is no hierarchy to reconstruct, so print it as a single
+    // line with its full path instead of synthesizing a root per segment.
+    if scopes.len() == 1 && top >= 1 {
+        let s = &scopes[0];
+        let last = s
+            .last_activity_at
+            .format(&time::format_description::well_known::Iso8601::DATE)
+            .unwrap_or_else(|_| "?".into());
+        return vec![
+            format!("Scopes (1 populated){suffix}:"),
+            format!("  {}  {}  last {last}", s.scope.as_str(), s.thought_count),
+        ];
+    }
+
+    // 1. Trie over dotted segments (Scope validation guarantees non-empty
+    //    segments, so there are no empty-string keys).
+    let mut roots: std::collections::BTreeMap<String, ScopeTreeNode> =
+        std::collections::BTreeMap::new();
+    for s in scopes {
+        let mut segs = s.scope.as_str().split('.');
+        let first = segs.next().unwrap_or(s.scope.as_str());
+        let mut node = roots.entry(first.to_string()).or_default();
+        for seg in segs {
+            node = node.children.entry(seg.to_string()).or_default();
+        }
+        node.own_count = Some(s.thought_count);
+        node.own_last = Some(s.last_activity_at);
+    }
+
+    // 2. Rank populated scopes by subtree rollup desc (scope asc on ties),
+    //    keep the top N.
+    let mut ranked: Vec<(String, i64)> = Vec::new();
+    for (seg, node) in &roots {
+        collect_scope_paths(node, seg, &mut ranked);
+    }
+    let total_populated = ranked.len();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let truncated = total_populated > top;
+    let kept: std::collections::HashSet<String> = if truncated {
+        ranked.iter().take(top).map(|(s, _)| s.clone()).collect()
+    } else {
+        ranked.into_iter().map(|(s, _)| s).collect()
+    };
+
+    // 3. Depth-first render with box-drawing connectors, then a column pass.
+    let mut lines: Vec<ScopeLine> = Vec::new();
+    walk_scope_level(&roots, "", "  ", 0, &kept, &mut lines);
+
+    let branch_only = lines
+        .iter()
+        .filter(|l| {
+            matches!(
+                l.kind,
+                ScopeLineKind::Node {
+                    branch_only: true,
+                    ..
+                }
+            )
+        })
+        .count();
+    // Absolute columns (char counts, not bytes — the connectors are
+    // multibyte): prefix+name share one column, rollups right-align to a
+    // single number column across the WHOLE tree (so `tech 296` and a
+    // deeper leaf's `11` still line up), then the optional own-count note,
+    // then the date.
+    let name_col_w = lines
+        .iter()
+        .filter(|l| !matches!(l.kind, ScopeLineKind::Hidden { .. }))
+        .map(|l| l.prefix.chars().count() + l.name.chars().count())
+        .max()
+        .unwrap_or(0);
+    let notes: Vec<String> = lines
+        .iter()
+        .map(|l| match &l.kind {
+            ScopeLineKind::Node { own: Some(o), .. } => format!(" ({o})"),
+            _ => String::new(),
+        })
+        .collect();
+    let num_w = lines
+        .iter()
+        .map(|l| match &l.kind {
+            ScopeLineKind::Node { rollup, .. } => rollup.to_string().len(),
+            _ => 0,
+        })
+        .max()
+        .unwrap_or(0);
+    let note_w = notes.iter().map(|n| n.chars().count()).max().unwrap_or(0);
+
+    let note = if truncated {
+        format!(
+            "  (showing top {top}, {} more hidden)",
+            total_populated - top
+        )
+    } else {
+        String::new()
+    };
+    let branch_note = if branch_only > 0 {
+        format!(", {branch_only} branch-only")
+    } else {
+        String::new()
+    };
+    let mut out = Vec::with_capacity(lines.len() + 1);
+    out.push(format!(
+        "Scopes ({total_populated} populated{branch_note}){suffix}:{note}"
+    ));
+    for (line, note) in lines.iter().zip(notes) {
+        match &line.kind {
+            ScopeLineKind::Node { rollup, last, .. } => out.push(format!(
+                "{:<name_col_w$}  {rollup:>num_w$}{note:<note_w$}  last {last}",
+                format!("{}{}", line.prefix, line.name)
+            )),
+            ScopeLineKind::Hidden { scopes, thoughts } => out.push(format!(
+                "{}… (+{scopes} scopes, {thoughts} thoughts)",
+                line.prefix
+            )),
+        }
+    }
+    out
+}
+
+/// Render one level of the tree: visible children in alphabetical order
+/// (BTreeMap iteration), then a single collapsed line for the pruned
+/// remainder. `cont` is the ancestor continuation prefix; roots (depth 0)
+/// take no connector.
+fn walk_scope_level(
+    children: &std::collections::BTreeMap<String, ScopeTreeNode>,
+    path: &str,
+    cont: &str,
+    depth: usize,
+    kept: &std::collections::HashSet<String>,
+    lines: &mut Vec<ScopeLine>,
+) {
+    let shown: Vec<(&String, &ScopeTreeNode)> = children
+        .iter()
+        .filter(|(seg, c)| scope_node_shown(c, &scope_child_path(path, seg), kept))
+        .collect();
+    let hidden: Vec<&ScopeTreeNode> = children
+        .iter()
+        .filter(|(seg, c)| !scope_node_shown(c, &scope_child_path(path, seg), kept))
+        .map(|(_, c)| c)
+        .collect();
+    let hidden_scopes = hidden.iter().map(|c| c.populated()).sum::<i64>();
+    let hidden_thoughts = hidden.iter().map(|c| c.rollup()).sum::<i64>();
+
+    for (i, (seg, node)) in shown.iter().enumerate() {
+        let is_last = i + 1 == shown.len() && hidden_scopes == 0;
+        let connector = if depth == 0 {
+            ""
+        } else if is_last {
+            "└─ "
+        } else {
+            "├─ "
+        };
+        let own_smaller = match node.own_count {
+            Some(o) if o < node.rollup() => Some(o),
+            _ => None,
+        };
+        let last = node
+            .last()
+            .map(|t| {
+                t.format(&time::format_description::well_known::Iso8601::DATE)
+                    .unwrap_or_else(|_| "?".into())
+            })
+            .unwrap_or_else(|| "?".into());
+        lines.push(ScopeLine {
+            prefix: format!("{cont}{connector}"),
+            name: (*seg).clone(),
+            kind: ScopeLineKind::Node {
+                rollup: node.rollup(),
+                own: own_smaller,
+                last,
+                branch_only: node.own_count.is_none(),
+            },
+        });
+        // Roots have no connector, so they contribute no continuation
+        // slot; their children start at the root indent either way.
+        let child_cont = if depth == 0 {
+            cont.to_string()
+        } else {
+            format!("{cont}{}", if is_last { "   " } else { "│  " })
+        };
+        walk_scope_level(
+            &node.children,
+            &scope_child_path(path, seg),
+            &child_cont,
+            depth + 1,
+            kept,
+            lines,
+        );
+    }
+    if hidden_scopes > 0 {
+        let connector = if depth == 0 { "" } else { "└─ " };
+        lines.push(ScopeLine {
+            prefix: format!("{cont}{connector}"),
+            name: "…".to_string(),
+            kind: ScopeLineKind::Hidden {
+                scopes: hidden_scopes,
+                thoughts: hidden_thoughts,
+            },
+        });
+    }
+}
+
 #[cfg(test)]
 mod stats_tests {
     use super::*;
+
+    fn scope_summary(scope: &str, count: i64, day: i64) -> kengram_storage::ScopeSummary {
+        let at = time::OffsetDateTime::UNIX_EPOCH + time::Duration::days(day);
+        kengram_storage::ScopeSummary {
+            scope: kengram_core::Scope::new(scope).unwrap(),
+            thought_count: count,
+            first_activity_at: at,
+            last_activity_at: at,
+        }
+    }
 
     #[test]
     fn humanize_bytes_renders_unit_scale() {
@@ -1493,6 +1782,144 @@ mod stats_tests {
         assert_eq!(humanize_bytes(1024 * 1024), "1.0 MB");
         assert_eq!(humanize_bytes(12 * 1024 * 1024), "12.0 MB");
         assert_eq!(humanize_bytes(1024_i64.pow(3)), "1.00 GB");
+    }
+
+    #[test]
+    fn scopes_tree_alphabetizes_and_synthesizes_branch_nodes() {
+        let lines = render_scopes_tree(
+            &[
+                scope_summary("zeroclaw", 26, 20),
+                scope_summary("rjf.professional.cto", 17, 25),
+                scope_summary("rjf.personal.fishing", 5, 9),
+                scope_summary("rjf.ham-radio", 11, 13),
+            ],
+            20,
+            None,
+        );
+        // rjf, personal, professional are branch-only: no thought sits there.
+        assert_eq!(lines[0], "Scopes (4 populated, 3 branch-only):");
+        let names: Vec<&str> = lines[1..]
+            .iter()
+            .map(|l| {
+                l.trim_start_matches([' ', '│', '├', '└', '─'])
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or_default()
+                    .trim_end_matches(',')
+            })
+            .collect();
+        // Alphabetical at every level; zeroclaw last among roots.
+        assert_eq!(
+            names,
+            [
+                "rjf",
+                "ham-radio",
+                "personal",
+                "fishing",
+                "professional",
+                "cto",
+                "zeroclaw"
+            ]
+        );
+    }
+
+    #[test]
+    fn scopes_tree_shows_rollup_with_own_in_parens() {
+        let lines = render_scopes_tree(
+            &[
+                scope_summary("rjf.tech", 280, 320),
+                scope_summary("rjf.tech.squrl", 11, 100),
+                scope_summary("rjf.tech.zed", 5, 120),
+            ],
+            20,
+            None,
+        );
+        let tech = lines.iter().find(|l| l.contains("tech")).unwrap();
+        assert!(tech.contains("296 (280)"), "rollup + own: {tech}");
+        let squrl = lines.iter().find(|l| l.contains("squrl")).unwrap();
+        assert!(squrl.contains(" 11 "), "leaf shows its own count: {squrl}");
+        // Branch root: rollup only, no paren.
+        let rjf = &lines[1];
+        assert!(
+            rjf.contains("296") && !rjf.contains("(296)"),
+            "branch root: {rjf}"
+        );
+    }
+
+    #[test]
+    fn scopes_tree_connectors_and_continuation() {
+        let lines = render_scopes_tree(
+            &[
+                scope_summary("rjf.a", 1, 1),
+                scope_summary("rjf.a.x", 1, 2),
+                scope_summary("rjf.b", 1, 3),
+            ],
+            20,
+            None,
+        );
+        // Root at flat-list indent, no connector.
+        assert!(lines[1].starts_with("  rjf "), "{}", lines[1]);
+        assert!(lines[2].starts_with("  ├─ a "), "{}", lines[2]);
+        // Grandchild under a NON-last parent gets the │ continuation.
+        assert!(lines[3].starts_with("  │  └─ x "), "{}", lines[3]);
+        // Last sibling gets └─.
+        assert!(lines[4].starts_with("  └─ b "), "{}", lines[4]);
+    }
+
+    #[test]
+    fn scopes_tree_truncates_by_rollup_and_collapses_pruned_siblings() {
+        let lines = render_scopes_tree(
+            &[
+                scope_summary("rjf.tech", 100, 1),
+                scope_summary("rjf.tech.squrl", 11, 2),
+                scope_summary("small", 1, 3),
+                scope_summary("tiny", 2, 4),
+            ],
+            2,
+            None,
+        );
+        // Kept by rollup: rjf.tech (111) and squrl (11); small/tiny pruned.
+        assert!(
+            lines[0].contains("(showing top 2, 2 more hidden)"),
+            "{}",
+            lines[0]
+        );
+        let hidden = lines.iter().find(|l| l.contains('…')).unwrap();
+        assert!(
+            hidden.contains("(+2 scopes, 3 thoughts)"),
+            "collapsed pruned roots: {hidden}"
+        );
+        assert!(lines.iter().any(|l| l.contains("111 (100)")));
+    }
+
+    #[test]
+    fn scopes_tree_keeps_pruned_ancestors_as_structure() {
+        let lines = render_scopes_tree(
+            &[
+                scope_summary("rjf.personal.fishing", 9, 1),
+                scope_summary("other", 5, 2),
+            ],
+            1,
+            None,
+        );
+        // rjf and personal have no thoughts of their own yet are shown so the
+        // kept leaf keeps its parents; `other` collapses into the hidden line.
+        assert!(lines.iter().any(|l| l.contains("personal")));
+        assert!(lines.iter().any(|l| l.contains("(+1 scopes, 5 thoughts)")));
+        assert!(lines[0].contains("2 branch-only"), "{}", lines[0]);
+    }
+
+    #[test]
+    fn scopes_tree_single_scope_and_empty_edge_cases() {
+        let one = render_scopes_tree(&[scope_summary("rjf.quotes", 1, 1)], 20, None);
+        assert_eq!(one.len(), 2); // header + one line, no connectors
+        assert!(one[1].starts_with("  rjf.quotes "), "{}", one[1]);
+
+        let none = render_scopes_tree(&[], 20, Some("rjf."));
+        assert_eq!(
+            none,
+            vec!["Scopes (0) matching prefix \"rjf.\": (no scopes)"]
+        );
     }
 }
 
