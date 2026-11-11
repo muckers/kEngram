@@ -37,7 +37,8 @@ the write/admin interface, and `/mcp` remains the agent interface.
   3. **Interactive graph** — cytoscape canvas; click a thought to expand its one-hop neighborhood,
      keep expanding to walk the link graph (`refines`/`supports`/`references`/… and polymorphic
      `entity`/`person`/`url` targets).
-  4. **Scope browser** — scopes with counts/activity; browse recent thoughts within a scope.
+  4. **Scope browser** — scopes as a collapsible dotted-hierarchy tree with counts/activity
+     (mirrors the CLI stats scope tree); browse recent thoughts within a scope.
 - **`[web]` config section** (`enabled: bool`, default `false`). `serve` mounts the UI only when
   enabled; otherwise `/` and `/api/*` 404 and only `/mcp` is served.
 - **Host-header guard** on the new routes mirroring the rmcp `[server].allowed_hosts` check

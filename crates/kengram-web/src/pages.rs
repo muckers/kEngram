@@ -1,16 +1,16 @@
 //! Server-rendered HTML pages (askama).
 //!
 //! `/` (search) and `/thought/{id}` render a thin shell that `app.js` hydrates
-//! from `/api/*`. `/scopes` and `/scope/{name}` are rendered fully server-side
-//! (simple lists; good first paint + a no-JS fallback).
+//! from `/api/*`. `/scopes` (collapsible scope tree) and `/scope/{name}` (list)
+//! are rendered fully server-side — good first paint + a no-JS fallback.
 
 use askama::Template;
 use axum::extract::{Path, Query, State};
 use axum::response::Html;
 use kengram_core::{Scope, TagKind};
 use kengram_mcp::{
-    CorpusStatsRequest, ListScopesRequest, RecentRequest, corpus_stats, list_scopes,
-    recent_thoughts,
+    CorpusStatsRequest, ListScopesRequest, RecentRequest, ScopeSummaryHit, corpus_stats,
+    list_scopes, recent_thoughts,
 };
 use serde::Deserialize;
 
@@ -145,31 +145,137 @@ pub(crate) async fn thought_page(Path(id): Path<String>) -> Html<String> {
 }
 
 // ---- /scopes -------------------------------------------------------------
+//
+// `list_scopes` returns a flat list of *populated* scopes (exact-scope
+// counts, live thoughts only). The page rebuilds the dotted hierarchy as a
+// collapsible tree — the web mirror of the CLI's Scopes tree
+// (`kengram-cli/src/main.rs`: `ScopeTreeNode` + `render_scopes_tree`), with
+// the same synthesis / alphabetical / rollup semantics rendered as nested
+// `<details>` instead of box-drawing text. Unlike the CLI the browser page
+// shows *every* scope: no top-N truncation (it is the "see all scopes"
+// target), and branch-only ancestors (`rjf`, `project`) newly appear as
+// heads. Presentation-only: `/api/scopes` stays a flat array.
 
-struct ScopeRow {
-    scope: String,
-    thought_count: i64,
-    last_activity: String,
+/// Trie node over dotted scope segments. `own_count` is `Some` only for
+/// populated scopes; synthesized ancestors are branch nodes. Mirrors the
+/// CLI's `ScopeTreeNode`.
+#[derive(Default)]
+struct ScopeNode {
+    own_count: Option<i64>,
+    own_last: Option<time::OffsetDateTime>,
+    children: std::collections::BTreeMap<String, ScopeNode>,
+}
+
+impl ScopeNode {
+    /// Thoughts in this node's whole subtree (own + descendants).
+    fn rollup(&self) -> i64 {
+        self.own_count.unwrap_or(0) + self.children.values().map(|c| c.rollup()).sum::<i64>()
+    }
+
+    /// Latest activity in the subtree (own + descendants).
+    fn last(&self) -> Option<time::OffsetDateTime> {
+        self.own_last
+            .max(self.children.values().filter_map(|c| c.last()).max())
+    }
+}
+
+/// Build the trie over `scope.split('.')` from the flat populated list
+/// (same walk as the CLI's).
+fn build_scope_trie(scopes: &[ScopeSummaryHit]) -> std::collections::BTreeMap<String, ScopeNode> {
+    let mut roots: std::collections::BTreeMap<String, ScopeNode> =
+        std::collections::BTreeMap::new();
+    for s in scopes {
+        let mut segs = s.scope.split('.');
+        let first = segs.next().unwrap_or(s.scope.as_str());
+        let mut node = roots.entry(first.to_string()).or_default();
+        for seg in segs {
+            node = node.children.entry(seg.to_string()).or_default();
+        }
+        node.own_count = Some(s.thought_count);
+        node.own_last = Some(s.last_activity_at);
+    }
+    roots
+}
+
+/// Full scope path for a child segment; roots join onto the empty path
+/// without a leading dot (mirrors the CLI's `scope_child_path`).
+fn scope_child_path(path: &str, seg: &str) -> String {
+    if path.is_empty() {
+        seg.to_string()
+    } else {
+        format!("{path}.{seg}")
+    }
+}
+
+/// "296 (280)" — the subtree rollup, with the exact scope's own count in
+/// parens only when strictly smaller (CLI parity; leaves and branch-only
+/// heads show the rollup alone).
+fn scope_count_text(rollup: i64, own: Option<i64>) -> String {
+    match own {
+        Some(o) if o < rollup => format!("{rollup} ({o})"),
+        _ => rollup.to_string(),
+    }
+}
+
+/// One rendered subtree. `scope_node.html` recurses by calling `.render()`
+/// on each child — askama 0.12's only supported template recursion
+/// (recursive `{% macro %}`/`{% include %}` don't compile at this version;
+/// 0.12 docs, "Recursive Structures"). Default (HTML) escaping stays ON so
+/// every interpolated value is escaped — scope names are free-form text
+/// (`Scope` only validates length); only each child's already-rendered
+/// markup is marked `|safe`. (Deliberately *not* `escape = "none"` + `|e`:
+/// at askama 0.12 `|e` follows the file-type setting and no-ops under
+/// `none` — pinned by `render_escapes_scope_names`.)
+#[derive(Template)]
+#[template(path = "scope_node.html")]
+struct ScopeNodeView {
+    /// Display name: the node's last dotted segment (CLI parity).
+    seg: String,
+    /// Full dotted path → `/scope/{path}`.
+    path: String,
+    /// No thought sits at this exact scope (synthesized ancestor): the
+    /// name is inert text, not a link — its exact-scope page would be empty.
+    branch_only: bool,
+    /// Preformatted count (see [`scope_count_text`]).
+    count: String,
+    /// Subtree-latest activity, `YYYY-MM-DD`.
+    last: String,
+    children: Vec<ScopeNodeView>,
+}
+
+/// Convert one trie node (and its whole subtree) to its view, precomputing
+/// every display string per house style.
+fn to_scope_node_view(path: &str, node: &ScopeNode) -> ScopeNodeView {
+    ScopeNodeView {
+        seg: path.rsplit('.').next().unwrap_or(path).to_string(),
+        branch_only: node.own_count.is_none(),
+        count: scope_count_text(node.rollup(), node.own_count),
+        last: node
+            .last()
+            .map(|d| d.date().to_string())
+            .unwrap_or_default(),
+        path: path.to_string(),
+        children: node
+            .children
+            .iter()
+            .map(|(seg, c)| to_scope_node_view(&scope_child_path(path, seg), c))
+            .collect(),
+    }
 }
 
 #[derive(Template)]
 #[template(path = "scopes.html")]
 struct ScopesPage {
-    scopes: Vec<ScopeRow>,
+    roots: Vec<ScopeNodeView>,
 }
 
 pub(crate) async fn scopes_page(State(st): State<WebState>) -> Result<Html<String>, ApiError> {
     let resp = list_scopes(&st.pool, ListScopesRequest { prefix: None }).await?;
-    let scopes = resp
-        .scopes
+    let roots = build_scope_trie(&resp.scopes)
         .into_iter()
-        .map(|s| ScopeRow {
-            scope: s.scope,
-            thought_count: s.thought_count,
-            last_activity: s.last_activity_at.date().to_string(),
-        })
+        .map(|(seg, node)| to_scope_node_view(&seg, &node))
         .collect();
-    Ok(render(ScopesPage { scopes }))
+    Ok(render(ScopesPage { roots }))
 }
 
 // ---- /scope/{name} -------------------------------------------------------
@@ -380,4 +486,166 @@ pub(crate) async fn stats_page(State(st): State<WebState>) -> Result<Html<String
         tables,
         db_total: humanize_bytes(s.database_total_bytes),
     }))
+}
+
+#[cfg(test)]
+mod scope_tree_tests {
+    use super::*;
+
+    fn hit(scope: &str, count: i64, day: i64) -> ScopeSummaryHit {
+        ScopeSummaryHit {
+            scope: scope.to_string(),
+            thought_count: count,
+            first_activity_at: time::OffsetDateTime::UNIX_EPOCH,
+            last_activity_at: time::OffsetDateTime::UNIX_EPOCH + time::Duration::days(day),
+        }
+    }
+
+    fn roots(hits: &[ScopeSummaryHit]) -> Vec<ScopeNodeView> {
+        build_scope_trie(hits)
+            .iter()
+            .map(|(seg, node)| to_scope_node_view(seg, node))
+            .collect()
+    }
+
+    /// Pre-order (alphabetical, per BTreeMap) collect of view segment names.
+    fn segs(v: &ScopeNodeView) -> Vec<String> {
+        let mut out = vec![v.seg.clone()];
+        for c in &v.children {
+            out.extend(segs(c));
+        }
+        out
+    }
+
+    #[test]
+    fn synthesizes_branch_nodes_and_alphabetizes() {
+        let r = roots(&[
+            hit("zeroclaw", 1, 0),
+            hit("rjf.professional.cto", 3, 0),
+            hit("rjf.personal.fishing", 2, 0),
+            hit("rjf.ham-radio", 4, 0),
+        ]);
+        let names: Vec<String> = r.iter().flat_map(segs).collect();
+        assert_eq!(
+            names,
+            [
+                "rjf",
+                "ham-radio",
+                "personal",
+                "fishing",
+                "professional",
+                "cto",
+                "zeroclaw"
+            ]
+        );
+        assert!(r[0].branch_only); // rjf holds no thought itself
+        assert!(r[0].children[1].branch_only); // personal
+        assert!(!r[0].children[0].branch_only); // ham-radio is populated
+    }
+
+    #[test]
+    fn rollup_shows_own_in_parens_when_smaller() {
+        let r = roots(&[
+            hit("rjf.tech", 280, 0),
+            hit("rjf.tech.squrl", 11, 0),
+            hit("rjf.tech.zed", 5, 0),
+        ]);
+        assert_eq!(r[0].count, "296"); // branch root: rollup only, no parens
+        let tech = &r[0].children[0];
+        assert_eq!(
+            (tech.seg.as_str(), tech.count.as_str()),
+            ("tech", "296 (280)")
+        );
+        // Children are alphabetical: squrl before zed.
+        assert_eq!(
+            (
+                tech.children[0].seg.as_str(),
+                tech.children[0].count.as_str()
+            ),
+            ("squrl", "11")
+        );
+        assert_eq!(
+            (
+                tech.children[1].seg.as_str(),
+                tech.children[1].count.as_str()
+            ),
+            ("zed", "5")
+        );
+    }
+
+    #[test]
+    fn count_text_parens_only_when_strictly_smaller() {
+        assert_eq!(scope_count_text(10, Some(10)), "10");
+        assert_eq!(scope_count_text(10, None), "10");
+        assert_eq!(scope_count_text(10, Some(4)), "10 (4)");
+    }
+
+    #[test]
+    fn last_is_subtree_max() {
+        let r = roots(&[
+            hit("rjf.tech", 1, 5),
+            hit("rjf.tech.squrl", 1, 9),
+            hit("rjf.zed", 1, 2),
+        ]);
+        assert_eq!(r[0].last, "1970-01-10"); // branch root: max over subtree
+        assert_eq!(r[0].children[0].last, "1970-01-10"); // tech: own day 5 < child day 9
+    }
+
+    #[test]
+    fn single_scope_builds_full_ancestor_chain() {
+        // Unlike the CLI's single-line special case, the browser tree always
+        // keeps the hierarchy (it renders all scopes, never a filtered subset).
+        let r = roots(&[hit("rjf.quotes", 1, 0)]);
+        assert_eq!(r.len(), 1);
+        assert!(r[0].branch_only);
+        assert_eq!(r[0].children.len(), 1);
+        assert_eq!(r[0].children[0].seg, "quotes");
+        assert!(!r[0].children[0].branch_only);
+        assert!(roots(&[]).is_empty());
+    }
+
+    fn fixture_views() -> Vec<ScopeNodeView> {
+        roots(&[
+            hit("rjf.tech", 280, 1),
+            hit("rjf.tech.squrl", 11, 3),
+            hit("project.kengram", 77, 2),
+        ])
+    }
+
+    #[test]
+    fn render_uses_collapsible_details_nesting() -> Result<(), askama::Error> {
+        let html = ScopesPage {
+            roots: fixture_views(),
+        }
+        .render()?;
+        assert!(html.contains("<details open class=\"scope-branch\">"));
+        assert!(html.contains("<summary class=\"scope-row\">"));
+        assert!(html.contains("<div class=\"scope-children\">"));
+        assert!(html.contains("scope-leaf"));
+        // tech = own 280 + squrl 11; the rjf head is branch-only (no parens).
+        assert!(html.contains(">291 (280)<"));
+        assert!(html.contains("<span class=\"scope-count\">291</span>"));
+        Ok(())
+    }
+
+    #[test]
+    fn render_links_exact_scopes_only() -> Result<(), askama::Error> {
+        let html = ScopesPage {
+            roots: fixture_views(),
+        }
+        .render()?;
+        assert!(html.contains("<a class=\"scope-name\" href=\"/scope/rjf.tech\">tech</a>"));
+        assert!(html.contains("<span class=\"scope-name\">rjf</span>"));
+        assert!(!html.contains("href=\"/scope/rjf\"")); // branch heads stay inert
+        Ok(())
+    }
+
+    #[test]
+    fn render_escapes_scope_names() -> Result<(), askama::Error> {
+        let r = roots(&[hit("evil.<script>alert(1)</script>", 1, 0)]);
+        let html = ScopesPage { roots: r }.render()?;
+        assert!(html.contains("&lt;script&gt;"));
+        assert!(!html.contains("<script>alert")); // no live injection
+        Ok(())
+    }
 }

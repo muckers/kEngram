@@ -17,6 +17,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   used); pruned siblings collapse to `… (+M scopes, K thoughts)` lines.
   Presentation-only: `list_scopes`, the `corpus_stats` wire shape, and the
   web `/stats` page are unchanged.
+- **The web `/scopes` browser is now a collapsible scope tree.** The flat
+  full-scope list is replaced by the same dotted-hierarchy view as the CLI
+  Scopes tree: alphabetical at every level, branch-only ancestors (`rjf`,
+  `project`) rendered as heads, counts are whole-subtree rollups with the
+  exact scope's own count in parens when smaller (`tech 296 (280)`). Each
+  head collapses/expands via server-rendered `<details>` — expanded by
+  default, keyboard-accessible, zero JS. Exact-scope names keep linking to
+  `/scope/{name}`; branch heads are inert text. Unlike the CLI the page is
+  never truncated. Presentation-only: the `/stats` page, every `/api/*`
+  JSON shape, `/scope/{name}`, and storage are unchanged.
 
 ### Fixed
 - **Nightly tagger window no longer reports a false failure.**
