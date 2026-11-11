@@ -6,6 +6,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.1] — 2026-11-11
+
+Post-0.4.0 polish for the human-facing surfaces and the nightly window: the
+dotted scope hierarchy now renders as a tree in `kengram stats` and in the
+web scope browser (collapsible there), and the nightly tagger systemd unit
+stops reporting a false failure every morning. No schema, wire-shape, or
+config changes — drop-in upgrade, no migration.
+
 ### Changed
 - **`kengram stats` Scopes section is now an indented scope tree.** The flat
   most-recently-used scope list is rebuilt in the CLI into a box-drawing tree
@@ -155,7 +163,8 @@ thoughts in Postgres + pgvector and exposes them to any MCP-capable client.
 - No Prometheus metrics or eval suite yet (remaining M7 scope).
 - Tagger output quality varies by base model; tags are advisory only.
 
-[Unreleased]: https://github.com/muckers/kEngram/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/muckers/kEngram/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/muckers/kEngram/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/muckers/kEngram/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/muckers/kEngram/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/muckers/kEngram/compare/v0.1.0...v0.2.0
