@@ -126,7 +126,7 @@ a:hover { text-decoration: underline; }
 .scope-children > .scope-branch > .scope-row { margin-left: -1ch; }
 .tree-toggle { display: inline-block; width: 1ch; color: var(--muted); }
 .tree-elbow { display: inline-block; width: 2ch; border-top: 1px solid var(--tree-line); vertical-align: middle; }
-.scope-branch > .scope-label > .tree-toggle::before { content: "▸"; }
+.scope-branch > .scope-row > .scope-label > .tree-toggle::before { content: "▸"; }
 details[open] > .scope-row > .scope-label > .tree-toggle::before { content: "▾"; }
 .scope-rollup { text-align: right; min-width: var(--scope-num-col); }
 .scope-note { color: var(--muted); min-width: var(--scope-note-col); }
