@@ -6,7 +6,7 @@
 {% if roots.is_empty() %}
 <p class="muted">No scopes yet.</p>
 {% else %}
-<div class="scope-tree">
+<div class="scope-tree" style="{{ style }}">
   {%- for r in roots %}
   {{ r.render()?|safe }}
   {%- endfor %}
