@@ -1,13 +1,15 @@
 {#- One scope-tree node; recursed by scopes.html (and itself) via `.render()`.
     Auto-escaping is ON for every interpolated value; only a child's
-    already-rendered markup gets `|safe`. Column spans are ADJACENT (no
-    whitespace between them) so the `ch`-sized CSS columns align; the row
-    is monospaced (see `.scope-tree` in app.css). All display strings are
+    already-rendered markup gets `|safe`. The label span's width (`lw` ch,
+    from pages.rs scope_align) is what absolutely aligns the count columns;
+    rails/elbows are pure CSS (app.css .scope-children / .tree-elbow).
+    Column spans are ADJACENT (no whitespace between them) and the tree is
+    monospaced so `ch` widths are exact. All display strings are
     precomputed in pages.rs; the template stays dumb. -#}
 {% if !children.is_empty() %}
 <details open class="scope-branch">
   <summary class="scope-row">
-    <span class="scope-label"><span class="tree-conn">{{ conn }}</span><span class="tree-toggle"></span>{% if branch_only %}<span class="scope-name">{{ seg }}</span>{% else %}<a class="scope-name" href="/scope/{{ path }}">{{ seg }}</a>{% endif %}</span><span class="scope-rollup">{{ count }}</span><span class="scope-note">{{ note }}</span>
+    <span class="scope-label" style="width: {{ lw }}ch"><span class="tree-toggle"></span>{% if elbow %}<span class="tree-elbow"></span>{% endif %}{% if branch_only %}<span class="scope-name">{{ seg }}</span>{% else %}<a class="scope-name" href="/scope/{{ path }}">{{ seg }}</a>{% endif %}</span><span class="scope-rollup">{{ count }}</span><span class="scope-note">{{ note }}</span>
     <span class="muted">last active {{ last }}</span>
   </summary>
   <div class="scope-children">
@@ -18,7 +20,7 @@
 </details>
 {%- else %}
 <div class="scope-row scope-leaf">
-  <span class="scope-label"><span class="tree-conn">{{ conn }}</span><span class="tree-toggle"></span><a class="scope-name" href="/scope/{{ path }}">{{ seg }}</a></span><span class="scope-rollup">{{ count }}</span><span class="scope-note">{{ note }}</span>
+  <span class="scope-label" style="width: {{ lw }}ch"><span class="tree-toggle"></span>{% if elbow %}<span class="tree-elbow"></span>{% endif %}<a class="scope-name" href="/scope/{{ path }}">{{ seg }}</a></span><span class="scope-rollup">{{ count }}</span><span class="scope-note">{{ note }}</span>
   <span class="muted">last active {{ last }}</span>
 </div>
 {%- endif %}
