@@ -406,6 +406,7 @@ model_id = "vllm/qwen3-coder:30b"                   # provenance written into th
 # api_key = ""
 timeout_seconds = 60
 temperature = 0.2
+# reasoning_effort = "low"
 scope_vocab_enabled = true
 scope_vocab_size = 50
 # system_prompt_file = "~/.config/kengram/tagger-prompt.txt"
@@ -492,6 +493,7 @@ The tagger is the per-thought metadata sidecar. Empty `provider` is the silent-d
 | `api_key` | `None` | Bearer token for hosted LLM endpoints. The HTTP sidecar provider has its own `[tagger.http].api_key`. |
 | `timeout_seconds` | `60` | Per-request timeout for the LLM provider. The HTTP sidecar provider has its own `[tagger.http].timeout_seconds`. |
 | `temperature` | `0.2` | Generation temperature. Lower = more deterministic. 0 makes some backends loop. LLM provider only. |
+| `reasoning_effort` | unset | Sent as the request's `reasoning_effort` (`"none"`, `"low"`, `"medium"`, `"high"`); omitted when unset, so backends that don't know it see no change. Set it for reasoning-model backends whose own default is too slow for tagging (Strata defaults to `high`; use `"low"`). Env: `KENGRAM_TAGGER__REASONING_EFFORT`. LLM provider only. |
 | `system_prompt_file` | `None` | Path to a file containing a custom system prompt. `None` = use `BUNDLED_TAGGER_PROMPT`. As of v14, a custom prompt MUST be paired with a `model_version` distinct from the bundled version — the tagger refuses to start if a custom prompt carries the bundled version number, so custom-prompt tags can't be mislabeled as bundled output. LLM provider only. |
 | `scope_vocab_enabled` | `true` | Inject the top topic + entity terms from the thought's scope into the tagger prompt as a controlled-vocabulary hint. Encourages consistent term reuse across captures. LLM provider only. |
 | `scope_vocab_size` | `50` | Top-N established terms (each for topics and entities) fed to the tagger. Larger = more vocabulary stability; smaller = faster emergence of new terms. LLM provider only. |

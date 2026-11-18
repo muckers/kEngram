@@ -70,6 +70,7 @@ model_id = "vllm/qwen3-coder:30b"
 # api_key = "..."                 # e.g. an OpenRouter key (or use KENGRAM_TAGGER__API_KEY)
 timeout_seconds = 60
 temperature = 0.2
+# reasoning_effort = "low"       # sent as reasoning_effort ("none"/"low"/"medium"/"high"); omitted when unset. For reasoning models (e.g. Strata) whose default is too slow for tagging
 # system_prompt_file = "..."      # custom prompt; REQUIRES a model_version != the bundled version (else refuses to start)
 scope_vocab_enabled = true
 scope_vocab_size = 50

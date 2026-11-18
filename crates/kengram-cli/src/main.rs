@@ -383,6 +383,7 @@ fn build_tagger(c: &TaggerConfig) -> anyhow::Result<ResolvedTagger> {
                 timeout: Duration::from_secs(c.timeout_seconds),
                 temperature: c.temperature,
                 system_prompt,
+                reasoning_effort: c.reasoning_effort.clone(),
             })
             .with_context(|| format!("constructing tagger for endpoint {}", c.endpoint))?;
             Ok(ResolvedTagger {
