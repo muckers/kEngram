@@ -290,6 +290,11 @@ pub struct TaggerConfig {
     /// give the model more context but cost prompt tokens; smaller values
     /// let new terms emerge faster. Default 50.
     pub scope_vocab_size: u32,
+    /// Optional OpenAI-style `reasoning_effort` (`"none"`, `"low"`,
+    /// `"medium"`, `"high"`) sent with every openai-compatible tag request.
+    /// `None` (default) omits the field. Set it for reasoning-model backends
+    /// whose own default is too slow for tagging (Strata defaults to `high`).
+    pub reasoning_effort: Option<String>,
     /// Sub-section for the HTTP-sidecar backend (`provider = "http"`).
     /// `None` when that backend isn't selected; the `[tagger.http]` toml
     /// block deserializes into `Some(...)`. The flat fields above remain
@@ -349,6 +354,7 @@ impl Default for TaggerConfig {
             system_prompt_file: None,
             scope_vocab_enabled: true,
             scope_vocab_size: 50,
+            reasoning_effort: None,
             http: None,
         }
     }

@@ -58,6 +58,10 @@ pub(crate) struct ArmSpec {
     pub system_prompt_file: Option<PathBuf>,
     #[serde(default)]
     pub model_version: Option<i32>,
+    /// Optional `reasoning_effort` sent with each call (e.g. `"low"` for a
+    /// reasoning model whose server default is `high`). Omitted when unset.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
 }
 
 /// A constructed arm ready to run, plus the descriptive fields the report
@@ -158,6 +162,7 @@ pub(crate) fn build_arm(spec: &ArmSpec) -> anyhow::Result<BuiltArm> {
                 timeout,
                 temperature: spec.temperature.unwrap_or(DEFAULT_TEMPERATURE),
                 system_prompt,
+                reasoning_effort: spec.reasoning_effort.clone(),
             };
             let tagger = OpenAICompatibleTagger::new(config)
                 .with_context(|| format!("constructing arm {:?}", spec.name))?;
@@ -328,6 +333,7 @@ temprature = 0.0
             timeout_seconds: None,
             system_prompt_file: None,
             model_version: None,
+            reasoning_effort: None,
         };
         let err = match build_arm(&spec) {
             Ok(_) => panic!("expected unset api_key_env to be a build error"),
@@ -349,6 +355,7 @@ temprature = 0.0
             timeout_seconds: None,
             system_prompt_file: Some(prompt),
             model_version: None, // defaults to BUNDLED_TAGGER_VERSION -> must be rejected
+            reasoning_effort: None,
         };
         assert!(
             build_arm(&spec).is_err(),

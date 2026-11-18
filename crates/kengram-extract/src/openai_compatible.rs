@@ -42,6 +42,12 @@ pub struct OpenAICompatibleConfig {
     /// meaningful provenance. A WARN is emitted at construction when this
     /// is `Some(_)`.
     pub system_prompt: Option<String>,
+    /// Optional OpenAI-style `reasoning_effort` (`"none"`, `"low"`,
+    /// `"medium"`, `"high"`) sent with every request. `None` (the default)
+    /// omits the field, so backends that don't know it see no change. Set it
+    /// for reasoning models whose server default is too slow for tagging
+    /// (e.g. Strata, which defaults to `high`).
+    pub reasoning_effort: Option<String>,
 }
 
 impl OpenAICompatibleConfig {
@@ -57,6 +63,7 @@ impl OpenAICompatibleConfig {
             timeout: Duration::from_secs(60),
             temperature: 0.2,
             system_prompt: None,
+            reasoning_effort: None,
         }
     }
 
@@ -74,6 +81,7 @@ impl OpenAICompatibleConfig {
             timeout: Duration::from_secs(60),
             temperature: 0.2,
             system_prompt: None,
+            reasoning_effort: None,
         }
     }
 }
@@ -242,6 +250,7 @@ pub struct OpenAICompatibleTagger {
     model_version: i32,
     api_key: Option<String>,
     temperature: f32,
+    reasoning_effort: Option<String>,
     /// Resolved system prompt — either the bundled default or the operator's
     /// override. Stored at construction so `tag()` doesn't re-resolve on
     /// every request.
@@ -312,6 +321,7 @@ impl OpenAICompatibleTagger {
             model_version: config.model_version,
             api_key: config.api_key,
             temperature: config.temperature,
+            reasoning_effort: config.reasoning_effort,
             system_prompt,
             timeout_seconds: config.timeout.as_secs(),
             client,
@@ -488,6 +498,8 @@ struct ChatRequestBody<'a> {
     temperature: f32,
     messages: Vec<ChatMessage<'a>>,
     response_format: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -574,6 +586,7 @@ impl Tagger for OpenAICompatibleTagger {
             temperature: self.temperature,
             messages,
             response_format: tags_response_format(),
+            reasoning_effort: self.reasoning_effort.as_deref(),
         };
 
         let mut req = self.client.post(&url).json(&body);
@@ -743,6 +756,7 @@ mod tests {
             timeout: Duration::from_secs(2),
             temperature: 0.0,
             system_prompt: None,
+            reasoning_effort: None,
         }
     }
 
@@ -757,6 +771,44 @@ mod tests {
                 "finish_reason": "stop"
             }]
         })
+    }
+
+    /// Mounts a tag response and returns the JSON body of the one request the
+    /// tagger sent.
+    async fn sent_body(reasoning_effort: Option<&str>) -> serde_json::Value {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(chat_response_with_tags(json!({
+                    "people": [], "entities": [], "action_items": [], "topics": [],
+                    "dates_mentioned": [], "kind": "observation", "relations": []
+                }))),
+            )
+            .mount(&server)
+            .await;
+        let mut cfg = config_for(format!("{}/v1", server.uri()), None);
+        cfg.reasoning_effort = reasoning_effort.map(str::to_string);
+        OpenAICompatibleTagger::new(cfg)
+            .unwrap()
+            .tag("anything", None)
+            .await
+            .unwrap();
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 1);
+        serde_json::from_slice(&reqs[0].body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn reasoning_effort_omitted_when_unset() {
+        let body = sent_body(None).await;
+        assert!(body.get("reasoning_effort").is_none(), "body: {body}");
+    }
+
+    #[tokio::test]
+    async fn reasoning_effort_sent_when_set() {
+        let body = sent_body(Some("low")).await;
+        assert_eq!(body["reasoning_effort"], "low");
     }
 
     #[tokio::test]
@@ -1654,6 +1706,7 @@ mod tests {
             timeout: Duration::from_secs(180),
             temperature: 0.2,
             system_prompt: None,
+            reasoning_effort: None,
         };
         OpenAICompatibleTagger::new(cfg).expect("OpenAICompatibleTagger::new should succeed")
     }
@@ -1738,6 +1791,7 @@ mod tests {
             timeout: Duration::from_secs(180),
             temperature: 0.2,
             system_prompt: None,
+            reasoning_effort: None,
         };
         let t =
             OpenAICompatibleTagger::new(cfg).expect("OpenAICompatibleTagger::new should succeed");
